@@ -208,6 +208,8 @@ def run(args):
             if not re.fullmatch(r"[0-9a-f]{64}", identifier or ""):
                 raise BuildControlError("Host reattestation lacks exact container pins")
             row = json.loads(dev.docker_text("inspect", identifier))[0]
+            if row.get("Image") != image:
+                raise BuildControlError("Host reattestation " + service + " image differs")
             labels = row.get("Config", {}).get("Labels", {})
             status = row.get("State", {})
             if (row.get("Id") != identifier
@@ -219,8 +221,6 @@ def run(args):
                 raise BuildControlError("Host reattestation requires exact stopped services")
             dev._validate_retained_service(document, row, service, image_config)
             rows[service] = row
-        if rows["backend"]["Image"] != image:
-            raise BuildControlError("Host reattestation backend image differs")
         state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Linux state")
         bind = next((m for m in rows["backend"]["Mounts"] if m["Destination"] == "/state"), {})
         if bind.get("Type") != "bind" or bind.get("Source") != str(state):

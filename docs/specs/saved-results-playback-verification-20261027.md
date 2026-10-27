@@ -75,6 +75,15 @@ i dokładnym CAS, bez zmiany oryginalnego receipt.json; potwierdzono brak
 helpera i brak zachowanych runów. Zwykłe resume
 82b6809c6aa1486fa10a52c3e0dfb765 przywróciło API i frontend.
 
+## Niezależny przegląd
+
+Przegląd ścieżki WSL/CAS, walidacji shared pnpm, wrappera i cyklu życia
+renderera wykonano niezależnie. Zamknięto dwa findings: jawny pin obrazu
+każdej usługi oraz dokładna zgodność etykiet shared pnpm. Regresje obejmują
+obcy obraz frontendu przed zapisem i dodatkową obcą etykietę wolumenu.
+Ponowny bounded review nie stwierdził pozostałych actionable problemów.
+Zestaw 68 regresji helperów pozostał zielony.
+
 ## Utrzymanie cache
 
 Przypięta procedura cache-maintenance/attempts/0c242ff7ed4c4431bb7ef22f65d2e523

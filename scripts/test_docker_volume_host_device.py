@@ -157,6 +157,11 @@ class HostDeviceTests(unittest.TestCase):
                     recovery.run(args)
                 self.assertEqual(records,{})
                 rows["backend"]["State"]["Running"]=False
+                rows["frontend"]["Image"]="sha256:"+"f"*64
+                with self.assertRaisesRegex(BuildControlError,"frontend image differs"):
+                    recovery.run(args)
+                self.assertEqual(records,{})
+                rows["frontend"]["Image"]=IMAGE
                 extra.append({"Id":"f"*64,"Mounts":[{"Type":"bind","Source":str(state.parent)}]})
                 with self.assertRaisesRegex(BuildControlError,"Another container"):
                     recovery.run(args)

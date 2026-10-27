@@ -396,7 +396,7 @@ def _validate_shared_frontend_pnpm(document, identity):
     except ValueError as error:
         raise BuildControlError(str(error)) from error
     labels = volume.get("Labels") or {}
-    if any(labels.get(key) != value for key, value in descriptor["labels"].items()):
+    if labels != descriptor["labels"]:
         raise BuildControlError("Frontend shared pnpm ownership differs")
     return {descriptor["name"]}
 

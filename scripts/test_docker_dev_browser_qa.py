@@ -1609,7 +1609,7 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             changed=deepcopy(document);changed["Mounts"].append(deepcopy(changed["Mounts"][0]))
             with self.assertRaises(qa.BuildControlError):
                 qa._validate_shared_frontend_pnpm(changed,identity)
-        for field,value in (("Labels",{}),("Driver","foreign"),("Options",{"type":"nfs","device":"/foreign"})):
+        for field,value in (("Labels",{}),("Labels",{**descriptor["labels"],"foreign":"owner"}),("Driver","foreign"),("Options",{"type":"nfs","device":"/foreign"})):
             changed=deepcopy(volume);changed[field]=value
             with patch.object(qa,"_inspect_existing_volume",return_value=changed),self.subTest(field=field),self.assertRaises(qa.BuildControlError):
                 qa._validate_shared_frontend_pnpm(document,identity)
