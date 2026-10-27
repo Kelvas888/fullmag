@@ -1602,7 +1602,8 @@ mod tests {
         fs::create_dir_all(store.root().join("objects/pins")).unwrap();
         let input_ref = store.cas().put(b"immutable accepted input").unwrap();
         let specification = serde_json::json!({
-            "snapshot": { "definition_sha256": input_ref.clone() }
+            "snapshot": { "definition_sha256": input_ref.clone() },
+            "immutable_assets": []
         });
         let mut intent = FmsRunIntent::new(RUN_ID, "idempotency-terminal", specification);
         intent.definition_object_ref = Some(input_ref);

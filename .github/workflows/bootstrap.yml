@@ -111,6 +111,9 @@ jobs:
                   f"FULLMAG_PROJECT_STORAGE_ROOT={layout['storage_root']}\n"
               )
           PY
+      - name: Run terminal Docker recovery contracts
+        run: cargo test -p fullmag-session --lib runtime_service::retained_terminal_runs::tests --no-fail-fast
+
       - name: Run accepted explicit Compute start-gate contracts
         run: |
           cargo test -p fullmag-session --lib accepted_start_gate
@@ -823,6 +826,7 @@ jobs:
           python -B scripts/test_docker_volume_stop_failed.py -v
           python -B scripts/test_docker_volume_activation_reconcile.py -v
           python -B scripts/test_docker_volume_offline_reconcile.py -v
+          python -B scripts/test_docker_stopped_network.py -v
           python -B scripts/test_docker_native_failed_recreate.py -v
           python -B scripts/test_docker_retained_recovery_context.py -v
           python -B scripts/test_runtime_service_successor.py -v
