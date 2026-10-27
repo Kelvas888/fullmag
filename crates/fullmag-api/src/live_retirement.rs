@@ -299,7 +299,7 @@ async fn retire_current_live_checked(
         })?;
         let store = open_retirement_store(&state)?;
         let unadmitted = proof.terminal_outcome == UNADMITTED_OUTCOME;
-        with_retirement_evidence(&store, &request.run_id, unadmitted, None, |evidence| {
+        read_retirement_evidence(&store, &request.run_id, unadmitted, None, |evidence| {
             validate_evidence_for_proof(&proof, &evidence)?;
             Ok(())
         })
@@ -389,7 +389,7 @@ async fn retire_current_live_checked(
         )));
     }
 
-    let initial_evidence = with_retirement_evidence(
+    let initial_evidence = read_retirement_evidence(
         &store,
         &request.run_id,
         unadmitted,
@@ -646,6 +646,28 @@ fn with_terminal_evidence_fence<T>(
         store,
         run_id,
         |snapshot, evidence_sha256| operation(snapshot, evidence_sha256),
+    )
+}
+
+/// How long a read-only evidence check waits for the host and store writers.
+const RETIREMENT_EVIDENCE_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`with_retirement_evidence`] for a check that mutates nothing. The fence
+/// takes the host-ledger and session-store writers without waiting, and the
+/// schedulers hold the store writer most of the time on a Windows-folder
+/// store; a busy writer used to surface as `terminal_evidence_unknown`, a
+/// 409 the launcher must quarantine. Only a busy writer or transient store
+/// I/O is retried, for a bound well inside the launcher's request timeout.
+fn read_retirement_evidence<T>(
+    store: &fullmag_session::SessionStore,
+    run_id: &str,
+    unadmitted: bool,
+    expected_outcome: Option<&str>,
+    operation: impl Fn(TerminalRetirementEvidence) -> Result<T>,
+) -> Result<T> {
+    fullmag_runtime_control::retry_store_writer_busy_within(
+        RETIREMENT_EVIDENCE_WRITER_WAIT,
+        || with_retirement_evidence(store, run_id, unadmitted, expected_outcome, &operation),
     )
 }
 
