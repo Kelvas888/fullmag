@@ -224,6 +224,7 @@ case "${recipe}" in
     docker_dev_activate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" activate-script --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --script '([^']+)'( --request-id '([^']+)')?[[:space:]]*$"
     docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'([[:space:]]+--recovery-authorization '([^']+)')?([[:space:]]+--fresh-state)?[[:space:]]*$"
     docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_cache_maintenance_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" maintain-cache --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)'[[:space:]]*$"
     docker_dev_args=(--repo-root "${repo_root}")
     if [[ "${recipe}" =~ ${docker_dev_codegen_pattern} ]]; then
       docker_dev_args+=(codegen-openapi)
@@ -268,6 +269,9 @@ case "${recipe}" in
         docker_dev_args+=(--recovery-authorization "${BASH_REMATCH[6]}")
       fi
       if [[ -n "${BASH_REMATCH[7]:-}" ]]; then docker_dev_args+=(--fresh-state); fi
+    elif [[ "${recipe}" =~ ${docker_dev_cache_maintenance_pattern} ]]; then
+      docker_dev_args+=(maintain-cache --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}")
     elif [[ "${recipe}" =~ ${docker_dev_idle_restart_pattern} ]]; then
       docker_dev_args+=(restart-idle-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
         --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")
