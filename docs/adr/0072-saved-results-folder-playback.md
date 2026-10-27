@@ -1,4 +1,4 @@
-# ADR 0071 — odtwarzanie pola z samodzielnego folderu wyników
+# ADR 0072 — odtwarzanie pola z samodzielnego folderu wyników
 
 Status: accepted for implementation (decyzja użytkownika 27.10.2026); runtime i browser proof wymagają weryfikacji.
 
