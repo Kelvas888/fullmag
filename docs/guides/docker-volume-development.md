@@ -412,9 +412,25 @@ frontend state volume. Nie tworzy brakującego control volume, nie naprawia
 named volume i nie restartuje usług. Domyślny limit pracy przeglądarki wynosi
 180 sekund, a osobny limit pobrania brakującego obrazu wynosi 1800 sekund;
 parametry `timeout` i `pull_timeout` są ostatnimi argumentami pozycyjnymi
-recepty, po `browser_image`. Nieudane lub
+recepty, po `browser_image`; opcjonalne `saved_playback_item_id` jest kolejnym
+argumentem. Nieudane lub
 niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
 przeglądu receiptu operacji.
+
+Kontrolę odtwarzania zapisanego wyniku można jawnie skierować na istniejący,
+zarejestrowany workspace item. Podaj jego dziesiętny identyfikator jako ostatni
+argument recepty:
+
+```powershell
+just docker-dev-browser-qa "$source" 3298 "" 180 1800 "<item-id>"
+```
+
+Ta odrębna próba uruchamia przypięty harness w tym samym zarządzanym, tylko do
+odczytu kontenerze Playwright. Nie instaluje przeglądarki na hoście i nie
+uruchamia Solve ani Compute Fields. Receipt zapisuje identyfikator oraz SHA-256
+źródłowego harnessu, a wynik potwierdza odczyt payloadów ramek, widoczny canvas,
+żywy kontekst WebGL i stabilność Inspectora oraz kamery. Tryb SwiftShader jest
+dowodem przeglądarki, nie dowodem sprzętowego GPU ani fizyki FEM.
 
 ## Budżet backendu podczas trwającego startu
 

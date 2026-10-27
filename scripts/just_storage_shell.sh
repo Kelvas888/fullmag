@@ -179,7 +179,7 @@ case "${recipe}" in
     # Browser proof owns its resolver, Compose project, BuildControl lease,
     # and image pull; do not create compatibility links or enter the generic
     # host runner before it can authenticate the selected volume DEV group.
-    browser_qa_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_browser_qa.py\" --repo-root \"[^\"]+\"[[:space:]]+(--source-root '([^']+)'[[:space:]]+)?(--port '([0-9]{1,5})'[[:space:]]+)?--timeout '([0-9]{2,3})'[[:space:]]+--pull-timeout '([0-9]{2,4})'([[:space:]]+--browser-image '([^']+)')?[[:space:]]*$"
+    browser_qa_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev_browser_qa.py\" --repo-root \"[^\"]+\"[[:space:]]+(--source-root '([^']+)'[[:space:]]+)?(--port '([0-9]{1,5})'[[:space:]]+)?--timeout '([0-9]{2,3})'[[:space:]]+--pull-timeout '([0-9]{2,4})'([[:space:]]+--browser-image '([^']+)')?([[:space:]]+--saved-playback-item-id '([0-9]{1,20})')?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${browser_qa_pattern} ]]; then
       echo "[fullmag just] invalid managed Docker DEV browser QA recipe" >&2
       exit 2
@@ -194,6 +194,9 @@ case "${recipe}" in
     browser_qa_args+=(--timeout "${BASH_REMATCH[5]}" --pull-timeout "${BASH_REMATCH[6]}")
     if [[ -n "${BASH_REMATCH[8]:-}" ]]; then
       browser_qa_args+=(--browser-image "${BASH_REMATCH[8]}")
+    fi
+    if [[ -n "${BASH_REMATCH[10]:-}" ]]; then
+      browser_qa_args+=(--saved-playback-item-id "${BASH_REMATCH[10]}")
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_browser_qa.py" "${browser_qa_args[@]}"
     ;;
