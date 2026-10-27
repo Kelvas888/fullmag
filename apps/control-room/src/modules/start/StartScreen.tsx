@@ -333,12 +333,28 @@ export function StartScreen({ kernel }: ModuleProps) {
       }
     : null;
 
-  // Opening a project and then its saved results: the Results module of the
-  // open project is the saved-results viewer (SavedResultsBrowser).
+  // Legacy navigation for callers without the standalone playback command.
   const openResults = async (entry: RecentEntry): Promise<string | null> => {
     const failure = await openRecent(entry);
     if (failure === null) kernel.layout.setActiveTab("results");
     return failure;
+  };
+
+  const openSavedPlayback = async (item: ApiWorkspaceItem): Promise<string | null> => {
+    const result = await kernel.commands.execute(
+      "workspace.open-results-folder",
+      createCommandContext("inspector", kernel, {
+        feedback: "local",
+        input: { itemId: item.id, name: item.name },
+        sessionScopeKey: null,
+        sourceDetail: "start-screen",
+      }),
+    );
+    if (result.status === "completed") {
+      homeView.close();
+      return null;
+    }
+    return result.message ?? `Could not open saved playback for ${item.name}.`;
   };
 
   const selectedScript =
@@ -444,6 +460,7 @@ export function StartScreen({ kernel }: ModuleProps) {
           void results.forget(id);
         },
         onSelectSource: selectApiItem,
+        onOpenPlayback: openSavedPlayback,
         onOpenResults: async (project) => {
           const entry =
             recent.state.kind === "ready"
@@ -521,6 +538,7 @@ export function StartScreen({ kernel }: ModuleProps) {
               scriptFlowNotice={scriptFlowNotice}
               compute={compute}
               onOpenRecent={openRecent}
+              onOpenResult={openSavedPlayback}
               onResumeContinue={resumeContinue}
               onDiscardContinue={discardContinue}
               onRunCommand={runCommand}
