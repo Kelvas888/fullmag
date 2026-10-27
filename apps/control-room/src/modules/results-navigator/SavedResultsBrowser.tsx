@@ -5,6 +5,7 @@ import { useState } from "react";
 import type { ModuleProps } from "@/kernel/types";
 import { useProjectDocumentSnapshot } from "@/kernel/persistence/ProjectDocumentStatus";
 import {
+  useProjectRunResource,
   useProjectRunsResource,
 } from "@/kernel/resources/projectRunResources";
 import {
@@ -84,6 +85,7 @@ function SavedProjectResults({
   const [runCursor, setRunCursor] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const runs = useProjectRunsResource(projectId, runCursor);
+  const runsError = runs.error ?? runs.refreshError;
 
   return (
     <section
@@ -110,14 +112,16 @@ function SavedProjectResults({
           >
             Runs
           </h3>
-          <span className="text-fm-xs text-fm-muted">50 per page</span>
+          <Button size="sm" variant="ghost" aria-label="Refresh saved runs" onClick={runs.refetch}>
+            Refresh runs
+          </Button>
         </div>
         {runs.status === "loading" && !runs.data ? (
           <p className="m-0 text-fm-xs text-fm-muted" role="status">Loading runs…</p>
         ) : null}
-        {runs.error ? (
+        {runsError ? (
           <p className="m-0 text-fm-xs text-fm-danger" role="alert">
-            Could not load runs: {runs.error.message}
+            Could not load runs: {runsError.message}{runs.data ? " Previously loaded runs are still shown." : ""}
           </p>
         ) : null}
         {runs.data?.runs.length === 0 ? (
@@ -180,6 +184,8 @@ function SavedRunResults({
   projectId,
   runId,
 }: SavedResultsBrowserProps & { projectId: string; runId: string }) {
+  const run = useProjectRunResource(projectId, runId);
+  const runError = run.error ?? run.refreshError;
   const [solutionCursor, setSolutionCursor] = useState<string | null>(null);
   const [selectedSolution, setSelectedSolution] = useState<SelectedSolution | null>(null);
   const discovery = useSolutionSetDiscoveryResource(projectId, runId, {
@@ -188,6 +194,7 @@ function SavedRunResults({
       limit: 25,
     },
   });
+  const discoveryError = discovery.error ?? discovery.refreshError;
   const selectedDiscovery = selectedSolution
     ? discovery.data?.items.find(
         (item) =>
@@ -230,12 +237,33 @@ function SavedRunResults({
           </p>
         ) : null}
       </header>
+      <section aria-label="Selected saved run execution" className="fm-saved-run-execution grid min-w-0 gap-2">
+        <p className="m-0 text-fm-xs text-fm-muted">
+          This saved run is independent of the live session shown in the footer.
+          A completed task does not by itself confirm that a field is available.
+        </p>
+        <Button size="sm" variant="secondary" className="justify-self-start"
+          aria-label="Refresh selected run and saved results" onClick={() => {
+            void run.refetch();
+            void discovery.refetch();
+          }}>
+          Refresh run and results
+        </Button>
+        {run.status === "loading" && !run.data ? <p role="status">Loading task execution…</p> : null}
+        {runError ? <p role="alert">Could not refresh task execution: {runError.message}</p> : null}
+        {run.data?.tasks.map(task => <div key={task.task_id} className="fm-saved-run-task grid min-w-0 gap-1 text-fm-xs">
+          <span>Task execution: {task.lifecycle}</span>
+          <span className="truncate text-fm-muted" title={task.task_id}>{task.task_id}</span>
+          {task.readiness.state === "blocked" ? <span>Blocked: {task.readiness.reason}</span> : null}
+        </div>)}
+        {run.data?.tasks.length === 0 ? <p role="status">No tasks have been materialized.</p> : null}
+      </section>
       {discovery.status === "loading" && !discovery.data ? (
         <p className="m-0 text-fm-xs text-fm-muted" role="status">Loading SolutionSets…</p>
       ) : null}
-      {discovery.error ? (
+      {discoveryError ? (
         <p className="m-0 text-fm-xs text-fm-danger" role="alert">
-          Could not load SolutionSets: {discovery.error.message}
+          Could not load SolutionSets: {discoveryError.message}{discovery.data ? " Previously loaded results are still shown." : ""}
         </p>
       ) : null}
       <SolutionSetDiscoveryList

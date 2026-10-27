@@ -508,3 +508,97 @@ Aktywny accepted run i scena authoring to odrębne zasoby; sam widok sceny
 nie potwierdza przypięcia ani wyrenderowania wyniku accepted.
 Pełna mapa, jej wyświetlenie w Universe i browser/WebGL: nadal NOT VERIFIED
 w chwili tego checkpointu. Odczytu przeglądarki nie ponawiano po blokadzie.
+
+
+### Odczyt zapisanego wyniku i stan wybranego runa w UI — 27.10.2026
+
+Kontynuacja poprzedniego etapu oznacza rzeczywisty postęp: zakończona diagnostyka
+20 punktów i uruchomiony pełny run pozostają zachowane. Ponownie sprawdzono
+żywy PID 9549 i ten sam starttime; CPU procesu rośnie, API potwierdza running.
+Pełny wynik 1145 punktów nie został jeszcze opublikowany w tym checkpointcie.
+
+Aktualny /v2/sessions/current/status nadal wskazuje stary, nieudany
+run-live-62d110763485b10e2512922267a1aed284996710852d4fd27cb3f4ad71a1e496
+z solver_steps=0. Ten licznik nie jest postępem nowego accepted runa.
+FooterTelemetry::resolveFooterAntennaStage prawidłowo wymaga tej samej
+tożsamości session/epoch/run; nie zmieniono tej ochrony.
+
+Wynik 20 punktów przeszedł istniejący kontroler
+scripts/validate_accepted_antenna_closed_loop_http.py::validate:
+33 rzeczywiste kontrole, exit 0, cold scope full_cold_bundle.
+Statusy: 13 × 200, 3 × 206, 5 × 304, 3 × 400, 6 × 409, 3 × 416.
+Sprawdzono V, lokalne J i H, ich jednostki, hashe, długości i wartości skończone;
+obce attempt/epoch/package odrzucono jako antenna_source_conflict.
+Odczyt nie zmienił authoring session, sceny ani poleceń i nie uruchomił Solve.
+Dowód: verification/rt0-geometry-cases-20261027/closed-loop-http-integrity-gate.json,
+SHA256 6111f5e8948078e51c47f9809bf0f7887ed7093f00c01d9f6cf2e6efc7e6fb12.
+Pierwszy wybrany smoke_accepted_antenna_inspection.py poprawnie odmówił innej
+rodziny metadanych: dotyczy truncated external lead, a nie closed_loop.
+Nie osłabiono jego walidacji; użyto istniejącego właściwego kontrolera.
+
+Niezależny audyt potwierdził rzeczywisty SolutionSet wyniku 20 punktów:
+solution-8741cfadb0b34bbb7d16f9c7bee755cc7c0645ed1a268f44ac7330b878a1448e,
+rewizja 2, succeeded. H:
+materialized-dataset-d863f1f9fa5c8b6af2876affe0f7851953be6666c0c8959a2729a3666697dacc,
+H_ant, A/m, 20 × 3 f64, integrity=verified.
+V i J również mają materialized datasets; J zachowuje tet4_cell_local_nodes.
+Zapisana geometria H 20 / 5, topology i support odczytane HTTP 200,
+zgodne z deskryptorami. To dane diagnostyczne, nie pełna mapa Universe.
+
+Istniejąca ścieżka jest wystarczająca:
+SavedResultsBrowser::inspectSelected →
+PinnedMaterializedDatasetSelectionRef →
+ObjectVisualizationController::setSavedFieldPresentation →
+useSavedFieldViewportResources →
+buildSavedFieldViewportSceneModel.
+Nie dodano alternatywnego ownera, pinów, endpointów ani fałszywego live result.
+Otwarty projekt jest stanem klienta ProjectDocumentController: odczyt API
+nie potwierdza, że przeglądarka ma otwarty project-1f48487cf16342ca9524e0795d39597b.
+Przyszły odbiór UI musi sprawdzić zgodność projektu i wybrany saved dataset.
+
+Poprawka apps/control-room/src/modules/results-navigator/SavedResultsBrowser.tsx:
+SavedProjectResults otrzymał Refresh runs; SavedRunResults korzysta z istniejącego
+useProjectRunResource i pokazuje lifecycle/readiness tylko jawnie wybranego runa.
+Refresh run and results odświeża jego zasób i odkrywanie SolutionSet.
+Błędy refresh nie ukrywają poprzednich danych, ale jawnie oznaczają starszą listę.
+Wybór SolutionSet/datasetu i prezentacja pozostają bez zmian; nie ma pollingu,
+Compute, automatycznego attach ani zmiany bieżącej sesji.
+
+Nowa regresja SavedResultsBrowser.execution.test.tsx sprawdza kliknięcia Refresh,
+właściwą tożsamość project/run, zachowanie tożsamości panelu przy refreshError
+oraz brak Inspect, gdy succeeded nie ma SolutionSet. Poprzednie testy integralności
+przypięcia datasetu pozostają osobnym dowodem. Końcowe cztery testy po uzupełnieniu ostrzeżeń refresh przeszły, exit 0.
+Niezależny review minimalnego diffu: brak Required; uwagę o refreshError
+uwzględniono w źródłach i regresji.
+
+Browser/WebGL i wizualny odbiór poprawki pozostają NOT VERIFIED;
+nie ponawiano zablokowanego dostępu. Nie deklarujemy pełnego Universe,
+kwalifikowanej bazy, FFT, LLG ani odtworzenia publikacji.
+
+
+Końcowe kontrole źródeł tej poprawki:
+- istniejący zarządzany just docker-dev-control-checks z zakresem
+  frontend-visualization: succeeded, 19 poleceń exit 0, w tym typecheck,
+  wskazane 15 kontroli ESLint, architecture i api-hygiene. Receipt
+  verification/frontend-visualization-checks/receipt.json,
+  SHA256 b485705378ccb208d4867029d893b860ee5fd4e42b64c5efe3ac9c47b8d9dac0.
+  Kontrola ESLint useViewport3DSceneModel trwała 150263 ms, ale zakończyła się 0;
+  nie potraktowano dłuższej obserwacji jako awarii ani nie przerwano procesu.
+- po końcowej zmianie refreshError: w stałym frontendzie 0dacc07deb1e, pod istniejącą
+  blokadą .fullmag-frontend-import-checks.lock, pnpm exec vitest run wskazanych
+  SavedResultsBrowser.execution/integrity: 4 testy pass; pnpm run typecheck:
+  exit 0; pnpm exec eslint obu zmienionych plików --max-warnings=0: exit 0.
+  Obserwacja poleceń i pełne wyjścia:
+  verification/saved-results-execution-20261027/focused-checks.json.
+  To kontrole źródeł JS/TS, nie native build ani dowód wizualny.
+- source-view.json w tym samym katalogu potwierdza zgodność plików worktree
+  i rzeczywiście testowanego cienia frontendu.
+  SavedResultsBrowser.tsx SHA256
+  995ba6f699eed343703b9b78ed1857f76f9104b8243e5460cd0c178376b05ba0;
+  SavedResultsBrowser.execution.test.tsx SHA256
+  f22150464e51ee191a73967c0543d26858a944b309eafa61ac5355ca808c6c56.
+
+Nie zmieniono schematu API, wygenerowanych typów, native operatora ani źródeł
+pracującego solvera. Nie restartowano backendu. Nowa stopka nie udaje obserwacji
+innego runa: stan nowej próby należy czytać po jej jawnym wyborze w Saved Results.
+Nie wykonywano nowych kompilacji testów Rust ani ponownego Solve diagnostyki.
