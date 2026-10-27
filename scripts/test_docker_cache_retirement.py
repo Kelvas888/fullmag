@@ -224,6 +224,50 @@ class RetirementTests(unittest.TestCase):
         result = self._retire(lambda keys, operation: {"state": "succeeded", "unit_keys": keys})
         self.assertEqual(result["state"], "succeeded")
 
+    def test_unrelated_windows_drive_binds_do_not_block_retirement(self):
+        self.docker.containers["3" * 64] = {
+            "Id": "3" * 64, "Config": {"Labels": None},
+            "Mounts": [{"Type": "bind", "Source": source} for source in (
+                r"C:\git\fullmag\worktrees\other",
+                r"C:\git\fullmag\worktrees\other/apps/control-room/app",
+                r"E:\git\storage\runtimes\other",
+                "D:/git/other",
+            )],
+        }
+        result = self._retire(lambda keys, operation: {"state": "succeeded", "unit_keys": keys})
+        self.assertEqual(result["state"], "succeeded")
+        self.assertEqual(len(self.docker.removed), 4)
+        self.assertIn(self.shared_name, self.docker.volumes)
+
+    def test_unknown_bind_path_formats_block_before_plan_or_deletion(self):
+        for source in (None, "", r"relative\path", "relative/path",
+                       r"\\wsl.localhost\docker-desktop\var\lib\docker\volumes",
+                       "//wsl.localhost/docker-desktop/var/lib/docker/volumes"):
+            with self.subTest(source=source):
+                self.docker.containers["3" * 64] = {
+                    "Id": "3" * 64, "Config": {"Labels": None},
+                    "Mounts": [{"Type": "bind", "Source": source}],
+                }
+                with self.assertRaisesRegex(retirement.CacheRetirementError, "bind-source inventory is ambiguous"):
+                    self._retire(lambda keys, operation: {"state": "succeeded", "unit_keys": keys})
+                self.assertEqual(self.docker.removed, [])
+                self.assertNotIn(retirement.PLAN_PATH, self.control.records)
+
+    def test_posix_private_and_shared_bind_aliases_still_block(self):
+        private = self.docker.volumes[self.backend_profile["volume_names"][backend_cache.BUILD_VOLUME_ROLE]]
+        shared = self.docker.volumes[self.shared_name]
+        for source in (private["Mountpoint"], private["Mountpoint"] + "/child",
+                       "/", "/var/lib/docker/volumes", shared["Mountpoint"] + "/artifacts"):
+            with self.subTest(source=source):
+                self.docker.containers["3" * 64] = {
+                    "Id": "3" * 64, "Config": {"Labels": None},
+                    "Mounts": [{"Type": "bind", "Source": source}],
+                }
+                with self.assertRaisesRegex(retirement.CacheRetirementError, "bind-aliases"):
+                    self._retire(lambda keys, operation: {"state": "succeeded", "unit_keys": keys})
+                self.assertEqual(self.docker.removed, [])
+                self.assertNotIn(retirement.PLAN_PATH, self.control.records)
+
     def test_unlabelled_private_volume_consumer_blocks(self):
         name = self.backend_profile["volume_names"][backend_cache.BUILD_VOLUME_ROLE]
         self.docker.containers["4" * 64] = {
