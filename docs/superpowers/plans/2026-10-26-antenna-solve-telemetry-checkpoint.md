@@ -427,3 +427,84 @@ Zarządzana kontrola frontend-antenna: sukces. Typecheck, testy dwóch wskazanyc
 plików Vitest i ESLint zakończyły się kodem 0; receipt
 verification/frontend-antenna-checks/receipt.json. To kontrola typów i kontraktów,
 nie dowód wizualny przeglądarki ani naukowa kwalifikacja anteny.
+
+
+### Diagnostyka geometrii 20 punktów i pełna próba Universe — 27.10.2026
+
+Audyt tylko do odczytu rozdzielił nośnik źródła (raw 664 węzły / 1856 Tet4,
+po przecięciu źródła 677 / 1856) od nośnika pola Global (1145 / 6428).
+Zgodność geometrii elementów źródła nie wymaga zgodności numeracji węzłów
+niezależnego Global. Samo istnienie 46 wspólnych węzłów nie jest błędem siatki.
+Dowód: verification/native-call-timing-20261027/geometry-readonly-audit.json,
+SHA256 628aa18d64471935fc36fa78ac9cf6005ec82541911c75bb0e56bd2caf1039f6.
+Klasyfikacja obejmuje przypadki dokładnie na granicy, wewnętrzne i bliskie
+granicy; bardzo małe odległości dotyczą dokładnej reprezentacji binary64,
+nie deklarowanej dokładności fizycznej.
+
+Nowy publiczny skrypt rt0_geometry_180s/fem_antenna_rt0_geometry_180s.py
+zachowuje 20 istniejących węzłów i pięć Tet4 Global wraz z ich ordinalami.
+Nie przemieszcza węzłów, nie upraszcza przewodnika ani tolerancji.
+Wybór i hashe zapisano w input-manifest.json. Nie obejmuje 15 przypadków
+kontaktów wewnętrznych źródła; pełna próba je zachowuje.
+Pierwszy capture odmówił dostępu do assetów poza katalogiem skryptu.
+Naprawiono pakiet wejścia przez identyczne lokalne kopie assetów;
+nie zmieniono bramki ani katalogu uprawnień.
+
+Run run-bb36bd56d49ba6da9201623cd8d5566f141e292f0c7d474e4c9f897c0cebb6a1,
+task task-1c5af8116c42e519552172b6e5a7a2873c30cded42dfe28f9ade2fb6f2a5356a,
+attempt attempt-51e01e436bfd43ca941ad03d8062db0d, epoch 1:
+**Succeeded**. Capture, kanoniczny producer RunIntent, pojedyncze Submit
+i materializacja, worker native, archiwum oraz publiczny odczyt V/J/H
+przeszły rzeczywistą ścieżkę aplikacji.
+
+| Zmierzony zakres diagnostyki 20 punktów | Czas [s] |
+|---|---:|
+| Cała operacja runnera | 211.171287713 |
+| Całe wywołanie native ABI | 199.361945707 |
+| Operator pola | 142.854900841 |
+| Native poza operatorem pola | 56.507044866 |
+| Runner poza wywołaniem native | 11.809342006 |
+
+Profil nie zgłasza accounting_issue. Wszystkie 20 wektorów H są skończone.
+Publiczne v_raw, j_center_raw, h_raw i sample_xyz zwróciły HTTP 200
+i zgodność hashy z przypiętym pakietem. V/J są bitowo identyczne z baseline4,
+a cztery wspólne próbki H również pozostają bitowo identyczne.
+Worker PID 7399 zakończony; lease-a83dc91282a24c0babd5168ea37f73ea
+Released 2026-10-27T05:20:36.030104473Z.
+Dowody: verification/rt0-geometry-cases-20261027/public-vjh-comparison.json,
+worker-operation-profile.v1.json, timing-breakdown.json, run-terminal.json
+i resource-lease-records.json. To nadal inspection_only, nie kwalifikacja
+bazy per A, FFT, LLG ani odtworzenie publikacji.
+
+Pełny skrypt rt0_full_universe_frozen/fem_antenna_rt0_full_universe_frozen.py
+usuwa diagnostyczny obiekt sampling i wybiera Global. Zachowuje wszystkie
+1145 węzłów / 6428 Tet4, ten sam przewodnik i 2 125 120 par źródło–target.
+Rzeczywisty capture potwierdził przygotowane źródło 677 / 1856,
+identyczne z anteną diagnostyki 20. Wszystkie tolerancje i limity są identyczne,
+poza przywróceniem dotychczasowego limitu pełnego pola 10800 s;
+90 s/target pozostaje. Nie podniesiono dotychczasowej polityki pełnej próby.
+Niezależny przegląd obu skryptów i manifestów: brak Required.
+Przegląd źródeł nie stanowi dowodu ukończenia pełnego Solve.
+
+Próba pełna run-5654db21201dd6c660f7ecae78baf8588477fe2a7d90480d9d64b30e4d050080
+została przyjęta HTTP 201; fingerprint
+9475dbcad624061ae17274f275355b3aaea03429df46b4b1fcdeb4e7179c1f87
+zgodny z kanonicznym producerem. Materializacja raz, HTTP 200.
+Task task-5d7919a0c304d49459b92343dca688a7f370108c918308340259d02ae7694bc0,
+attempt attempt-61282a3f0a5b4db8a9a8add68d705645, epoch 1,
+stan odczytany przez API: running, rewizja 23. PID 9549 rzeczywiście pracuje.
+Jego załadowana biblioteka ma SHA256
+9d53bd2519a8c814f4272137712a1b48ba5a277c63aba84380855361f3dc4eea,
+identyczny z diagnostyką 20 punktów. Stan ten nie dowodzi wyniku pełnej mapy.
+Dowody w verification/rt0-full-universe-20261027/, w tym
+compiled-carrier-shape.json, pre-submit-review.json, submit-response.json,
+materialization-response.json i loaded-worker-native-binding.json.
+Prepared request SHA256 c8c2cb73b1e5767f0f3f504a65d209c1a3696e28de596b5c4cf90bc2a8dc816a.
+Commit źródeł przed próbą: 3ddfd9b4c680255f7b142e3b277d7079cf8feefa;
+pakiet pozostaje z udanej iteracji dd1fd019a11c4a29b2545ce36f1b1c4c.
+
+W UI licznik step opisuje dynamikę LLG, więc statyczne V/J/H nie zwiększa go.
+Aktywny accepted run i scena authoring to odrębne zasoby; sam widok sceny
+nie potwierdza przypięcia ani wyrenderowania wyniku accepted.
+Pełna mapa, jej wyświetlenie w Universe i browser/WebGL: nadal NOT VERIFIED
+w chwili tego checkpointu. Odczytu przeglądarki nie ponawiano po blokadzie.
