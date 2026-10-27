@@ -13,8 +13,8 @@
    Weryfikacja: 60 interpreted frontend tests; review diffu i lifecycle.
 2. `d63759018d84430c3be971de5ac1d316825f2dc2` — współdzielone pakiety backendu,
    transport named volumes, Cargo cache, bezpieczna publikacja/recovery i jawna retencja.
-3. Końcowy etap dodaje automatyczną retencję po starcie oraz kwalifikowane
-   sprzątanie przy `worktree-finish completed`; hash zapisywany w raporcie integracji.
+3. `1ef18597014637a2124993e91d8c9fcfb18bb80a` — automatyczna retencja po starcie
+   oraz kwalifikowane sprzątanie przy `worktree-finish completed`.
 
 ## Dowody przed integracją
 
@@ -25,9 +25,7 @@
   recovery ready publisher/cache-hit bez fikcyjnego Make attempt.
 - Root initializer: 8 tests, 1 UID65532 probe skipped na hoście nie-root.
 - Zarządzane obrazy helperów: build PASS, backend image
-  `sha256:f4f97860f4ee6563cd860e6ddd4cdf7175d7020cee512d5eaade48667ce834d1`.
-  Obraz poprzedza ostatnie poprawki crash recovery; wymaga refresh przed
-  pełnym testem startu aplikacji.
+  `sha256:5b537e4445291e8e505f98ac424b4a8f61bb76f913b2b7742a35f647fcd7c7c5`.
 - Niezależne review wykryło ctime/link races i recovery building/ready/cleanup;
   poprawki i regresje dodane. Sam review nie jest qualification runtime.
 - Docker UID/mount/concurrent helper proof: PASS. Dwóch publisherów tego samego
@@ -51,3 +49,10 @@ kontenerów. Nie ma globalnego quota Docker ani zbiorczego usuwania danych
 nieznanych/starych grup. Limit incremental nie ogranicza całego target. Zachować cudze dirty
 submodules w głównym checkoutcie. PR, merge, fast-forward i cleanup własnego
 worktree pozostają wymaganymi krokami domknięcia.
+
+## CI i integracja
+
+PR: https://github.com/MateuszZelent/fullmag/pull/285. Pierwsze CI wykryło stare
+fixture cache oraz certyfikatu offline; uzupełniono wymagane pola, bez zmiany
+walidatorów. Lokalnie przeszło wszystkich 59 skryptów bramki Docker storage
+z workflow (łącznie z poprawionymi fixture). Końcowe kontrole PR pozostają w toku.
