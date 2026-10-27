@@ -754,3 +754,56 @@ Status: implementacja i kontrole źródeł/klienta API zweryfikowane w opisanym 
 Browser/WebGL, obraz pełnego Universe i cold reopen nadal NOT VERIFIED.
 Nie ponawiano zablokowanego dostępu do przeglądarki. Baza per A, LLG, FFT,
 kwalifikacja naukowa i odtworzenie publikacji nie wynikają z tej poprawki.
+
+### Kontroler odbioru pełnego Universe — 27.10.2026
+
+Dodano scripts/verify_antenna_universe_result.py oraz interpretowane regresje
+scripts/test_verify_antenna_universe_result.py. To kontroler odbioru danych,
+nie nowy solver ani nowa kwalifikacja fizyki. Nie zmienia istniejących tolerancji.
+
+read_inputs sprawdza hashe skryptów i wszystkich assetów obu zamrożonych wejść,
+kopertę i hash topology.npz, 1145 węzłów / 6428 Tet4 Global oraz dokładne
+mapowanie 20 węzłów diagnostycznych. compare_payloads wymaga całych tablic
+sample_xyz i sample_cells zgodnych z zamrożonym Global, skończonych H,
+bitowej zgodności wspólnych H oraz niezmienionych v_raw, j_center_raw,
+j_local_raw, vertex_xyz, stable_vertex_ids i conductivity względem diagnostyki.
+Krótsza mapa diagnostyczna nie przechodzi jako pełny Universe.
+To ścisła kontrola odtwarzalności dla tych wejść, nie niezależny dowód dokładności H.
+
+verify najpierw odczytuje konkretny ProjectRunResource. Running oraz inne
+kanoniczne stany nieterminalne dają jawne waiting, full_universe_verified=false,
+exit 2; nie są traktowane jak ukończony wynik lub powód restartu. Po succeeded
+wywoływana jest istniejąca validate_accepted_antenna_closed_loop_http.validate,
+a następnie odczyt dokładnie przypiętych payloadów pełnego runu i referencji.
+Błąd danych zapisuje failed/exit 1, zamiast pozostawienia starszego waiting.
+
+Niezależny review wykrył brak pełnego powiązania project/run/task w nowym
+kontrolerze. Uzupełniono go przed commitem: fetch_bundle zawsze odczytuje własny
+run, wymaga jednego succeeded taska, zgodnego projektu/runu katalogu,
+zgodnego projektu metadanych oraz zgodności owner.task_id/attempt_id/ownership_epoch
+z tym taskiem. Ten sam warunek dotyczy referencji. Negatywna regresja odrzuca osiem
+podmian przed pobraniem payloadów. Końcowy review: Required zamknięte.
+
+Końcowe dowody w verification/rt0-full-universe-20261027/:
+- verifier-source-tests-final.json: 11 testów PASS, uruchomionych jako
+  python3 -B scripts/test_verify_antenna_universe_result.py w istniejącym backendzie;
+  brak kompilacji testów Rust. Hashe końcowych źródeł zapisano w tym dowodzie.
+- verifier-reference-http-final.json: rzeczywisty fetch_bundle po końcowej poprawce
+  tożsamości PASS; wszystkie dziewięć payloadów odczytane, 20 próbek / 5 Tet4,
+  bez Solve. Odczyt zajął 147.752 s; nie jest to czas obliczenia pola.
+- verifier-live-wait-final.json i full-parity-gate.json: rzeczywisty pełny run
+  nadal running, wynik kontrolera waiting/exit 2, full_universe_verified=false.
+  Żywy PID 9549 oraz jego starttime i rosnący CPU sprawdzano oddzielnie.
+- poprzednie nieudane i pośrednie kontrole zachowano, bez usuwania danych.
+
+Przykładowa faktycznie wykonana konfiguracja kontrolera: origin
+http://127.0.0.1:8081, project-1f48487cf16342ca9524e0795d39597b,
+full-run run-5654db21201dd6c660f7ecae78baf8588477fe2a7d90480d9d64b30e4d050080,
+full-input examples/antenna_universe/rt0_full_universe_frozen,
+reference-input examples/antenna_universe/rt0_geometry_180s. Dokładna komenda
+z absolutnymi ścieżkami kontenera znajduje się w verifier-live-wait-final.json.
+Raport i logi są w wolumenie kontrolnym własnej grupy, nie na hoście.
+
+Pełna bramka po succeeded, cold reopen, odbiór browser/WebGL oraz kwalifikacja
+naukowa nadal NOT VERIFIED. Nie uruchamiano buildu/restartu podczas obliczeń.
+Zachowano osobno wcześniejszy WIP runtime i obcy wpis indeksu.
