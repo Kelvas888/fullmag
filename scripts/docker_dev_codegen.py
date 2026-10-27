@@ -98,7 +98,11 @@ def digest_binary(name):
     descriptor = os.open("/opt/fullmag/package/bin/" + name, FLAGS)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        # Verified packages are shared between DEV groups as sealed (read-only)
+        # hardlinks; a writable binary must still have exactly one link. The
+        # digest below is checked against the build receipt either way.
+        sealed = not metadata.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        if not stat.S_ISREG(metadata.st_mode) or (metadata.st_nlink != 1 and not sealed):
             raise RuntimeError("runtime binary is not one regular file")
         digest = hashlib.sha256()
         total = 0
@@ -455,6 +459,29 @@ def _path_identity(value: object) -> str:
     return normalized
 
 
+_WSL_DESKTOP_BIND_MOUNT = re.compile(
+    r"/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/[^/]+/([0-9a-f]{64})"
+)
+
+
+def _mount_source_matches(mount_source: object, selected: Path) -> bool:
+    """Compare an inspected bind-mount source with the selected checkout.
+
+    Docker Desktop's WSL integration reports a Linux checkout as an opaque
+    `docker-desktop-bind-mounts/<distro>/<sha256>` path whose digest is the
+    SHA-256 of the exact host path, so it is compared by that digest.
+    """
+    if _path_identity(mount_source) == _path_identity(str(selected)):
+        return True
+    if not isinstance(mount_source, str):
+        return False
+    match = _WSL_DESKTOP_BIND_MOUNT.fullmatch(mount_source.rstrip("/"))
+    if not match:
+        return False
+    host_path = selected.as_posix().rstrip("/") or "/"
+    return hashlib.sha256(host_path.encode("utf-8")).hexdigest() == match.group(1)
+
+
 def _environment(document: Mapping[str, Any]) -> dict[str, str]:
     config = document.get("Config")
     values = config.get("Env") if isinstance(config, Mapping) else None
@@ -578,7 +605,7 @@ def _running_service(
     if not source_root or _path_identity(source_root) != _path_identity(str(selected)):
         raise CodegenError(f"{service} service environment is mounted from a different source checkout")
     source_mount = _mount_for(document, "/opt/fullmag/source")
-    if _path_identity(source_mount.get("Source")) != _path_identity(str(selected)):
+    if not _mount_source_matches(source_mount.get("Source"), selected):
         raise CodegenError(f"{service} inspected source mount differs from the selected checkout")
     return container, document
 
@@ -952,10 +979,14 @@ def _publish_outputs(source: Path, outputs: Mapping[str, bytes], before: Mapping
     try:
         for name, data in outputs.items():
             destination = target_root / name
+            # mkstemp creates 0600 files; generated sources must stay readable
+            # by the frontend service, so keep the previous (or default) mode.
+            mode = destination.stat().st_mode & 0o777 if destination.exists() else 0o644
             handle, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=target_root)
             with os.fdopen(handle, "wb", closefd=True) as stream:
                 stream.write(data)
                 stream.flush()
+                os.fchmod(stream.fileno(), mode | 0o444)
                 os.fsync(stream.fileno())
             temporary.append((Path(temporary_name), destination))
         published: dict[str, str] = {}

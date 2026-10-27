@@ -1,6 +1,7 @@
 """Lightweight source and provenance checks for the fixed-service codegen route."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -55,6 +56,39 @@ class DockerDevCodegenTests(unittest.TestCase):
             "/run/desktop/mnt/host/c/git/fullmag/fullmag",
         ):
             self.assertEqual(expected, codegen._path_identity(alias))
+
+    def test_mount_source_matches_docker_desktop_wsl_bind_mount_digest(self) -> None:
+        selected = Path("/home/user/git/fullmag/worktrees/task")
+        digest = hashlib.sha256(b"/home/user/git/fullmag/worktrees/task").hexdigest()
+        mount = f"/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/{digest}"
+        self.assertTrue(codegen._mount_source_matches(mount, selected))
+        other = hashlib.sha256(b"/home/user/git/fullmag/fullmag").hexdigest()
+        self.assertFalse(codegen._mount_source_matches(
+            f"/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/{other}", selected
+        ))
+        self.assertTrue(codegen._mount_source_matches(str(selected), selected))
+        self.assertFalse(codegen._mount_source_matches(None, selected))
+
+    def test_backend_binary_digest_accepts_only_sealed_shared_hardlinks(self) -> None:
+        script = codegen.BACKEND_DOCUMENTS_SCRIPT
+        self.assertIn("metadata.st_nlink != 1 and not sealed", script)
+        self.assertIn("stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH", script)
+
+    def test_published_outputs_stay_readable_by_the_frontend_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            target = source / "apps/control-room/src/kernel/api/generated"
+            target.mkdir(parents=True)
+            existing = target / "openapi-v2.json"
+            existing.write_bytes(b"{}")
+            existing.chmod(0o644)
+            codegen._publish_outputs(
+                source,
+                {"openapi-v2.json": b'{"a":1}', "openapi-v2-paths.ts": b"export {};"},
+                {"openapi-v2.json": codegen._sha256(b"{}"), "openapi-v2-paths.ts": None},
+            )
+            for name in ("openapi-v2.json", "openapi-v2-paths.ts"):
+                self.assertEqual((target / name).stat().st_mode & 0o444, 0o444, name)
 
     def test_source_probe_uses_backend_module_root(self) -> None:
         self.assertIn('sys.path.insert(0, "/opt/fullmag")', codegen.SOURCE_PROBE_SCRIPT)
