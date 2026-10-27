@@ -13,52 +13,16 @@
   flex-shrink: 0;
 }
 
-/* ── Tab bar: underline style scoped to Explorer ── */
+/* The shared line Tabs owns presentation; this panel owns spacing/overflow. */
 .fm-explorer-tabs {
-  border-bottom: 1px solid var(--fm-border-subtle);
-  padding: 0 var(--fm-space-2);
-  overflow-x: auto;
-  scrollbar-width: none;
+  padding: 0;
+  overflow: visible;
+  scrollbar-width: thin;
 }
 
-.fm-explorer-tabs::-webkit-scrollbar {
-  display: none;
-}
-
-/* Override the shared fm-tabs-list inside explorer */
 .fm-explorer-tabs .fm-tabs-list {
-  gap: 0;
-  min-height: var(--fm-panel-header-height);
-  border: 0;
-  background: transparent;
-}
-
-.fm-explorer-tabs .fm-tabs-trigger {
-  height: var(--fm-panel-header-height);
-  padding-inline: var(--fm-space-2);
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  background: transparent;
-  color: var(--fm-text-muted);
-  font-size: var(--fm-font-size-sm);
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  transition:
-    color var(--fm-transition-fast),
-    border-color var(--fm-transition-fast);
-}
-
-.fm-explorer-tabs .fm-tabs-trigger:hover {
-  background: transparent;
-  color: var(--fm-text-secondary);
-}
-
-.fm-explorer-tabs .fm-tabs-trigger[data-state="active"] {
-  border-bottom-color: var(--fm-accent);
-  background: transparent;
-  color: var(--fm-accent);
-  font-weight: 600;
+  width: auto;
+  min-width: 0;
 }
 
 /* ── Filter bar ── */
@@ -631,3 +595,8 @@
     display: none;
   }
 }
+
+/* Resource names stay readable; the status glyph/badge carries its own tone. */
+.fm-explorer-tree-row[data-status] { color: var(--fm-text-primary); }
+.fm-explorer-tree-row__status { color: var(--fm-text-secondary); }
+.fm-explorer-toolbar__action { min-width: 24px; min-height: 28px; }

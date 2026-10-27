@@ -822,9 +822,12 @@ def _record_activation_result(operation: dict[str, object], result: Mapping[str,
     if isinstance(result.get("retirement"), Mapping):
         receipt["retirement"] = dict(result["retirement"])
     if result["state"] == "rejected":
-        raise BuildControlError(
+        error = BuildControlError(
             "Backend activation was rejected; terminal activation receipt retained and retry is forbidden"
         )
+        if isinstance(result.get("rejection"), Mapping):
+            setattr(error, "rejection", dict(result["rejection"]))
+        raise error
 
 
 def _read_control_bytes(

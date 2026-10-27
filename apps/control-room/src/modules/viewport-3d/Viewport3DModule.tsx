@@ -43,6 +43,7 @@ import {
   viewport3DOrbitDebugEnabledFromBrowserConfig,
 } from "@/kernel/browserFullmagConfig";
 import type { MeshSizeHistogramHighlight } from "@/kernel/events/eventTypes";
+import { useInstanceTabHidden } from "@/kernel/layout/instanceTabVisibility";
 import { useMeshHistogramBinElementsResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { sessionResourceIdentityKey, type SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
@@ -2158,6 +2159,9 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     effectAntialias,
   );
   const canvasContextKey = `viewport-3d-canvas-aa:${canvasGlOptions.antialias ? "1" : "0"}-preserve:${canvasGlOptions.preserveDrawingBuffer ? "1" : "0"}`;
+  // A hidden instance tab renders nothing; the root, its WebGL context and the
+  // view stay, and going back to `demand` invalidates once (ADR 0069).
+  const canvasFrameloop = useInstanceTabHidden() ? "never" : VIEWPORT_3D_FRAMELOOP;
   const orbitDebugEnabled = viewport3DOrbitDebugEnabledFromBrowserConfig();
   const hysteresisReplayLabel = formatHysteresisReplayLabel(hysteresisReplayTarget);
   const [orbitDebugAngles, setOrbitDebugAngles] =
@@ -2793,7 +2797,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
-      <div className="fm-viewport-3d__hud">
+      <div className="fm-viewport-3d__hud" role="group" aria-label="3D view controls">
         <Viewport3DAppearanceHud onOpenSettings={() => { void kernel.commands.execute("viewport-3d.open-settings", { source: "menu", layout: kernel.layout, selection: kernel.selection }); }} />
         {fieldDataIssue ? (
           <div className="fm-viewport-3d__issue-banner" role="status">
@@ -2834,7 +2838,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </fieldset>
         ) : null}
         <Viewport3DFieldLabel quantityId={antennaFieldOverlay?.intent.quantity ?? quantityId} label={antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} liveDataAvailable={antennaFieldOverlay ? undefined : liveQuantityDataAvailable} />
-        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
+        <span title={antennaFieldSourceLabel ?? selectedLabel}>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{artifactField.model ? `${artifactField.model.count} owned samples · historical inspection · ${artifactField.model.unit}` : antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
         {!antennaFieldOverlay && artifactField.candidates.length > 0 ? (
@@ -3021,7 +3025,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
           events={createCanvasEvents}
-          frameloop={VIEWPORT_3D_FRAMELOOP}
+          frameloop={canvasFrameloop}
           gl={canvasGlOptions}
           key={canvasContextKey}
           onCreated={handleCanvasCreated}

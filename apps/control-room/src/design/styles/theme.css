@@ -29,9 +29,11 @@
 
   --fm-text-primary: #cdd6f4;
   --fm-text-secondary: #bac2de;
-  --fm-text-muted: #6c7086;
-  --fm-text-disabled: var(--fm-text-muted);
+  --fm-text-tertiary: #a6adc8;
+  --fm-text-muted: var(--fm-text-tertiary);
+  --fm-text-disabled: #7f849c; /* Overlay1: legible, clearly below tertiary */
   --fm-text-inverse: #11111b;
+  --fm-text-on-accent: #1e1e2e;
 
   --fm-accent: #89b4fa;
   --fm-accent-strong: #b4befe;
@@ -51,6 +53,12 @@
   --fm-chart-lavender: #b4befe;
   --fm-chart-flamingo: #f2cdcd;
   --fm-chart-rosewater: #f5e0dc;
+
+  /* Telemetry identity is a UI category palette, separate from chart and status roles. */
+  --fm-category-runtime: #89b4fa;
+  --fm-category-solver: #a6e3a1;
+  --fm-category-magnetization: #cba6f7;
+  --fm-category-energy: #fab387;
 
   --fm-explorer-icon-group: var(--fm-accent-strong);
   --fm-explorer-icon-object: var(--fm-chart-peach);
@@ -142,10 +150,12 @@
   --fm-border-disabled: var(--fm-border-muted);
 
   --fm-text-primary: #4c4f69;
-  --fm-text-secondary: #5c5f77;
-  --fm-text-muted: #9ca0b0;
-  --fm-text-disabled: var(--fm-text-muted);
+  --fm-text-secondary: #525570; /* between Text and tertiary; AA on every surface incl. selected */
+  --fm-text-tertiary: #585c71;
+  --fm-text-muted: var(--fm-text-tertiary);
+  --fm-text-disabled: #7c7f93; /* Overlay2: legible, clearly below tertiary */
   --fm-text-inverse: #eff1f5;
+  --fm-text-on-accent: #ffffff;
 
   --fm-accent: #1e66f5;
   --fm-accent-strong: #7287fd;
@@ -165,6 +175,12 @@
   --fm-chart-lavender: #7287fd;
   --fm-chart-flamingo: #dd7878;
   --fm-chart-rosewater: #dc8a78;
+
+  /* Keep telemetry group identity independent of status and scientific chart roles. */
+  --fm-category-runtime: #1e66f5;
+  --fm-category-solver: #40a02b;
+  --fm-category-magnetization: #8839ef;
+  --fm-category-energy: #fe640b;
 
   --fm-explorer-icon-group: var(--fm-accent-strong);
   --fm-explorer-icon-object: var(--fm-chart-peach);
