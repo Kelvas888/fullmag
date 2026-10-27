@@ -15262,6 +15262,11 @@ export interface components {
         SolverProfileOperationResource: {
             accounting_issue: boolean;
             execution_config?: null | components["schemas"]["SolverProfileCommandConfig"];
+            /**
+             * Format: int64
+             * @description Entire native ABI call, containing the surface operator duration.
+             */
+            native_call_wall_ns?: number | null;
             /** Format: int64 */
             native_operator_wall_ns?: number | null;
             operation_id: string;

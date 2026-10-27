@@ -402,3 +402,28 @@ ani nie zmieniono receiptów. Pozostają zarządzany build z aktualnymi źródł
 i regeneracja klienta/typów; nie zgłoszono ich jako zakończonych. Następny krok
 wydajności: pomiar etapów native i osobno poprawka operatora pola, z kontrolą
 identycznych wyników.
+
+
+### Zamknięcie synchronizacji typów — 27.10.2026
+
+Poprzednia blokada stale-source została usunięta przez rzeczywisty zarządzany
+build, bez osłabienia bramki. Iteracja dd1fd019a11c4a29b2545ce36f1b1c4c:
+sukces, Make 254713 ms, pakowanie 8802 ms, weryfikacja 3559 ms.
+Commit wejściowy 891918ab18fbef6c7bf35328b5aee6254aad626a,
+snapshot baef683051ad8031277a7347e88983cb278a07f00c06c11c8281dca12098f577.
+Receipt SHA256 3bd6bcda27927a285243c2c45ce55d26c3c1c663afa40641b3ca6d0f53ee8758;
+kopia build-dd1fd019-receipt.json w dotychczasowym wolumenie dowodów.
+API health HTTP 200. Zachowano te same kontenery i wszystkie dane; pozostawiono
+10 generacji rollback bez usuwania.
+
+Rzeczywisty docker-dev-codegen zakończył się sukcesem: exit 0, 68733 ms,
+receipt backend/codegen/openapi-v2/a28c6d671a2de47e7b0f1d2a71b1b300edcdb1ddd1e7715585252a7c11aa7654.json.
+Wygenerowano cztery artefakty; diff obejmuje tylko openapi-v2.json
+i openapi-v2-types.ts: opcjonalne native_call_wall_ns. Nie zmieniono endpointów.
+Przypięty backend, frontend, źródła, build identity i wolumeny zostały sprawdzone
+przed generacją oraz po niej; staging usunięto przez istniejącą procedurę.
+
+Zarządzana kontrola frontend-antenna: sukces. Typecheck, testy dwóch wskazanych
+plików Vitest i ESLint zakończyły się kodem 0; receipt
+verification/frontend-antenna-checks/receipt.json. To kontrola typów i kontraktów,
+nie dowód wizualny przeglądarki ani naukowa kwalifikacja anteny.
