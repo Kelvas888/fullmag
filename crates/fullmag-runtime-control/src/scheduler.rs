@@ -440,6 +440,20 @@ pub fn resume_next_admitted_accepted_task_with_host(
     resource_id: &str,
     host: &crate::host_runtime::HostRuntimeAdmission,
 ) -> Result<Option<ScheduledAcceptedTask>> {
+    // Discovery can observe RunIntent before its initial task catalog is
+    // published. No admitted claim can be resumed until that catalog exists.
+    let Some(catalog) = store.read_run_catalog(run_id.as_str())? else {
+        return Ok(None);
+    };
+    if !catalog.tasks.iter().any(|task| {
+        task.lifecycle == FmsTaskLifecycle::Preparing
+            && task.readiness == FmsTaskReadiness::Ready
+            && task.resource_id.as_deref() == Some(resource_id)
+            && task.attempt_id.is_some()
+            && task.ownership_epoch.is_some()
+    }) {
+        return Ok(None);
+    }
     let intent = store
         .read_run_intent(run_id.as_str())?
         .context("accepted scheduler recovery requires an immutable run intent")?;
@@ -454,20 +468,6 @@ pub fn resume_next_admitted_accepted_task_with_host(
     // from turning into a worker launch when a manual run is still held.
     // Runs without the optional manual policy retain legacy automatic behavior.
     if !store.accepted_run_start_permitted(run_id.as_str())? {
-        return Ok(None);
-    }
-    // Discovery can observe RunIntent before its initial task catalog is
-    // published. No admitted claim can be resumed until that catalog exists.
-    let Some(catalog) = store.read_run_catalog(run_id.as_str())? else {
-        return Ok(None);
-    };
-    if !catalog.tasks.iter().any(|task| {
-        task.lifecycle == FmsTaskLifecycle::Preparing
-            && task.readiness == FmsTaskReadiness::Ready
-            && task.resource_id.as_deref() == Some(resource_id)
-            && task.attempt_id.is_some()
-            && task.ownership_epoch.is_some()
-    }) {
         return Ok(None);
     }
     // Idle resources, held runs and terminal tasks cannot be resumed. Do not

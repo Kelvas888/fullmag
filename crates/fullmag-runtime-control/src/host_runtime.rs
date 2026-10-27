@@ -388,6 +388,56 @@ mod recovery_tests {
     }
 
     #[test]
+    fn accepted_recovery_filters_catalog_before_reading_immutable_intent() {
+        let untyped = FmsRunIntent::new("run-1", "recovery-untyped", serde_json::json!({}));
+        let mut corrupt = untyped.clone();
+        corrupt.payload_sha256 = "b".repeat(64);
+        for (payload, expected_error) in [
+            (None, "requires an immutable run intent"),
+            (
+                Some(serde_json::to_string(&corrupt).unwrap()),
+                "run intent payload digest mismatch",
+            ),
+            (
+                Some(serde_json::to_string(&untyped).unwrap()),
+                "recovery run specification is not typed",
+            ),
+        ] {
+            let fixture = recovery_fixture_without_sample();
+            let run_id = fullmag_application::RunId::parse(&fixture.request.identity.run_id).unwrap();
+            seed_ready_queued_catalog(&fixture, None);
+            let intent_path = fixture.store.root().join("runs/run-1/run_intent.json");
+            if let Some(bytes) = &payload {
+                std::fs::write(&intent_path, bytes).unwrap();
+            }
+            let mut catalog = fixture.store.read_run_catalog(run_id.as_str()).unwrap().unwrap();
+            let before = fixture.ledger.read().unwrap().reservations;
+            assert!(crate::scheduler::resume_next_admitted_accepted_task_with_host(
+                &fixture.store, &run_id, "compute.cpu", &fixture.context,
+            ).unwrap().is_none());
+            assert_eq!(fixture.store.read_run_catalog(run_id.as_str()).unwrap(), Some(catalog.clone()));
+            assert_eq!(fixture.ledger.read().unwrap().reservations, before);
+            assert_eq!(std::fs::read_to_string(&intent_path).ok(), payload);
+
+            catalog.revision += 1;
+            catalog.tasks[0].lifecycle = FmsTaskLifecycle::Preparing;
+            catalog.tasks[0].resource_id = Some("compute.cpu".into());
+            catalog.tasks[0].attempt_id = Some("attempt-1".into());
+            catalog.tasks[0].ownership_epoch = Some(1);
+            fixture.store.commit_run_catalog(&catalog).unwrap();
+            let error = crate::scheduler::resume_next_admitted_accepted_task_with_host(
+                &fixture.store, &run_id, "compute.cpu", &fixture.context,
+            ).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "eligible Preparing recovery must validate its immutable input: {error:#}",
+            );
+            assert_eq!(fixture.store.read_run_catalog(run_id.as_str()).unwrap(), Some(catalog));
+            assert_eq!(fixture.ledger.read().unwrap().reservations, before);
+        }
+    }
+
+    #[test]
     fn accepted_recovery_waits_for_initial_catalog_without_mutating_admission() {
         let fixture = recovery_fixture();
         let run_id = fullmag_application::RunId::parse(&fixture.request.identity.run_id).unwrap();
