@@ -1609,6 +1609,7 @@ def _render_scene_stage_bootstrap(
                 "g",
                 "autosave",
                 "table_autosave",
+                "relax_alpha",
             },
         )
         kwargs = _scene_relax_stage_kwargs(stage, solver=solver)
@@ -2359,6 +2360,9 @@ def _scene_relax_stage_kwargs(
     max_relaxation_time_s = _finite_number(stage.get("max_relaxation_time_s"))
     if max_relaxation_time_s is not None:
         kwargs["max_relaxation_time_s"] = max_relaxation_time_s
+    relax_alpha = _finite_number(stage.get("relax_alpha"))
+    if relax_alpha is not None:
+        kwargs["relax_alpha"] = relax_alpha
     kwargs.update(_relax_stage_timestep_kwargs(stage, solver))
     return kwargs
 
@@ -2806,11 +2810,11 @@ def _bind_stage_world_state(
         return
     stage_kind = _infer_pipeline_stage_kind(payload)
     study = stage.problem.study
-    _reject_stage_material_changes(
-        stage,
-        base_problem,
-        ignore_alpha=isinstance(study, Relaxation) and study.algorithm == "llg_overdamped",
-    )
+    relax_alpha_stage = isinstance(study, Relaxation) and study.algorithm == "llg_overdamped"
+    _reject_stage_material_changes(stage, base_problem, ignore_alpha=relax_alpha_stage)
+    if relax_alpha_stage and _stage_damping_matches_base(stage, base_problem):
+        # Only an actual relax(relax_alpha=...) override needs to travel.
+        payload.pop("relax_alpha", None)
     if stage_kind == "hysteresis":
         # Every hysteresis point sets its own field.
         return
@@ -2823,6 +2827,14 @@ def _bind_stage_world_state(
             "set the field once for the whole script"
         )
     payload["external_field"] = stage_field if stage_field is not None else [0.0, 0.0, 0.0]
+
+
+def _stage_damping_matches_base(stage: LoadedStage, base_problem: Problem) -> bool:
+    base_alpha = {magnet.name: magnet.material.alpha for magnet in base_problem.magnets}
+    return all(
+        base_alpha.get(magnet.name) == magnet.material.alpha
+        for magnet in stage.problem.magnets
+    )
 
 
 def _reject_stage_material_changes(
