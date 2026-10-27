@@ -36,6 +36,7 @@ import {
   fieldCatalogQuantitySupportsSpatialVisualization,
   quantityCatalogEntrySupportsAirbox,
   quantityCatalogEntrySupportsSpatialVisualization,
+  quantityCatalogPickerItem,
 } from "@/kernel/api/quantityIds";
 import { RIBBON_CROSS_SECTION_BEGIN_DRAFT_COMMAND } from "./ribbonCommands";
 
@@ -85,12 +86,14 @@ export function quantityItemsForVisualizationTarget(
             ? quantityCatalogEntrySupportsAirbox
             : quantityCatalogEntrySupportsSpatialVisualization,
         )
-        .map((quantity) => ({
-          label: quantity.unit
-            ? `${quantity.label} / ${quantity.unit}`
-            : quantity.label || quantity.id,
-          value: quantity.id,
-        }))
+        .map((quantity) =>
+          quantityCatalogPickerItem(
+            quantity,
+            quantity.unit
+              ? `${quantity.label} / ${quantity.unit}`
+              : quantity.label || quantity.id,
+          ),
+        )
     : [];
   const fieldItems = fieldCatalog
     ? fieldCatalog.quantities
@@ -128,10 +131,10 @@ export function quantityItemsForVisualizationTarget(
 }
 
 function mergeQuantityItems(
-  capabilityItems: Array<{ label: string; value: string }>,
+  capabilityItems: Array<{ disabled?: boolean; label: string; value: string }>,
   fieldItems: Array<{ label: string; value: string }>,
-): Array<{ label: string; value: string }> {
-  const merged = new Map<string, { label: string; value: string }>();
+): Array<{ disabled?: boolean; label: string; value: string }> {
+  const merged = new Map<string, { disabled?: boolean; label: string; value: string }>();
   for (const item of capabilityItems) merged.set(item.value, item);
   for (const item of fieldItems) {
     if (!merged.has(item.value)) merged.set(item.value, item);
