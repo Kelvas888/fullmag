@@ -4179,7 +4179,7 @@ export function useViewport3DSceneModel({
   const nativeLayerFieldVectors = useViewport3DQuantityFieldVectors(
     nativeLayerFieldRequests,
     liveViewportResourcesEnabled &&
-      sessionDiscretization === "fdm" && nativeLayerFieldRequests.size > 0,
+      fdmLaneActive && nativeLayerFieldRequests.size > 0,
     { selectedTargetId: selectedVisualizationTargetId },
   );
   const fdmTargetSettingsById = useMemo(() => {
@@ -4492,8 +4492,10 @@ export function useViewport3DSceneModel({
     quantityCatalog.data,
   ]);
   const targetQuantityFieldRequests = targetQuantityFieldDemandPlan.requests;
+  // Field payloads are viewport data: a published domain and its prepared
+  // initial state are readable while the runtime lane is still unresolved.
   const targetQuantityFieldDemandActive = hasActiveViewport3DTargetQuantityDemand(
-    sessionDiscretization,
+    viewportDataDiscretization,
     targetQuantityFieldRequests.size,
   );
   const fdmMultilayerAirboxMaxSamples = useMemo(() => {
@@ -4529,7 +4531,7 @@ export function useViewport3DSceneModel({
     fdmMultilayerAirboxFieldRequest,
     liveViewportResourcesEnabled &&
       Boolean(
-        sessionDiscretization === "fdm" &&
+        fdmLaneActive &&
         fdmMultilayerAirboxDomain &&
         shouldRequestFdmMultilayerAirboxField(airboxSettings, airboxSettings.activeQuantityId),
       ),
@@ -4537,7 +4539,7 @@ export function useViewport3DSceneModel({
   const magneticPartFieldVectors = useViewport3DPartFieldVectors(
     magneticPartFieldQueries,
     liveViewportResourcesEnabled &&
-      sessionDiscretization === "fem" && magneticPartFieldQueries.size > 0,
+      femLaneActive && magneticPartFieldQueries.size > 0,
     { selectedTargetId: selectedVisualizationTargetId, tracker },
   );
   const targetQuantityFieldVectors = useViewport3DQuantityFieldVectors(
@@ -4549,7 +4551,7 @@ export function useViewport3DSceneModel({
     airboxSettings.activeQuantityId,
     airboxFieldVectorParts,
     liveViewportResourcesEnabled &&
-      sessionDiscretization === "fem" &&
+      femLaneActive &&
       airboxFieldVectorEnabled &&
       airboxFieldVectorParts.length > 0,
     airboxFieldVectorRequests,
@@ -7366,6 +7368,10 @@ export function useViewport3DSceneModel({
     fdmUniverseOutsideSupport: savedSelectionActive ? null : fdmUniverseOutsideSupport,
     fdmSettings,
     fdmMultilayerAirboxView: savedSelectionActive ? null : fdmMultilayerAirboxView,
+    fdmMultilayerAirboxAuthoredBounds:
+      savedSelectionActive || !fdmLaneActive || !fdmMultilayerLayout.data?.available
+        ? null
+        : universeRootSelectionBounds,
     fdmMultilayerAirboxBuildError:
       savedSelectionActive || !fdmLaneActive
         ? null

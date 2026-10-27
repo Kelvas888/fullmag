@@ -1398,8 +1398,12 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
             if not isinstance(document, Mapping):
                 raise _fail("running Docker cache-consumer inventory is malformed")
             state = document.get("State")
-            if not isinstance(state, Mapping) or state.get("Running") is not True:
-                raise _fail("Docker cache-consumer inventory changed during inspection")
+            if not isinstance(state, Mapping):
+                raise _fail("running Docker cache-consumer inventory is malformed")
+            # A helper of another DEV group that exited after `docker ps` is
+            # no longer a consumer, exactly as if it had exited before it.
+            if state.get("Running") is not True:
+                continue
             consumers.append(document)
         return tuple(consumers)
 
