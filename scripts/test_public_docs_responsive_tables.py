@@ -191,6 +191,32 @@ class ResponsivePublicDocumentationTableTests(unittest.TestCase):
             any(re.search(r"overflow-x:\s*clip", declarations) for declarations in header_rules)
         )
 
+    def test_documentation_theme_tokens_align_with_fullmag_light_and_dark_palettes(self) -> None:
+        css = CSS.read_text(encoding="utf-8")
+        light_rules = self._rules_for_selector(css, 'html[data-theme="light"]')
+        dark_rules = self._rules_for_selector(css, 'html[data-theme="dark"]')
+
+        self.assertTrue(
+            any(
+                "--fm-docs-bg-app: #eff1f5" in declarations
+                and "--fm-docs-bg-chrome: #e6e9ef" in declarations
+                and "--fm-docs-text-primary: #4c4f69" in declarations
+                and "--fm-docs-accent: #1e66f5" in declarations
+                and "--color-base-100: var(--fm-docs-bg-app)" in declarations
+                for declarations in light_rules
+            )
+        )
+        self.assertTrue(
+            any(
+                "--fm-docs-bg-app: #1e1e2e" in declarations
+                and "--fm-docs-bg-chrome: #181825" in declarations
+                and "--fm-docs-text-primary: #cdd6f4" in declarations
+                and "--fm-docs-accent: #89b4fa" in declarations
+                and "--color-base-100: var(--fm-docs-bg-app)" in declarations
+                for declarations in dark_rules
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
