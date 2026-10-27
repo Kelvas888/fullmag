@@ -56,6 +56,17 @@ class DockerDevCodegenTests(unittest.TestCase):
         ):
             self.assertEqual(expected, codegen._path_identity(alias))
 
+    def test_desktop_wsl_source_alias_requires_same_inode(self) -> None:
+        alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/" + "a" * 64
+        selected = Path("/selected/checkout")
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", return_value=True):
+            self.assertTrue(codegen._source_mount_matches_selected(alias, selected))
+            self.assertFalse(codegen._source_mount_matches_selected(alias + "/../other", selected))
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", return_value=False):
+            self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", side_effect=OSError("missing")):
+            self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
+
     def test_source_probe_uses_backend_module_root(self) -> None:
         self.assertIn('sys.path.insert(0, "/opt/fullmag")', codegen.SOURCE_PROBE_SCRIPT)
 
@@ -322,6 +333,9 @@ class DockerDevCodegenTests(unittest.TestCase):
             outputs = {name: name.encode() for name in names}
             published = codegen._publish_outputs(source, outputs, before)
             self.assertEqual(set(published), set(names))
+            for name in names:
+                self.assertTrue((source / "apps/control-room/src/kernel/api/generated" / name).stat().st_mode & 0o040)
+
             self.assertEqual({name: (generated / name).read_bytes() for name in names}, outputs)
 
 
