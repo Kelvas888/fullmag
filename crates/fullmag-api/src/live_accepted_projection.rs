@@ -725,8 +725,23 @@ fn load_durable_projection(
         .pointer("/parameters/live_workspace/command/kind")
         .and_then(Value::as_str)
         .is_some_and(|kind| kind != "startup_script");
-    let resolved_capabilities = if matches!(status, "completed" | "failed" | "cancelled") {
-        finished_step_capabilities(&accepted, &intent.specification)
+    // Provider truth belongs to the resolved plan, not to the run lifecycle.
+    // A prepared session waiting for Compute installs it too, so the catalog
+    // offers every active quantity instead of only the prepared m. A running
+    // stage is left to the worker-lane check on the live observation. Before
+    // a terminal state only a plan that provides m is installed: modal and
+    // frequency studies provide no magnetization, and the prepared m must
+    // stay readable there. A run's plan is immutable, so it is re-resolved
+    // only when durable state changes, never on each live observation.
+    let terminal_status = matches!(status, "completed" | "failed" | "cancelled");
+    let resolved_capabilities = if durable_changed && (terminal_status || active_task.is_none()) {
+        accepted_step_capabilities(&accepted, &intent.specification).filter(|capabilities| {
+            terminal_status
+                || capabilities
+                    .resolved_quantity_registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.field_quantities.iter().any(|id| id == "m"))
+        })
     } else {
         None
     };
@@ -1134,11 +1149,12 @@ fn validate_live_intent(
     Ok(())
 }
 
-/// Runtime capabilities of the step a finished accepted run executed. The
-/// in-process runner publishes these with its fields; an accepted run left the
-/// session with the scratch authoring capabilities, whose registry is not a
-/// resolved plan, so its published fields (m, H_eff, ...) were not readable.
-fn finished_step_capabilities(
+/// Runtime capabilities of the accepted step the RunIntent targets. The
+/// in-process runner publishes these with its fields; without them an
+/// accepted run keeps the scratch authoring capabilities, whose registry is
+/// not a resolved plan, so the quantity catalog and field routes refuse every
+/// field except the prepared m.
+fn accepted_step_capabilities(
     accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
     specification: &Value,
 ) -> Option<fullmag_runner::BackendCapabilities> {
