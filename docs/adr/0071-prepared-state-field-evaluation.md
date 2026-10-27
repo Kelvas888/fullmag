@@ -125,3 +125,39 @@ istniejącej retencji runów.
 5. Frontend: stany `pending`/`error`, odświeżenie po rewizji, usunięcie „(after Run)” tam, gdzie
    ewaluacja jest dostępna.
 6. Weryfikacja w Docker DEV według sekcji dowodów.
+
+## Rewizja 27.10.2026: wdrożenie v1 w przygotowaniu FEM
+
+Inwentaryzacja pokazała, że osobny tor przyjęcia (sekcje 1–3, 6) wymaga zmian w około stu
+miejscach Rust (session store, archiwum i reachability, ledger hosta z dowodami zwolnienia i
+bramkami uruchomienia, usługa runtime, API przydziałów) oraz w kilkunastu skryptach launchera,
+które zakładają dokładnie dwie role potomne `{compute, preparation}`, a także nowego podziału
+budżetu CPU/pamięci grupy Docker. Decyzja użytkownika: v1 nie tworzy nowego toru.
+
+**v1 (obowiązuje):**
+
+1. Ewaluację wykonuje istniejący preparer FEM (`accepted_fem_preparer`) pod swoim leasem
+   przygotowania CPU, w tym samym procesie co przygotowanie przestrzeni siatki. Nie ma osobnego
+   żądania `compute_fields`: pola przygotowanego stanu powstają automatycznie razem z receiptem
+   przygotowania zadania FEM.
+2. Ewaluator: `materialize_prepared_observables` na torze `fem_cpu`, dla planu osadzonego w
+   receipcie przygotowania (ten sam `plan_fingerprint`, który API publikuje dla przygotowanego
+   `m`). Dla planu o żądanym torze GPU obliczenie przebiega na CPU i provenance zapisuje oba tory
+   (`evaluation_lane: fem_cpu`, `requested_lane: fem_gpu`). To jawna ewaluacja obserwacji stanu
+   wejściowego, nie wykonanie Study: bieg nadal startuje na żądanym urządzeniu i nie ma cichego
+   przejścia na CPU dla solvera.
+3. Wynik: niezmienny rekord `fms_task_prepared_observation.v1` w
+   `runs/<run>/task_prepared_observations/<task>.json`, związany z aktywnym leasem przygotowania,
+   z tożsamością (`preparation_id`, `plan_fingerprint`, digest przygotowanego `m`) i odwołaniami
+   do obiektów CAS (opis pakietu + binarne fragmenty F64LE pól). Reachability traktuje te obiekty
+   jako osiągalne. Porażka ewaluacji albo przekroczenie budżetu zapisuje wynik `unavailable` z
+   powodem i nie zmienia wyniku przygotowania.
+4. Adopcja: API publikuje pola razem z przygotowanym `m` tylko przy zgodności `preparation_id`,
+   `plan_fingerprint` i digestu wartości `m`; provenance `source: prepared_state_evaluation`.
+   Brak rekordu lub `unavailable` pozostawia stan `accepted_state_required` („after Run”).
+5. FDM nie ma toru przygotowania z leasem; FDM i FEM GPU na urządzeniu pozostają „after Run”
+   do czasu osobnej decyzji o torze ewaluacji (sekcje 1–3 pozostają kierunkiem docelowym).
+
+Wymagane dowody v1: przygotowana sesja FEM CPU w Docker DEV pokazuje przed Run `H_eff`,
+`torque` i `eden_total` w viewport; rekord jest osiągalny po GC; zmiana sceny nie adoptuje
+starego pakietu.
