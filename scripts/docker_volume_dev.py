@@ -2426,7 +2426,7 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
 
 def _finish(control, operation, document, backend_id, frontend_id, selected, state,
             certificate_path, certificate, cache, toolchain, image, git_common, ledger_profile, port,
-            *, completion_gate=None, helper_source_binding=None):
+            *, completion_gate=None, helper_source_binding=None, terminal_completion_gate=None):
     import fullmag_docker_runtime as runtime
     token = operation["receipt"]["attempt"]
     operator_probe_record = _operator_probe_record_from_retained(operation["receipt"], document)
@@ -2579,6 +2579,18 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         operation["receipt"]["startup"] = runtime._wait_for_startup_ready(
             state, authorization, startup_helper=helper,
             receipt_reader=lambda: (read_process_receipt(), None))
+    if terminal_completion_gate is not None:
+        published = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c",
+                                          runtime._BACKEND_BUILD_DOCUMENTS_SCRIPT))
+        if (published["receipt"]["value"] != receipt or published["provenance"]["value"] != provenance
+                or published["receipt"]["sha256"] != provenance["build_receipt_sha256"]):
+            raise BuildControlError("Qualified terminal retry publication changed before completion")
+        terminal_completion_gate({
+            "backend_container_id": backend_id, "backend_started_at": operation["receipt"]["backend_started_at"],
+            "image_id": image, "package_receipt_sha256": published["receipt"]["sha256"],
+            "provenance_sha256": published["provenance"]["sha256"],
+            "runtime_config_sha256": _read_runtime_config_digest(control),
+        })
     if completion_gate is not None:
         completion_gate()
     post_build_start = operation["receipt"].get("post_build_start")
@@ -7455,12 +7467,25 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
     environment = document["services"]["backend"]["environment"]
     ledger_profile = _retained_ledger_profile(control, previous_root, document, image)
     from docker_volume_prestart_recovery import continuation
-    prestart_checkpoint = continuation(control, args, previous, document, actual, state)
+    import docker_volume_terminal_prestart_recovery as terminal_prestart
+    terminal_context = terminal_prestart.continuation(control, args, previous, document, actual, state)
+    prestart_checkpoint = (None if terminal_context is not None else
+                          continuation(control, args, previous, document, actual, state))
     with control.operation("resume", {"attempt": args.attempt, "config_sha256": args.config_sha256,
                                        **operator_probe_record}) as operation:
         operation["receipt"].update(operator_probe_record)
         operation["receipt"].update(state="resuming-observation", state_root=str(state),
             backend_volumes=previous["backend_volumes"], frontend_volume=previous["frontend_volume"])
+        if terminal_context is not None:
+            fresh = {name: json.loads(docker_text("inspect", identifier))[0] for name, identifier in ids.items()}
+            _assert_private_restart_network(fresh, ids, control.project)
+            _retained_certificate(state, document)
+            terminal_context = terminal_prestart.continuation(
+                control, args, previous, document, fresh, state)
+            operation["receipt"].update(
+                terminal_prestart_reconciliation=args.prestart_reconciliation,
+                terminal_prestart_reconciliation_sha256=args.prestart_reconciliation_sha256)
+            operation["daemon_pending"] = True
         if prestart_checkpoint:
             fresh = {name: json.loads(docker_text("inspect", identifier))[0] for name, identifier in ids.items()}
             _assert_private_restart_network(fresh, ids, control.project)
@@ -7477,12 +7502,15 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         if restart_backend:
             operation["daemon_pending"] = True
             compose_capture(document, "start", "backend", timeout=90)
-            operation["daemon_pending"] = bool(prestart_checkpoint)
+            operation["daemon_pending"] = bool(prestart_checkpoint or terminal_context is not None)
         git_common = Path(environment["FULLMAG_SOURCE_GIT_COMMON"]) if "FULLMAG_SOURCE_GIT_COMMON" in environment else Path(
             next(m["source"] for m in document["services"]["backend"]["volumes"] if m["target"] == "/opt/fullmag/source-git"))
         _finish(control, operation, document, ids["backend"], ids["frontend"], selected, state,
             certificate_path, certificate, cache, {"image_id": environment["FULLMAG_TOOLCHAIN_IMAGE_ID"]},
             image, git_common, ledger_profile, args.port,
+            terminal_completion_gate=(lambda qualified: terminal_prestart.complete(
+                control, operation, ids["backend"], terminal_context, qualified))
+                if terminal_context is not None else None,
             completion_gate=(lambda: _saved_authoring_complete(control, operation,
                 ids["backend"], prestart_checkpoint[0], state, prestart_checkpoint[1]))
                 if prestart_checkpoint else None)

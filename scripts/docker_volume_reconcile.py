@@ -16,6 +16,7 @@ from docker_build_control import (BuildControl, BuildControlError, MAX_DOCUMENT_
 SCHEMA = "fullmag.docker-iteration-reconciliation.v1"
 FAILED_BUILD_SCHEMA = "fullmag.docker-iteration-failed-build-reconciliation.v1"
 PRESTART_SCHEMA = "fullmag.docker-iteration-prestart-reconciliation.v1"
+TERMINAL_PRESTART_SCHEMA = "fullmag.docker-terminal-prestart-reconciliation.v1"
 ACTIVATION_PREFLIGHT_SCHEMA = "fullmag.docker-activation-preflight-reconciliation.v1"
 TOOLCHAIN_CANCELED_SCHEMA = "fullmag.docker-toolchain-canceled-reconciliation.v1"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -62,9 +63,10 @@ def fingerprint(actual):
 
 
 def validate_request(request):
-    prestart = isinstance(request, dict) and request.get("schema") == PRESTART_SCHEMA
+    terminal_prestart = isinstance(request, dict) and request.get("schema") == TERMINAL_PRESTART_SCHEMA
+    prestart = isinstance(request, dict) and request.get("schema") in (PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA)
     cgroup = isinstance(request, dict) and request.get("schema") == CGROUP_FAILURE_SCHEMA
-    failed = isinstance(request, dict) and request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
+    failed = isinstance(request, dict) and request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
     expected = {"schema", "attempt", "compose_project", "source_root", "port", "config_sha256",
         "unknown_receipt_sha256", "controller_sha256", "containers", "package_documents"}
     if failed:
@@ -73,7 +75,9 @@ def validate_request(request):
         expected.add("package_documents")
     if prestart:
         expected.add("prestart_helper_sha256")
-    require(isinstance(request, dict) and set(request) == expected and request["schema"] in (SCHEMA, FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
+    if terminal_prestart:
+        expected.update({"history_baseline", "observation", "prior_publication"})
+    require(isinstance(request, dict) and set(request) == expected and request["schema"] in (SCHEMA, FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
             "Reconciliation request schema/keys differ")
     require(isinstance(request["attempt"], str) and TOKEN.fullmatch(request["attempt"]), "Invalid iteration attempt")
     for key in ("config_sha256", "unknown_receipt_sha256", "controller_sha256"):
@@ -93,6 +97,15 @@ def validate_request(request):
     if cgroup:
         from docker_worker_cgroup import validate_failure_pin
         validate_failure_pin(request["failure"], request["attempt"])
+    if terminal_prestart:
+        import docker_volume_terminal_prestart_recovery as terminal
+        require(isinstance(request["prestart_helper_sha256"], str) and SHA.fullmatch(request["prestart_helper_sha256"]),
+                "Invalid terminal prestart helper digest")
+        terminal.validate_failure_pin(request["failure"])
+        terminal.validate_history_baseline(request["history_baseline"])
+        terminal.validate_publication_pin(request["prior_publication"])
+        terminal.validate_observation(request["observation"])
+        return
     if prestart:
         from docker_volume_prestart_recovery import validate_failure_pin
         require(isinstance(request["prestart_helper_sha256"], str) and SHA.fullmatch(request["prestart_helper_sha256"]), "Invalid prestart helper digest")
@@ -128,7 +141,7 @@ def inspect_pins(request, *, frontend_running=True):
     for name, pin in request["containers"].items():
         records = json.loads(docker_capture("inspect", pin["id"]).stdout)
         require(len(records) == 1, "Ambiguous container inspection")
-        validate_incarnation(records[0], pin, request["compose_project"], running=(False if name != "lease" and request["schema"] == PRESTART_SCHEMA else
+        validate_incarnation(records[0], pin, request["compose_project"], running=(False if name != "lease" and request["schema"] in (PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA) else
                 frontend_running if name == "frontend" else not (name == "backend" and request["schema"] == FAILED_BUILD_SCHEMA)))
         result[name] = records[0]
     return result
@@ -200,6 +213,9 @@ def validate_failed_build_state(actual, failure, log):
 def validate_failed_build(control, root, request, original, actual, state):
     import docker_volume_dev as dev
     from docker_volume_stop_unadmitted import _read_terminal_process_receipt
+    if request["schema"] == TERMINAL_PRESTART_SCHEMA:
+        from docker_volume_terminal_prestart_recovery import validate_failure
+        return validate_failure(control, root, request, original, actual, state)
     if request["schema"] == PRESTART_SCHEMA:
         from docker_volume_prestart_recovery import validate_failure
         return validate_failure(control, root, request, original, actual, state)
@@ -274,8 +290,8 @@ def commit_script(control, root, request, journal_relative, result_sha, current_
                  and request.get("schema") == TOOLCHAIN_CANCELED_SCHEMA)
     require(activation or toolchain or (phase, publish_verified) in (("iteration", True), ("iteration", False), ("boris-reference", False)), "Closed reconciliation phase required")
     require(phase != "iteration" or publish_verified
-            or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA), "Failure-only publication requires its explicit schema")
-    require(not publish_verified or request.get("schema") not in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
+            or request.get("schema") in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA), "Failure-only publication requires its explicit schema")
+    require(not publish_verified or request.get("schema") not in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA),
             "A failed iteration cannot publish a verified success")
     phase = control.path(phase)
     targets = f"'{path}/receipt.json' '{phase}/current.json' " + (f"'{phase}/verified.json' " if publish_verified else "") + f"'{path}/terminal.json'"
@@ -360,7 +376,8 @@ def reconcile(args):
     if isinstance(request, dict) and request.get("schema") == ACTIVATION_PREFLIGHT_SCHEMA:
         from docker_activation_preflight_runtime import reconcile_preflight
         return reconcile_preflight(args, control, selected, request, request_raw)
-    prestart = isinstance(request, dict) and request.get("schema") == PRESTART_SCHEMA
+    terminal_prestart = isinstance(request, dict) and request.get("schema") == TERMINAL_PRESTART_SCHEMA
+    prestart = isinstance(request, dict) and request.get("schema") in (PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA)
     cgroup = isinstance(request, dict) and request.get("schema") == CGROUP_FAILURE_SCHEMA
     typed_failure = prestart or cgroup or (isinstance(request, dict) and request.get("schema") == FAILED_BUILD_SCHEMA)
     require(typed_failure or not getattr(args, "preview", False), "Preview is scoped to a typed failure reconciliation")
@@ -370,7 +387,7 @@ def reconcile(args):
         from docker_boris_volume import reconcile_preproducer
         return reconcile_preproducer(args, control, selected, request, request_raw)
     validate_request(request)
-    failed_build = request["schema"] in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
+    failed_build = request["schema"] in (FAILED_BUILD_SCHEMA, PRESTART_SCHEMA, TERMINAL_PRESTART_SCHEMA, CGROUP_FAILURE_SCHEMA)
     require(request["source_root"] == str(selected) and request["compose_project"] == control.project
             and request["port"] == args.port, "Selected checkout/group/port differs")
     require(digest(Path(__file__).read_bytes()) == request["controller_sha256"], "Controller code differs from reviewed request")
@@ -398,15 +415,28 @@ def reconcile(args):
     require(isinstance(base_attempt, str) and TOKEN.fullmatch(base_attempt), "Missing original development attempt")
     base = "development/attempts/" + base_attempt
     previous = control.read(base + "/terminal.json")
-    require(previous.get("state") == "succeeded" and previous.get("attempt") == base_attempt
-            and previous.get("compose_project") == control.project
-            and previous.get("state_root") == original.get("state_root")
-            and previous.get("backend_volumes") == original.get("backend_volumes")
-            and previous.get("frontend_volume") == original.get("frontend_volume")
-            and previous.get("config_sha256") == request["config_sha256"]
-            and previous.get("backend_container") == request["containers"]["backend"]["id"]
-            and previous.get("frontend_container") == request["containers"]["frontend"]["id"],
-            "Original development resources differ")
+    if terminal_prestart:
+        from docker_volume_terminal_prestart_recovery import prior_publication
+        require(previous.get("state") in {"failed-confirmed", "succeeded"}
+                and previous.get("attempt") == base_attempt
+                and previous.get("compose_project") == control.project
+                and previous.get("state_root") == original.get("state_root")
+                and previous.get("backend_volumes") == original.get("backend_volumes")
+                and previous.get("frontend_volume") == original.get("frontend_volume")
+                and digest(read_raw(control, base + "/terminal.json")) == request["failure"]["previous_receipt_sha256"]
+                and digest(canonical(control.read(base + "/compose.json"))) == request["config_sha256"],
+                "Original terminal development resources differ")
+        prior_publication(control, request, original)
+    else:
+        require(previous.get("state") == "succeeded" and previous.get("attempt") == base_attempt
+                and previous.get("compose_project") == control.project
+                and previous.get("state_root") == original.get("state_root")
+                and previous.get("backend_volumes") == original.get("backend_volumes")
+                and previous.get("frontend_volume") == original.get("frontend_volume")
+                and previous.get("config_sha256") == request["config_sha256"]
+                and previous.get("backend_container") == request["containers"]["backend"]["id"]
+                and previous.get("frontend_container") == request["containers"]["frontend"]["id"],
+                "Original development resources differ")
     image = request["containers"]["backend"]["image"]
     environment = document["services"]["backend"]["environment"]
     require(environment.get("FULLMAG_STARTUP_ENABLED") != "1", "Reconciliation never repeats startup Solve")
@@ -495,7 +525,8 @@ def reconcile(args):
         require(control._line(claim) == "OBSERVING", "Observer BEGIN outcome unknown; resources retained")
         if failed_build:
             actual = inspect_pins(request)
-            result["cgroup_failure_proof" if cgroup else "prestart_failure_proof" if prestart else "failed_build_proof"] = validate_failed_build(control, root, request, original, actual, state)
+            result["cgroup_failure_proof" if cgroup else "terminal_prestart_failure_proof" if terminal_prestart
+                   else "prestart_failure_proof" if prestart else "failed_build_proof"] = validate_failed_build(control, root, request, original, actual, state)
             result.update(state="failed-confirmed", backend_container=ids["backend"],
                           frontend_container=ids["frontend"])
         else:

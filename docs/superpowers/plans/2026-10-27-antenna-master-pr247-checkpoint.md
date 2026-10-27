@@ -361,3 +361,60 @@ Projekt recovery terminalnej sesji zapisano osobno w
 `2026-10-27-terminal-session-prestart-recovery-proposal.md`.
 Kod nowego wariantu, jego natywny proof/preview, reconcile i rzeczywisty
 managed restart pozostają do wykonania. Nie uznano planu za implementację.
+
+
+## Opublikowana integracja i potwierdzenie source-contracts
+
+Integracja i ograniczona recepta offline zostały zapisane oraz wypchnięte w
+`830857cce55c5dd10f51124b37b9c6c6260e77eb`. PR #247 pozostaje otwarty;
+nie wykonano merge do mastera. Dla tego dokładnego HEAD kontrola
+source-contracts zakończyła się wynikiem 1821 PASS, 0 FAIL, 1 ignored.
+Potwierdza to także korektę losowej kolejności fixture digestu. Pełny log
+joba 122446243508 zachowano w control volume:
+`verification/pr247-ci-830857-20261027/source-contracts-122446243508.log`.
+Pozostałe kontrole CI trzeba ocenić oddzielnie; ostatni odczyt joba Rust
+122446861761 wskazał ukończony krok polityki closed-loop oraz trwający krok
+shared accepted-inspection. Nie oznaczono całego joba jako zaliczonego.
+
+Ponowny odczyt Docker potwierdził backend stopped/exit128/PID0, frontend
+stopped/exit0 oraz żywy oryginalny helper c037. Wpis rejestru worktree
+zaktualizowano przez `worktree-finish ... review`, bez cleanup lub retencji.
+Kod terminal-only recovery jest w implementacji i niezależnym review; przed
+prawdziwym proof/apply wymagane są testy oraz usunięcie wykrytych błędów
+kształtu held intent i rozdzielenie niezmiennych danych naukowych od legalnie
+nowej, zweryfikowanej generacji runtime po rebuildzie. Nie wykonano retry.
+
+
+## Terminal-only recovery — kod i regresje
+
+Dodano osobny wariant `fullmag.docker-terminal-prestart-reconciliation.v1`,
+który korzysta z autentykowanego drainu i terminalnego runu zamiast
+saved-authoring checkpointu. Pierwszy development370 pozostał
+failed-confirmed; obecny pakiet wiąże dokładna udana iteracja
+`94ca9bf8ff37455a939d416150c3b10a` wraz z niezmiennym terminal receipt
+i identycznym `iteration/verified.json`. Nie przepisano historii startu.
+
+Zachowano stary wariant v1 bez zmian. Nowy request przypina kontroler, moduł,
+kontenery, pełne stany Docker, OCI error, bazowy receipt i prior publication,
+operator baseline oraz natywny dowód i pełny inventory historii. Completion
+oddziela niezmienne dane naukowe od nowego pakietu, który musi przejść
+istniejące kwalifikacje `_finish`. Nie nadaje Compute ani nie odtwarza Solve.
+
+Kanoniczne kontrole offline: 23 nowe + 18 legacy + 39 reconcile = 80 PASS,
+0 FAIL; źródła stabilne. Osobno rejestr źródeł: 27 PASS i receipt potwierdzający
+hash nowego modułu. AST oraz embedded Python i diff check PASS. Testów
+Rust nie kompilowano lokalnie. Raport źródeł w control volume:
+`verification/terminal-prestart-recovery-20261027/source-final-report.json`,
+SHA256 `11f87d4bc524db1879df5b26cd18e11a89be4077df78123357de197129432504`.
+
+Wykryte podczas review błędy regex, pola specification, namespace, prior
+publication i legalnej zmiany generacji usunięto przed native proof. Kontrola
+rzeczywistych metadanych receipt/provenance: 12 porównań PASS, ale nie
+zastępuje ponownego hashowania pakietu. Diagnostyczny pomiar magazynu:
+15917 zwykłych plików / 537825612 B; mieści się w jawnych limitach proofu.
+
+Na tym checkpointcie natywny prepare, kanoniczny preview, reconcile oraz
+restart nadal NOT VERIFIED. Backend i frontend zatrzymane; oryginalny helper
+zachowuje lease. Nie wykonano cleanup, nowego Solve ani zmiany profilu GPU
+aplikacji. CPU ABI w helperze służy wyłącznie natywnemu odczytowi metadanych
+bez GPU; zgodność loadera wymaga rzeczywistego wykonania.
