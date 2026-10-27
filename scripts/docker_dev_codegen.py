@@ -542,10 +542,11 @@ def _validate_admitted_source_mount(
     project: str, service: str, identity: Mapping[str, str], selected: Path,
     document: Mapping[str, Any],
 ) -> None:
-    """Authenticate daemon aliases against the exact succeeded DEV admission."""
+    """Authenticate daemon aliases against the current admitted DEV runtime."""
     from bootstrap_docker_toolchain import control_volume_name
     from docker_build_control import BuildControlError, MAX_DOCUMENT_BYTES, canonical, control_read_script
     from docker_volume_dev import _validate_retained_service
+    from docker_volume_activate import _linked_runtime_terminals
 
     observed = {service: document}
 
@@ -573,20 +574,31 @@ def _validate_admitted_source_mount(
     if not isinstance(backend_id, str) or SHA256_RE.fullmatch(backend_id) is None:
         raise CodegenError("admission backend has no full container identity")
 
-    def read(relative: str) -> tuple[bytes, dict[str, Any]]:
+    records: dict[str, bytes | None] = {}
+
+    def read(relative: str, *, optional: bool = False) -> tuple[bytes | None, dict[str, Any] | None]:
         script = control_read_script("/control/" + relative)
         # The same control-volume root is mounted inside this fixed backend;
         # reading it must not launch a helper or create a new operation.
         script = script.replace("/control", "/opt/fullmag/control")
-        raw, _ = _exec(backend_id, ("/bin/bash", "-euo", "pipefail", "-c", script),
-                       timeout=90, stdout_limit=MAX_DOCUMENT_BYTES + 1)
-        return raw, _read_json_bytes(raw, "DEV admission " + relative, MAX_DOCUMENT_BYTES)
+        try:
+            raw, _ = _exec(backend_id, ("/bin/bash", "-euo", "pipefail", "-c", script),
+                           timeout=90, stdout_limit=MAX_DOCUMENT_BYTES + 1)
+        except CodegenError as error:
+            if not optional or error.exit_code != 44:
+                raise
+            records[relative] = None
+            return None, None
+        value = _read_json_bytes(raw, "DEV admission " + relative, MAX_DOCUMENT_BYTES)
+        records[relative] = raw
+        return raw, value
 
-    receipt_raw, receipt = read("development/verified.json")
+    receipt_raw, receipt = read("development/current.json")
     attempt = receipt.get("attempt")
     inputs = receipt.get("inputs")
     if (receipt.get("schema") != "fullmag.docker-build-operation.v1"
-            or receipt.get("phase") != "development" or receipt.get("state") != "succeeded"
+            or receipt.get("phase") != "development"
+            or receipt.get("state") not in {"succeeded", "failed-confirmed"}
             or receipt.get("compose_project") != project
             or not isinstance(attempt, str) or re.fullmatch(r"[0-9a-f]{32}", attempt) is None
             or not isinstance(inputs, Mapping)
@@ -597,9 +609,41 @@ def _validate_admitted_source_mount(
     root = "development/attempts/" + attempt
     terminal_raw, _ = read(root + "/terminal.json")
     _, compose = read(root + "/compose.json")
+    config_sha256 = _sha256(canonical(compose))
     if (terminal_raw != receipt_raw or compose.get("name") != project
-            or _sha256(canonical(compose)) != receipt.get("config_sha256")):
+            or (receipt.get("config_sha256") != config_sha256
+                and not (receipt["state"] == "failed-confirmed" and receipt.get("config_sha256") is None))):
         raise CodegenError("DEV admission terminal or Compose digest differs")
+    if receipt["state"] == "succeeded":
+        if read("development/verified.json")[0] != receipt_raw:
+            raise CodegenError("DEV admission current and verified receipts differ")
+    else:
+        class AdmissionControl:
+            def read(self, relative: str, *, optional: bool = False):
+                return read(relative, optional=optional)[1]
+
+        image = inputs.get("image_id")
+        if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+            raise CodegenError("DEV admission image is not immutable")
+        try:
+            terminals = _linked_runtime_terminals(
+                AdmissionControl(), attempt, receipt, source_root=str(selected),
+                image=image, config_sha256=config_sha256,
+            )
+        except (BuildControlError, KeyError, TypeError, ValueError) as error:
+            raise CodegenError("DEV admission linked runtime validation failed: " + str(error)) from error
+        matching = [
+            terminal for terminal in terminals
+            if all(terminal.get(role + "_container") == running(role).get("Id")
+                   for role in ("backend", "frontend"))
+        ]
+        if not matching:
+            raise CodegenError("DEV admission linked runtime service incarnation differs")
+        receipt = matching[-1]
+        phase = receipt["phase"]
+        if (receipt.get("schema") != "fullmag.docker-build-operation.v1"
+                or read(phase + "/current.json")[0] != records[phase + "/verified.json"]):
+            raise CodegenError("DEV admission linked runtime current receipt differs")
     try:
         for role in ("backend", "frontend"):
             actual = running(role)
@@ -624,8 +668,9 @@ def _validate_admitted_source_mount(
             _validate_retained_service(compose, actual, role, image["Config"])
     except (BuildControlError, KeyError, TypeError, StopIteration) as error:
         raise CodegenError("DEV admission service validation failed: " + str(error)) from error
-    if read("development/verified.json")[0] != receipt_raw:
-        raise CodegenError("DEV admission changed during source mount validation")
+    for relative, expected_raw in list(records.items()):
+        if read(relative, optional=expected_raw is None)[0] != expected_raw:
+            raise CodegenError("DEV admission changed during source mount validation: " + relative)
 
 
 def _running_service(

@@ -185,10 +185,28 @@ class DockerDevCodegenTests(unittest.TestCase):
                 **{"source_" + k:v for k,v in identity.items()}},"config_sha256":codegen._sha256(canonical(compose))}
         return selected, identity, compose, actual, receipt
 
-    def _select_admitted_wsl_service(self, role, fixture, *, terminal=None, changed_verified=None):
+    def _select_admitted_wsl_service(self, role, fixture, *, terminal=None, changed_verified=None,
+                                     linked=None, changed_records=None):
         selected, identity, compose, actual, receipt = fixture
         receipt_raw = codegen._canonical_json(receipt)
-        reads = []
+        root = "development/attempts/" + receipt["attempt"]
+        records = {
+            "development/current.json": receipt_raw,
+            "development/verified.json": receipt_raw,
+            root + "/terminal.json": receipt_raw if terminal is None else terminal,
+            root + "/compose.json": codegen._canonical_json(compose),
+        }
+        if linked is not None:
+            stale = {**receipt, "state":"succeeded", "attempt":"0" * 32,
+                     "backend_container":"0" * 64, "frontend_container":"0" * 64}
+            records["development/verified.json"] = codegen._canonical_json(stale)
+            stale_root = "development/attempts/" + stale["attempt"]
+            records[stale_root + "/terminal.json"] = codegen._canonical_json(stale)
+            records[stale_root + "/compose.json"] = codegen._canonical_json(compose)
+            records["iteration/verified.json"] = codegen._canonical_json(linked)
+            records["iteration/current.json"] = codegen._canonical_json(linked)
+            records["iteration/attempts/" + linked["attempt"] + "/terminal.json"] = codegen._canonical_json(linked)
+        reads = {}
         def capture(arguments, **_kwargs):
             target = next(a.rsplit("=",1)[1] for a in arguments if a.startswith("label=com.docker.compose.service="))
             return actual[target]["Id"].encode() + b"\n", b""
@@ -200,19 +218,66 @@ class DockerDevCodegenTests(unittest.TestCase):
             self.assertEqual(container, actual["backend"]["Id"])
             self.assertEqual(arguments[:4], ("/bin/bash","-euo","pipefail","-c"))
             script = arguments[4]
-            reads.append(script)
-            if "/development/verified.json" in script:
-                return (changed_verified if changed_verified is not None and len(reads) > 3 else receipt_raw), b""
-            self.assertIn("development/attempts/" + receipt["attempt"], script)
-            if "/terminal.json" in script:
-                return receipt_raw if terminal is None else terminal, b""
-            self.assertIn("/compose.json", script)
-            return codegen._canonical_json(compose), b""
+            relative = next((name for name in records if "/opt/fullmag/control/" + name in script), None)
+            if relative is None:
+                raise codegen.CodegenError("missing control record", exit_code=44)
+            reads[relative] = reads.get(relative, 0) + 1
+            if changed_records and relative in changed_records and reads[relative] > 1:
+                return changed_records[relative], b""
+            if relative == "development/verified.json" and changed_verified is not None and reads[relative] > 1:
+                return changed_verified, b""
+            return records[relative], b""
         with mock.patch.object(codegen,"_capture",side_effect=capture), mock.patch.object(
                 codegen,"_inspect",side_effect=inspect), mock.patch.object(codegen,"_exec",side_effect=execute):
             result = codegen._running_service("project",role,identity,selected)
-        self.assertEqual(len(reads),4)
         return result
+
+    def _admitted_wsl_iteration(self):
+        fixture = self._admitted_wsl_services()
+        receipt = fixture[4]
+        receipt["state"] = "failed-confirmed"
+        receipt["inputs"]["image_id"] = fixture[3]["backend"]["Image"]
+        linked = {
+            "schema":"fullmag.docker-build-operation.v1", "phase":"iteration", "state":"succeeded",
+            "attempt":"d" * 32, "compose_project":"project",
+            "config_sha256":receipt["config_sha256"],
+            "backend_container":fixture[3]["backend"]["Id"],
+            "frontend_container":fixture[3]["frontend"]["Id"],
+            "inputs":{"attempt":receipt["attempt"], "config_sha256":receipt["config_sha256"],
+                      "source_root":str(fixture[0]), "image_id":fixture[3]["backend"]["Image"]},
+            "source_commit":"a" * 40, "source_digest":"b" * 64,
+            "source_snapshot_sha256":"c" * 64, "backend_build_receipt_sha256":"e" * 64,
+        }
+        receipt.pop("config_sha256")
+        return fixture, linked
+
+    def test_wsl_alias_admits_linked_iteration_after_failed_development(self):
+        for role in ("backend", "frontend"):
+            with self.subTest(role=role):
+                fixture, linked = self._admitted_wsl_iteration()
+                container, _ = self._select_admitted_wsl_service(role, fixture, linked=linked)
+                self.assertEqual(container, fixture[3][role]["Id"])
+
+    def test_linked_iteration_refuses_source_config_image_and_container_drift(self):
+        for field in ("source_root", "config_sha256", "image_id", "attempt",
+                      "backend_container", "frontend_container", "compose_project", "state", "schema"):
+            with self.subTest(field=field):
+                fixture, linked = self._admitted_wsl_iteration()
+                if field in ("source_root", "config_sha256", "image_id", "attempt"):
+                    linked["inputs"][field] = "/foreign" if field == "source_root" else "f" * 64
+                else:
+                    linked[field] = "foreign"
+                with self.assertRaises(codegen.CodegenError):
+                    self._select_admitted_wsl_service("backend", fixture, linked=linked)
+
+    def test_linked_iteration_refuses_receipt_changes_during_validation(self):
+        for relative in ("development/current.json", "iteration/verified.json", "iteration/current.json",
+                         "iteration/attempts/" + "d" * 32 + "/terminal.json"):
+            with self.subTest(relative=relative):
+                fixture, linked = self._admitted_wsl_iteration()
+                with self.assertRaisesRegex(codegen.CodegenError, "changed"):
+                    self._select_admitted_wsl_service("backend", fixture, linked=linked,
+                                                     changed_records={relative:b"{}"})
 
     def test_wsl_daemon_alias_requires_exact_succeeded_admission_for_both_services(self):
         for role in ("backend","frontend"):
