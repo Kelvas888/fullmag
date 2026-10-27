@@ -116,6 +116,7 @@ describe("field-map data plan", () => {
     [{ kind: "monitor_target" as const }, undefined],
     [{ kind: "airbox" as const }, undefined],
     [{ kind: "mesh_part" as const, scope_id: "part-7" }, "part-7"],
+    [{ kind: "layer" as const, scope_id: "bottom" }, "bottom"],
   ])("preserves the supported %s scope without inventing a fallback id", (viewScope, scopeId) => {
     const plan = buildFieldMapDataPlan({
       active: true,
@@ -155,15 +156,37 @@ describe("field-map data plan", () => {
     expect(plan).not.toHaveProperty("monitorId");
   });
 
-  it("fails closed with an explicit not-applicable state for FDM mesh-part and airbox scopes", () => {
+  it("lets the backend resolve FDM Airbox and native-layer scopes", () => {
     for (const viewScope of [
-      { kind: "mesh_part" as const, scope_id: "part-7" },
       { kind: "airbox" as const },
+      { kind: "layer" as const, scope_id: "bottom" },
     ]) {
       const plan = buildFieldMapDataPlan({
         active: true,
         component: "magnitude",
         discretization: "fdm",
+        includeMesh: false,
+        source: { kind: "default" },
+        quality: "interactive",
+        quantityId: "m",
+        resolution: [32, 32],
+        showVectors: false,
+        viewScope,
+        vectorBudget: 0,
+      });
+      expect(plan).toMatchObject({ availability: "ready", enabled: true });
+    }
+  });
+
+  it("fails closed with an explicit not-applicable state for FDM mesh-part and FEM layer scopes", () => {
+    for (const [discretization, viewScope, reason] of [
+      ["fdm", { kind: "mesh_part" as const, scope_id: "part-7" }, "structured FDM grid"],
+      ["fem", { kind: "layer" as const, scope_id: "bottom" }, "FDM multilayer"],
+    ] as const) {
+      const plan = buildFieldMapDataPlan({
+        active: true,
+        component: "magnitude",
+        discretization,
         includeMesh: true,
         source: { kind: "monitor", monitorId: "plane-1" },
         quality: "interactive",
@@ -182,7 +205,7 @@ describe("field-map data plan", () => {
         requestScalar: false,
         requestVectors: false,
       });
-      expect(plan.unavailableReason).toContain("structured FDM grid");
+      expect(plan.unavailableReason).toContain(reason);
     }
   });
 

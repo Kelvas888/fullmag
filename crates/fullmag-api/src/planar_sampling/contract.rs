@@ -1,7 +1,7 @@
 use crate::error::ApiError;
 use fullmag_ir::{PlanarFrameIR, PlanarOperatorIR};
 
-pub(crate) const PLANAR_SAMPLER_VERSION: &str = "planar_sampling_v2";
+pub(crate) const PLANAR_SAMPLER_VERSION: &str = "planar_sampling_v3";
 pub(crate) const MAX_PLANAR_SAMPLE_POINTS: u32 = 1_048_576;
 
 #[derive(Debug, Clone)]

@@ -862,3 +862,46 @@ fn planar_sampling_surface_preserves_nanometer_scale_boundary_measure() {
         .any(|occupancy| *occupancy != Occupancy::Empty));
     assert!(result.meta.occupied_measure > 0.0);
 }
+
+#[test]
+fn planar_sampling_fdm_plane_area_averages_cells_under_coarse_pixels() {
+    // 4 x 2 cells of 0.25 m x 0.5 m on [-0.5, 0.5]^2; values encode the cell.
+    let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let field = FdmPlanarField::new(1, [4, 2, 1], [-0.5; 3], [0.25, 0.5, 1.0], values).unwrap();
+    let frame = explicit_frame([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+
+    let coarse = PlanarSamplingEngine::sample_fdm(
+        &field,
+        &request(frame.clone(), PlanarOperatorIR::PlaneSample, [2, 1]),
+    )
+    .unwrap();
+    assert_eq!(coarse.meta.sampling_method, "fdm_cell_area_plane");
+    // Each pixel covers two columns of both rows: mean of four cells.
+    assert_eq!(coarse.scalar_values, vec![3.5, 5.5]);
+
+    let native = PlanarSamplingEngine::sample_fdm(
+        &field,
+        &request(frame, PlanarOperatorIR::PlaneSample, [4, 2]),
+    )
+    .unwrap();
+    assert_eq!(
+        native.scalar_values,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    );
+}
+
+#[test]
+fn planar_sampling_fdm_plane_area_average_excludes_empty_cells() {
+    let field = FdmPlanarField::new(1, [2, 1, 1], [-0.5; 3], [0.5, 1.0, 1.0], vec![4.0, 9.0])
+        .unwrap()
+        .with_membership_mask(vec![true, false])
+        .unwrap();
+    let frame = explicit_frame([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+    let result = PlanarSamplingEngine::sample_fdm(
+        &field,
+        &request(frame, PlanarOperatorIR::PlaneSample, [1, 1]),
+    )
+    .unwrap();
+    assert_eq!(result.occupancy, vec![Occupancy::Occupied]);
+    assert_eq!(result.scalar_values, vec![4.0]);
+}

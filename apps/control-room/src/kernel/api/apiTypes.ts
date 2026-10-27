@@ -167,7 +167,12 @@ export type PlanarViewScopeState =
   components["schemas"]["PlanarViewScopeState"];
 
 export type PlanarFieldSource =
-  | { kind: "default" }
+  /**
+   * `sliceKey` is client-only resource identity for the session default slice:
+   * the server resolves the slice from visualization state, so a slice change
+   * must produce a new resource key even though the HTTP query is unchanged.
+   */
+  | { kind: "default"; sliceKey?: string }
   | { kind: "monitor"; monitorId: string };
 
 export interface PlanarFieldQuery {

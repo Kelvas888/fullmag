@@ -172,6 +172,10 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
   useDomainMetaResource: () => ({ data: null, error: null, status: "idle" }),
 }));
 
+vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
+  useFieldCatalogResource: () => ({ data: null, error: null, status: "idle" }),
+}));
+
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
   useSessionStatusSelector: () => null,
 }));
@@ -310,7 +314,7 @@ describe("FieldMapModule planar state ownership", () => {
       expect(mocks.queuePatch).not.toHaveBeenCalled();
       expect(mocks.meta).toHaveBeenCalledWith(
         "m",
-        { kind: "default" },
+        expect.objectContaining({ kind: "default", sliceKey: expect.any(String) }),
         expect.any(Object),
         { enabled: true },
       );

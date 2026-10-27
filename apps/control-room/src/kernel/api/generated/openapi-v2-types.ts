@@ -11870,6 +11870,7 @@ export interface components {
             schema_version: string;
             scope_id?: string | null;
             scope_kind: string;
+            section?: null | components["schemas"]["PlanarSectionResource"];
             source: components["schemas"]["PlanarSampleSourceResource"];
         };
         PlanarFieldOccupancyResource: {
@@ -12046,6 +12047,39 @@ export interface components {
             monitor_revision: string;
         };
         /**
+         * @description Requested vs. resolved position of the session `Default` slice along its
+         *     normal. A snap to an FDM cell centre is published, never hidden.
+         */
+        PlanarSectionResource: {
+            /** Format: int32 */
+            layer_count?: number | null;
+            /** Format: int32 */
+            layer_index?: number | null;
+            /** Format: double */
+            layer_spacing_m?: number | null;
+            /**
+             * Format: double
+             * @description Distance moved by one layer or navigation step along the normal.
+             */
+            navigation_step_m: number;
+            /** @description World axis of the slice normal: `x`, `y` or `z`. */
+            normal_axis: string;
+            /** Format: double */
+            normal_max_m: number;
+            /** Format: double */
+            normal_min_m: number;
+            /** @description `xy`, `xz` or `yz`. */
+            plane: string;
+            /** Format: double */
+            requested_coordinate_m: number;
+            /** Format: double */
+            requested_fraction: number;
+            /** Format: double */
+            resolved_coordinate_m: number;
+            /** @description `fdm_cell_layers` (coordinate snapped to a cell centre) or `continuous`. */
+            stops_kind: string;
+        };
+        /**
          * @description The source selected by the session-scoped planar viewport state.
          *
          *     `Default` is a presentation source resolved from the current domain. It is
@@ -12100,6 +12134,10 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "airbox";
+        } | {
+            /** @enum {string} */
+            kind: "layer";
+            scope_id: string;
         };
         PlanarVisualizationPatch: {
             colormap?: string | null;

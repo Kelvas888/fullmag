@@ -26,20 +26,58 @@ pub(crate) struct ResolvedPlanarSamplingSource {
     pub target: MonitorTargetIR,
     pub frame: PlanarFrameIR,
     pub operator: PlanarOperatorIR,
+    /// Requested and resolved position along the normal; only for `Default`.
+    pub section: Option<ResolvedPlanarSection>,
+}
+
+/// Fraction of the normal extent moved by one navigation step on sections
+/// without discrete data layers.
+pub(crate) const CONTINUOUS_SECTION_STEP_FRACTION: f64 = 0.01;
+
+/// Requested vs. resolved section of the session `Default` slice. Decision 8
+/// of the 2D refactor: a snap to an FDM cell centre is never hidden.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedPlanarSection {
+    pub plane: &'static str,
+    pub normal_axis: &'static str,
+    pub requested_fraction: f64,
+    pub requested_coordinate_m: f64,
+    pub resolved_coordinate_m: f64,
+    /// `fdm_cell_layers` when the coordinate snaps to cell centres, else `continuous`.
+    pub stops_kind: &'static str,
+    pub layer_index: Option<u32>,
+    pub layer_count: Option<u32>,
+    pub layer_spacing_m: Option<f64>,
+    pub normal_min_m: f64,
+    pub normal_max_m: f64,
+    /// Distance moved by one layer step (FDM cell) or navigation step (continuous).
+    pub navigation_step_m: f64,
+}
+
+struct SliceCoordinate {
+    requested: f64,
+    resolved: f64,
+    /// (index, count, spacing) of the FDM cell layer that contains the request.
+    layer: Option<(u32, u32, f64)>,
 }
 
 fn default_slice_coordinate(
     domain: &DomainMeta,
     axis: usize,
     position_fraction: f64,
-) -> Result<f64, ApiError> {
+) -> Result<SliceCoordinate, ApiError> {
     let continuous = domain.bounds.min[axis]
         + position_fraction * (domain.bounds.max[axis] - domain.bounds.min[axis]);
+    let continuous_result = SliceCoordinate {
+        requested: continuous,
+        resolved: continuous,
+        layer: None,
+    };
     if domain.discretization != "fdm" {
-        return Ok(continuous);
+        return Ok(continuous_result);
     }
     let Some(grid) = domain.grid.as_ref() else {
-        return Ok(continuous);
+        return Ok(continuous_result);
     };
 
     for grid_axis in 0..3 {
@@ -88,7 +126,45 @@ fn default_slice_coordinate(
             "planar_default_grid_invalid: structured FDM cell center must be finite",
         ));
     }
-    Ok(coordinate)
+    Ok(SliceCoordinate {
+        requested: continuous,
+        resolved: coordinate,
+        layer: Some((index, count, grid.spacing[axis])),
+    })
+}
+
+fn resolved_section(
+    domain: &DomainMeta,
+    plane: &'static str,
+    axis: usize,
+    position_fraction: f64,
+    coordinate: &SliceCoordinate,
+) -> ResolvedPlanarSection {
+    let normal_min_m = domain.bounds.min[axis];
+    let normal_max_m = domain.bounds.max[axis];
+    let (layer_index, layer_count, layer_spacing_m) = match coordinate.layer {
+        Some((index, count, spacing)) => (Some(index), Some(count), Some(spacing)),
+        None => (None, None, None),
+    };
+    ResolvedPlanarSection {
+        plane,
+        normal_axis: ["x", "y", "z"][axis],
+        requested_fraction: position_fraction,
+        requested_coordinate_m: coordinate.requested,
+        resolved_coordinate_m: coordinate.resolved,
+        stops_kind: if coordinate.layer.is_some() {
+            "fdm_cell_layers"
+        } else {
+            "continuous"
+        },
+        layer_index,
+        layer_count,
+        layer_spacing_m,
+        normal_min_m,
+        normal_max_m,
+        navigation_step_m: layer_spacing_m
+            .unwrap_or((normal_max_m - normal_min_m) * CONTINUOUS_SECTION_STEP_FRACTION),
+    }
 }
 pub(crate) fn resolve_default_planar_source(
     domain: &DomainMeta,
@@ -123,13 +199,16 @@ pub(crate) fn resolve_default_planar_source(
         (bounds.min[2] + bounds.max[2]) * 0.5,
     ];
     let q = default_slice.position_fraction;
+    let (plane_name, normal_axis) = match default_slice.plane {
+        PlanarAxisPlane::Xy => ("xy", 2),
+        PlanarAxisPlane::Xz => ("xz", 1),
+        PlanarAxisPlane::Yz => ("yz", 0),
+    };
+    let coordinate = default_slice_coordinate(domain, normal_axis, q)?;
+    let section = resolved_section(domain, plane_name, normal_axis, q, &coordinate);
     let (origin_m, u_axis, v_axis, normal, preset, u_length, v_length) = match default_slice.plane {
         PlanarAxisPlane::Xy => (
-            [
-                centers[0],
-                centers[1],
-                default_slice_coordinate(domain, 2, q)?,
-            ],
+            [centers[0], centers[1], coordinate.resolved],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0],
@@ -138,11 +217,7 @@ pub(crate) fn resolve_default_planar_source(
             lengths[1],
         ),
         PlanarAxisPlane::Xz => (
-            [
-                centers[0],
-                default_slice_coordinate(domain, 1, q)?,
-                centers[2],
-            ],
+            [centers[0], coordinate.resolved, centers[2]],
             [1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
             [0.0, -1.0, 0.0],
@@ -151,11 +226,7 @@ pub(crate) fn resolve_default_planar_source(
             lengths[2],
         ),
         PlanarAxisPlane::Yz => (
-            [
-                default_slice_coordinate(domain, 0, q)?,
-                centers[1],
-                centers[2],
-            ],
+            [coordinate.resolved, centers[1], centers[2]],
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0],
@@ -192,6 +263,7 @@ pub(crate) fn resolve_default_planar_source(
         target: MonitorTargetIR::Domain,
         frame,
         operator,
+        section: Some(section),
     })
 }
 
@@ -224,6 +296,7 @@ pub(crate) fn resolve_authored_planar_source(
         target: monitor.target.clone(),
         frame: monitor.frame.clone(),
         operator: monitor.operator.clone(),
+        section: None,
     })
 }
 
@@ -329,6 +402,51 @@ mod tests {
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ]
+    }
+
+    #[test]
+    fn default_section_publishes_requested_and_resolved_fdm_layer() {
+        let mut d = domain([0.0; 3], [8.0, 4.0, 60e-9], "generation-section");
+        d.grid = Some(StructuredGridDescriptor {
+            shape: [8, 4, 8],
+            origin: [0.0; 3],
+            spacing: [1.0, 1.0, 7.5e-9],
+        });
+
+        let resolved = resolve_default_planar_source(
+            &d,
+            &slice(PlanarAxisPlane::Xy, 0.4, DefaultPlanarOperatorState::PlaneSample),
+        )
+        .expect("default source");
+        let section = resolved.section.expect("default source publishes its section");
+
+        assert_eq!(section.normal_axis, "z");
+        assert_eq!(section.stops_kind, "fdm_cell_layers");
+        assert_eq!(section.layer_index, Some(3));
+        assert_eq!(section.layer_count, Some(8));
+        assert!((section.requested_coordinate_m - 24e-9).abs() < 1e-21);
+        assert!((section.resolved_coordinate_m - 26.25e-9).abs() < 1e-21);
+        assert_eq!(resolved.frame.origin_m[2], section.resolved_coordinate_m);
+        assert_eq!(section.navigation_step_m, 7.5e-9);
+    }
+
+    #[test]
+    fn default_section_is_continuous_without_a_structured_grid() {
+        let mut d = domain([0.0; 3], [1.0, 1.0, 20e-9], "generation-fem");
+        d.discretization = "fem".into();
+
+        let section = resolve_default_planar_source(
+            &d,
+            &slice(PlanarAxisPlane::Xy, 0.62, DefaultPlanarOperatorState::PlaneSample),
+        )
+        .expect("default source")
+        .section
+        .expect("section");
+
+        assert_eq!(section.stops_kind, "continuous");
+        assert_eq!(section.layer_index, None);
+        assert_eq!(section.requested_coordinate_m, section.resolved_coordinate_m);
+        assert!((section.navigation_step_m - 0.2e-9).abs() < 1e-24);
     }
 
     #[test]

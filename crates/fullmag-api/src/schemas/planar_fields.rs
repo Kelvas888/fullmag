@@ -135,6 +135,28 @@ pub struct PlanarMeshOverlayDescriptor {
     pub geometry_source: String,
 }
 
+/// Requested vs. resolved position of the session `Default` slice along its
+/// normal. A snap to an FDM cell centre is published, never hidden.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlanarSectionResource {
+    /// `xy`, `xz` or `yz`.
+    pub plane: String,
+    /// World axis of the slice normal: `x`, `y` or `z`.
+    pub normal_axis: String,
+    pub requested_fraction: f64,
+    pub requested_coordinate_m: f64,
+    pub resolved_coordinate_m: f64,
+    /// `fdm_cell_layers` (coordinate snapped to a cell centre) or `continuous`.
+    pub stops_kind: String,
+    pub layer_index: Option<u32>,
+    pub layer_count: Option<u32>,
+    pub layer_spacing_m: Option<f64>,
+    pub normal_min_m: f64,
+    pub normal_max_m: f64,
+    /// Distance moved by one layer or navigation step along the normal.
+    pub navigation_step_m: f64,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PlanarFieldMetaResource {
     pub schema_version: String,
@@ -166,6 +188,8 @@ pub struct PlanarFieldMetaResource {
     pub scope_kind: String,
     pub scope_id: Option<String>,
     pub frame: PlanarFieldFrameResource,
+    /// Section of the session `Default` slice; null for authored monitors.
+    pub section: Option<PlanarSectionResource>,
     pub operator: PlanarOperatorSchema,
     pub resolution: [u32; 2],
     pub pixel_size_m: [f64; 2],

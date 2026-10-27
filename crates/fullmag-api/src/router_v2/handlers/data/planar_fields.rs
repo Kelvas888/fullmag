@@ -12,12 +12,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     error::ApiError,
-    field_render_png::{encode_scalar_png, AutoScaleMode},
+    field_render_png::{encode_direction_png, encode_scalar_png, AutoScaleMode, DIRECTION_COLORMAP},
     field_store::serialize_field_vector_binary_v2,
     planar_sampling::{
         resolve_authored_planar_source, resolve_default_planar_source, resolve_spatial_target,
         sample_resolved_target, Occupancy, PlanarComponent, PlanarSampleIdentity,
-        PlanarSampleResult, ResolvedPlanarSampleRequest, ResolvedPlanarSourceIdentity,
+        PlanarSampleResult, ResolvedPlanarSampleRequest, ResolvedPlanarSection,
+        ResolvedPlanarSourceIdentity,
         ResolvedSpatialScope, ResolvedSpatialTarget, MAX_PLANAR_SAMPLE_POINTS,
     },
     preview::quantity_unit,
@@ -36,6 +37,7 @@ use crate::{
         PlanarFieldFrameResource, PlanarFieldLinksResource, PlanarFieldMetaResource,
         PlanarFieldOccupancyResource, PlanarFieldProbeQuery, PlanarFieldProbeResource,
         PlanarFieldQuery, PlanarMeshOverlayDescriptor, PlanarSampleSourceResource,
+        PlanarSectionResource,
     },
     types::AppState,
 };
@@ -55,6 +57,7 @@ struct BuiltPlanarField {
     target: Arc<ResolvedSpatialTarget>,
     request: ResolvedPlanarSampleRequest,
     source: ResolvedPlanarSourceIdentity,
+    section: Option<ResolvedPlanarSection>,
     frame: PlanarFrameIR,
     operator: PlanarOperatorIR,
     scene_revision: u64,
@@ -762,6 +765,7 @@ async fn build_planar_field_from_source(
         target,
         request,
         source: resolved_source.identity,
+        section: resolved_source.section,
         frame,
         operator,
         scene_revision,
@@ -970,24 +974,81 @@ async fn planar_render_png_response(
     query: &PlanarFieldQuery,
 ) -> Result<Response<Body>, ApiError> {
     let built = build_planar_field_from_source(state, quantity_id, source, query).await?;
+    let planar = state
+        .current_display_presentation
+        .read()
+        .await
+        .visualization_planar
+        .clone()
+        .unwrap_or_else(crate::schemas::visualization_state::default_planar_visualization_state);
+    let style = PlanarPngStyle::from_state(&planar);
     let mask = built
         .result
         .occupancy
         .iter()
         .map(|occupancy| u8::from(*occupancy == Occupancy::Empty))
         .collect::<Vec<_>>();
-    let png = encode_scalar_png(
-        built.result.meta.resolution[0],
-        built.result.meta.resolution[1],
-        &built.result.scalar_values,
-        &mask,
-        "viridis",
-        AutoScaleMode::Slice,
-        None,
-        None,
-        true,
-    )?;
-    binary_response(png, "image/png", &built.etag)
+    let png = match (&built.result.vector_values, style.colormap.as_str()) {
+        // The direction wheel needs the full vector; a scalar field falls
+        // back to viridis exactly as the Control Room legend does.
+        (Some(vectors), DIRECTION_COLORMAP) => encode_direction_png(
+            built.result.meta.resolution[0],
+            built.result.meta.resolution[1],
+            vectors,
+            &mask,
+        )?,
+        (_, colormap) => encode_scalar_png(
+            built.result.meta.resolution[0],
+            built.result.meta.resolution[1],
+            &built.result.scalar_values,
+            &mask,
+            if colormap == DIRECTION_COLORMAP { "viridis" } else { colormap },
+            style.auto_scale,
+            style.vmin,
+            style.vmax,
+            true,
+        )?,
+    };
+    binary_response(png, "image/png", &planar_png_etag(&built.etag, &style))
+}
+
+/// Presentation applied to the exported PNG: the session planar colormap and
+/// SI color range, so the export matches the 2D view's legend.
+#[derive(Debug, Clone, PartialEq)]
+struct PlanarPngStyle {
+    colormap: String,
+    auto_scale: AutoScaleMode,
+    vmin: Option<f64>,
+    vmax: Option<f64>,
+}
+
+impl PlanarPngStyle {
+    fn from_state(planar: &crate::schemas::visualization_state::PlanarVisualizationState) -> Self {
+        use crate::schemas::visualization_state::PlanarColorRangeMode;
+        let range = &planar.range;
+        let (auto_scale, vmin, vmax) = match (range.mode, range.min, range.max) {
+            (PlanarColorRangeMode::Manual, Some(min), Some(max))
+                if min.is_finite() && max.is_finite() && min < max =>
+            {
+                (AutoScaleMode::Manual, Some(min), Some(max))
+            }
+            (PlanarColorRangeMode::Symmetric, _, _) => (AutoScaleMode::SymmetricZero, None, None),
+            _ => (AutoScaleMode::Slice, None, None),
+        };
+        Self {
+            colormap: planar.colormap.clone(),
+            auto_scale,
+            vmin,
+            vmax,
+        }
+    }
+}
+
+fn planar_png_etag(sample_etag: &str, style: &PlanarPngStyle) -> String {
+    format!(
+        "\"fm-planar-png:{:x}\"",
+        Sha256::digest(format!("{sample_etag}:{style:?}").as_bytes())
+    )
 }
 
 async fn planar_mesh_overlay_response(
@@ -1241,7 +1302,7 @@ fn meta_resource(built: &BuiltPlanarField) -> PlanarFieldMetaResource {
             )
         });
     PlanarFieldMetaResource {
-        schema_version: "planar_sample_meta.v4".to_string(),
+        schema_version: "planar_sample_meta.v5".to_string(),
         sample_token: built.sample_token.clone(),
         scene_revision: built.scene_revision,
         source: source_resource(&built.source),
@@ -1265,6 +1326,7 @@ fn meta_resource(built: &BuiltPlanarField) -> PlanarFieldMetaResource {
             normal: built.frame.normal,
             bounds_uv_m: bounds,
         },
+        section: built.section.as_ref().map(section_resource),
         operator: (&built.operator).into(),
         resolution: built.result.meta.resolution,
         pixel_size_m: [
@@ -1402,6 +1464,23 @@ fn source_base_path(built: &BuiltPlanarField) -> String {
             )
         ),
         other => panic!("unsupported resolved planar source kind: {other}"),
+    }
+}
+
+fn section_resource(section: &ResolvedPlanarSection) -> PlanarSectionResource {
+    PlanarSectionResource {
+        plane: section.plane.to_string(),
+        normal_axis: section.normal_axis.to_string(),
+        requested_fraction: section.requested_fraction,
+        requested_coordinate_m: section.requested_coordinate_m,
+        resolved_coordinate_m: section.resolved_coordinate_m,
+        stops_kind: section.stops_kind.to_string(),
+        layer_index: section.layer_index,
+        layer_count: section.layer_count,
+        layer_spacing_m: section.layer_spacing_m,
+        normal_min_m: section.normal_min_m,
+        normal_max_m: section.normal_max_m,
+        navigation_step_m: section.navigation_step_m,
     }
 }
 

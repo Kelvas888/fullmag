@@ -60,6 +60,11 @@
   ],
   "qualification_gates": [
     {
+      "id": "PM-N06",
+      "status": "unqualified",
+      "requirement": "FDM plane_sample equals the arithmetic mean of covered cells when raster dimensions divide the cell counts; an equal raster reproduces cell values."
+    },
+    {
       "id": "PM-N05",
       "status": "red",
       "requirement": "Metadata extrema and automatic ranges exclude empty occupancy even when include_air_as_zero serializes zero."
@@ -162,6 +167,11 @@
       "sources": ["fdm-sample", "clipped-tetra", "weighted-reduction"]
     },
     {
+      "id": "eq-planar-fdm-plane-area",
+      "symbols": ["qbar", "qc", "Acij", "c"],
+      "sources": ["fdm-sample", "sampling-tests"]
+    },
+    {
       "id": "eq-planar-fem-p1",
       "symbols": ["q", "Na", "qa", "a"],
       "sources": ["fem-sample", "clipped-tetra"]
@@ -213,6 +223,7 @@
     {"id": "c", "latex": "c", "meaning": "FDM cell index", "si_unit": "1"},
     {"id": "qc", "latex": "q_c", "meaning": "Cell-constant FDM value", "si_unit": "[q]"},
     {"id": "Vcij", "latex": "V_{c,ij}", "meaning": "Cell/pixel-support intersection volume", "si_unit": "\\mathrm{m^3}"},
+    {"id": "Acij", "latex": "A_{c,ij}", "meaning": "Area of the cell section inside the pixel footprint", "si_unit": "\\mathrm{m^2}"},
     {"id": "a", "latex": "a", "meaning": "Local FEM node index", "si_unit": "1"},
     {"id": "Na", "latex": "N_a", "meaning": "Tet4 barycentric or Prism6 triangle-P1 tensor-product interval-P1 basis function", "si_unit": "1"},
     {"id": "qa", "latex": "q_a", "meaning": "Nodal P1 value", "si_unit": "[q]"},
