@@ -106,7 +106,7 @@ describe("scratch material Inspector stability", () => {
   });
 
   it("hydrates with production resource hooks and keeps root, focus, scroll, drafts and requests bounded across both ACKs", async () => {
-    let resolveAssignment!: (value: SceneResource) => void;
+    let resolveAssignment: ((value: SceneResource) => void) | null = null;
     const fixture = createFixture();
     fixture.createMaterial.mockResolvedValue(
       createdMaterialAck("mat:cofeb", {
@@ -165,6 +165,7 @@ describe("scratch material Inspector stability", () => {
       expect(button(mounted.container, "Create and assign").disabled).toBe(true);
 
       await act(async () => {
+        if (!resolveAssignment) throw new Error("The assignment request did not start");
         resolveAssignment(assignedScene(23, "mat:cofeb", {
           Aex: 1.3e-11,
           Dbulk: null,
@@ -177,7 +178,10 @@ describe("scratch material Inspector stability", () => {
       expect(mounted.container.querySelector(".fm-inspector-panel") === panelRoot).toBe(true);
       expect(mounted.document.activeElement === nameInput).toBe(true);
       expect(panelRoot.scrollTop).toBe(73);
-      expect(input(mounted.container, "New anisotropy axis X").value).toBe("1");
+      expect(input(mounted.container, "New anisotropy axis X").value).toBe("0");
+      expect(Number(input(mounted.container, "Axis X").value)).toBeCloseTo(Math.SQRT1_2);
+      expect(Number(input(mounted.container, "Axis Y").value)).toBe(0);
+      expect(Number(input(mounted.container, "Axis Z").value)).toBeCloseTo(Math.SQRT1_2);
       expect(mounted.container.textContent).toContain("Ku1 draft is ready");
       expect(findElements(mounted.container, (element) =>
         element.tagName === "INPUT" && ["Ms", "Aex"].includes(element.getAttribute("aria-label") ?? ""),
@@ -219,6 +223,14 @@ describe("scratch material Inspector stability", () => {
       expect(input(mounted.container, "Ms").value).toBe("1100000");
       expect(input(mounted.container, "Aex").value).toBe("1.3e-11");
     } finally {
+      resolveAssignment?.(assignedScene(23, "mat:cofeb", {
+        Aex: 1.3e-11,
+        Dbulk: null,
+        Dind: null,
+        Ms: 1.1e6,
+        alpha: 0.01,
+      }));
+      await flushResource();
       await mounted.cleanup();
     }
   });
@@ -345,6 +357,264 @@ describe("scratch material Inspector stability", () => {
       });
       expect(historyRecord).toHaveBeenCalledTimes(2);
     } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("guards a staged Create and Assign form, blocks implicit global Apply, and Revert clears it", async () => {
+    const fixture = createFixture();
+    const editSessionStore = createInspectorEditSessionStore();
+    const mounted = await mountFixture(
+      fixture,
+      { ...selectionA, kind: "object", nodeId: "object:object-a" },
+      { editSessionStore, withFooter: true, withGuard: true },
+    );
+    try {
+      await waitForText(mounted.container, "object-a");
+      await act(async () => changeInput(input(mounted.container, "New material name"), "Unsaved material"));
+
+      const session = editSessionStore.getCurrentSession();
+      if (!session) throw new Error("ObjectMaterialPanel did not register its Inspector session");
+      expect(session.dirty).toBe(true);
+      expect(session.valid).toBe(true);
+      expect(session.applyBlockReason).toContain("global Apply does not create materials");
+      expect(shouldGuardInspectorSelection(session)).toBe(true);
+      expect(exactButton(mounted.container, "Apply").disabled).toBe(true);
+      expect(exactButton(mounted.container, "Revert").disabled).toBe(false);
+      await act(async () => expect(await session.apply()).toBe(false));
+      expect(fixture.createMaterial).not.toHaveBeenCalled();
+
+      await act(async () => {
+        fixture.selection.set({
+          kind: selectionB.kind,
+          label: selectionB.label,
+          nodeId: selectionB.nodeId,
+          objectId: selectionB.objectId,
+          ref: selectionB.ref,
+        }, "test");
+      });
+      expect(mounted.container.textContent).toContain("Unapplied Inspector changes");
+      expect(mounted.container.textContent).toContain("Create and assign");
+      expect(exactButton(mounted.container, "Discard").disabled).toBe(false);
+      await act(async () => exactButton(mounted.container, "Discard").click());
+      await waitForText(mounted.container, "object-b");
+      expect(fixture.selection.get().objectId).toBe("object-b");
+      expect(fixture.createMaterial).not.toHaveBeenCalled();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("locks Create and Assign synchronously across global/local writers and rebases edits made while ACK is pending", async () => {
+    const fixture = createFixture();
+    const createAck = deferred<AuthoringTransactionResponse>();
+    const assignmentAck = deferred<SceneResource>();
+    fixture.createMaterial.mockReturnValue(createAck.promise);
+    fixture.patchObject.mockImplementation(() => assignmentAck.promise);
+    const editSessionStore = createInspectorEditSessionStore();
+    const mounted = await mountFixture(
+      fixture,
+      { ...selectionA, kind: "object", nodeId: "object:object-a" },
+      { editSessionStore, withFooter: true, withGuard: true },
+    );
+    let racedGlobalApply: Promise<boolean> | null = null;
+    try {
+      await waitForText(mounted.container, "object-a");
+      await act(async () => {
+        changeInput(input(mounted.container, "New material ID"), "mat:cofeb");
+        button(mounted.container, "Create and assign").click();
+        const session = editSessionStore.getCurrentSession();
+        if (!session) throw new Error("ObjectMaterialPanel did not register its Inspector session");
+        expect(session.applying).toBe(true);
+        expect(session.dirty).toBe(true);
+        racedGlobalApply = session.apply();
+        // This button still has its pre-render enabled state. Its callback
+        // must lose the same synchronous object lease and issue no write.
+        button(mounted.container, "Apply Assignment").click();
+        fixture.selection.set({
+          kind: selectionB.kind,
+          label: selectionB.label,
+          nodeId: selectionB.nodeId,
+          objectId: selectionB.objectId,
+          ref: selectionB.ref,
+        }, "test");
+      });
+      expect(await racedGlobalApply).toBe(false);
+      expect(fixture.patchObject).not.toHaveBeenCalled();
+      expect(fixture.createMaterial).toHaveBeenCalledOnce();
+      expect(fixture.createMaterial).toHaveBeenCalledWith(
+        "mat:cofeb",
+        "Object A material",
+        expect.objectContaining({ Ms: 8e5 }),
+        [],
+        { baseRevision: 21, sessionScopeKey: SESSION_SCOPE_KEY },
+      );
+      expect(mounted.container.textContent).toContain("Unapplied Inspector changes");
+      expect(exactButton(mounted.container, "Apply and continue").disabled).toBe(true);
+      expect(exactButton(mounted.container, "Discard").disabled).toBe(true);
+      expect(fixture.selection.get().objectId).toBe("object-a");
+      await act(async () => exactButton(mounted.container, "Cancel").click());
+
+      await flushResource();
+      expect(fixture.createMaterial).toHaveBeenCalledOnce();
+      await act(async () => {
+        changeInput(input(mounted.container, "New material name"), "Edited during create ACK");
+        createAck.resolve(createdMaterialAck("mat:cofeb", {
+          Aex: 1.3e-11,
+          Dbulk: null,
+          Dind: null,
+          Ms: 1.1e6,
+          alpha: 0.01,
+        }));
+      });
+      await flushResource();
+      expect(fixture.patchObject).toHaveBeenCalledOnce();
+      expect(fixture.patchObject).toHaveBeenCalledWith("object-a", {
+        base_revision: 22,
+        material_ref: "mat:cofeb",
+      }, { sessionScopeKey: SESSION_SCOPE_KEY });
+      expect(input(mounted.container, "New material name").disabled).toBe(false);
+      expect(input(mounted.container, "New material name").value).toBe("Edited during create ACK");
+      expect(editSessionStore.getCurrentSession()?.applying).toBe(true);
+      expect(await editSessionStore.getCurrentSession()?.apply()).toBe(false);
+
+      await act(async () => assignmentAck.resolve(assignedScene(23, "mat:cofeb", {
+        Aex: 1.3e-11,
+        Dbulk: null,
+        Dind: null,
+        Ms: 1.1e6,
+        alpha: 0.01,
+      })));
+      await flushResource();
+      expect(input(mounted.container, "New material name").value).toBe("Edited during create ACK");
+      expect(editSessionStore.getCurrentSession()?.applying).toBe(false);
+      expect(editSessionStore.getCurrentSession()?.dirty).toBe(true);
+      expect(editSessionStore.getCurrentSession()?.applyBlockReason).toContain("Use Create and assign");
+      expect(fixture.patchObject).toHaveBeenCalledOnce();
+    } finally {
+      createAck.resolve(createdMaterialAck("mat:cofeb"));
+      assignmentAck.resolve(assignedScene(23, "mat:cofeb"));
+      await flushResource();
+      await mounted.cleanup();
+    }
+  });
+
+  it("serializes an anisotropy write against the nested boundary writer and preserves the boundary draft", async () => {
+    const properties = {
+      Aex: 1.3e-11,
+      Dbulk: null,
+      Dind: null,
+      Ms: 8e5,
+      alpha: 0.01,
+    };
+    let currentScene = {
+      ...materialScene(21, properties),
+      objects: [
+        {
+          ...sceneObject("object-a", "Object A", "mat:old"),
+          absorbing_boundary: {
+            total_width_m: 4e-7,
+            ramp_width_m: 3e-7,
+            max_damping: 0.5,
+            faces: ["x+"],
+            profile: "smootherstep",
+            frame: "universe",
+          },
+        },
+        sceneObject("object-b", "Object B"),
+      ],
+    } as unknown as SceneResource;
+    const anisotropyAck = deferred<AuthoringTransactionResponse>();
+    const fixture = createFixture();
+    Object.assign(fixture.kernel, {
+      authoringHistory: {
+        getGeneration: () => 0,
+        record: vi.fn(),
+        subscribe: () => () => undefined,
+      },
+    });
+    fixture.sceneLoad.mockImplementation(async () => currentScene);
+    fixture.materialLoad.mockResolvedValue({
+      id: "mat:old",
+      name: "Old material",
+      properties,
+      scene_revision: currentScene.revision,
+    });
+    fixture.interactionLoad.mockResolvedValue({
+      enabled: true,
+      interaction_kind: "uniaxial_anisotropy",
+      object_id: "object-a",
+      params: { axis: [0, 0, 1], ku1: 3e5 },
+      present: true,
+      scene_revision: 21,
+    });
+    fixture.patchObjectInteraction.mockReturnValue(anisotropyAck.promise);
+    fixture.patchObject.mockImplementation(async (_objectId, patch) => {
+      const nextObject = {
+        ...currentScene.objects?.find((candidate) => candidate.id === "object-a"),
+        absorbing_boundary: patch.absorbing_boundary,
+      };
+      currentScene = {
+        ...currentScene,
+        revision: 23,
+        objects: [nextObject, sceneObject("object-b", "Object B")],
+      } as unknown as SceneResource;
+      return currentScene;
+    });
+    const editSessionStore = createInspectorEditSessionStore();
+    const mounted = await mountFixture(
+      fixture,
+      { ...selectionA, kind: "object", nodeId: "object:object-a" },
+      { editSessionStore, withFooter: true, withGuard: true },
+    );
+    try {
+      await waitForText(mounted.container, "Old material");
+      await act(async () => {
+        changeInput(input(mounted.container, "Ku1"), "400000");
+        changeInput(input(mounted.container, "Total width"), "5e-7");
+      });
+      await act(async () => {
+        button(mounted.container, "Apply Anisotropy").click();
+        // This stale enabled button must fail the shared lease before calling
+        // patchObject, even before React publishes disabled state.
+        button(mounted.container, "Apply boundary").click();
+      });
+      await flushResource();
+      expect(fixture.patchObjectInteraction).toHaveBeenCalledOnce();
+      expect(fixture.patchObject).not.toHaveBeenCalled();
+      expect(input(mounted.container, "Total width").disabled).toBe(false);
+      expect(input(mounted.container, "Total width").value).toBe("5e-7");
+      const savingSession = editSessionStore.getCurrentSession();
+      expect(savingSession?.applying).toBe(true);
+      expect(savingSession?.dirty).toBe(true);
+
+      currentScene = { ...currentScene, revision: 22 } as SceneResource;
+      await act(async () => anisotropyAck.resolve({
+        committed_scene: currentScene,
+        revision: 22,
+        scene_revision: 22,
+        transaction_kind: "patch_object_interaction",
+      } as unknown as AuthoringTransactionResponse));
+      await flushResource();
+      expect(editSessionStore.getCurrentSession()?.applying).toBe(false);
+      expect(input(mounted.container, "Total width").value).toBe("5e-7");
+      expect(editSessionStore.getCurrentSession()?.dirty).toBe(true);
+
+      await act(async () => button(mounted.container, "Apply boundary").click());
+      await flushResource();
+      expect(fixture.patchObject).toHaveBeenCalledOnce();
+      expect(fixture.patchObject.mock.calls[0][1]).toMatchObject({
+        base_revision: 22,
+        absorbing_boundary: { total_width_m: 5e-7 },
+      });
+    } finally {
+      anisotropyAck.resolve({
+        committed_scene: currentScene,
+        revision: 22,
+        scene_revision: 22,
+        transaction_kind: "patch_object_interaction",
+      } as unknown as AuthoringTransactionResponse);
+      await flushResource();
       await mounted.cleanup();
     }
   });

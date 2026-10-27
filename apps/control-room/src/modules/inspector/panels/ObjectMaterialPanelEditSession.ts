@@ -3,6 +3,68 @@ import type { InspectorEditSession } from "../InspectorEditSession";
 export const OBJECT_MATERIAL_MULTIPLE_DRAFTS_BLOCK_REASON =
   "Apply or revert one draft before committing the other; these changes use separate server writes.";
 
+export interface ObjectMaterialMutationLease {
+  readonly operation: string;
+  readonly scopeKey: string;
+  readonly token: symbol;
+}
+
+export interface ObjectMaterialMutationCoordinator {
+  acquire: (scopeKey: string, operation: string) => ObjectMaterialMutationLease | null;
+  finish: (lease: ObjectMaterialMutationLease) => boolean;
+  getActive: (scopeKey: string) => ObjectMaterialMutationLease | null;
+  getVersion: () => number;
+  subscribe: (listener: () => void) => () => void;
+}
+
+/** A panel-owned synchronous lock shared by material and boundary writers. */
+export function createObjectMaterialMutationCoordinator(): ObjectMaterialMutationCoordinator {
+  const active = new Map<string, ObjectMaterialMutationLease>();
+  const listeners = new Set<() => void>();
+  let version = 0;
+
+  function publish(): void {
+    version += 1;
+    listeners.forEach((listener) => listener());
+  }
+
+  return Object.freeze({
+    acquire: (scopeKey: string, operation: string) => {
+      if (active.has(scopeKey)) return null;
+      const lease = Object.freeze({
+        operation,
+        scopeKey,
+        token: Symbol(operation),
+      });
+      active.set(scopeKey, lease);
+      publish();
+      return lease;
+    },
+    finish: (lease: ObjectMaterialMutationLease) => {
+      if (active.get(lease.scopeKey)?.token !== lease.token) return false;
+      active.delete(lease.scopeKey);
+      publish();
+      return true;
+    },
+    getActive: (scopeKey: string) => active.get(scopeKey) ?? null,
+    getVersion: () => version,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  });
+}
+
+/** Shared by every material and absorbing-boundary writer in this client. */
+export const objectMaterialMutationCoordinator = createObjectMaterialMutationCoordinator();
+
+export function objectMaterialMutationScopeKey(
+  sessionScopeKey: string | null,
+  objectId: string,
+): string {
+  return `${sessionScopeKey ?? "session:unknown"}|${objectId}`;
+}
+
 export type ObjectMaterialDraftScope = "anisotropy" | "assignment" | "parameters";
 
 const OBJECT_MATERIAL_DRAFT_APPLY_LABELS: Record<ObjectMaterialDraftScope, string> = {
@@ -72,7 +134,11 @@ export function combineObjectMaterialEditSessions(
 
   return {
     applyBlockReason: bothDirty
-      ? OBJECT_MATERIAL_MULTIPLE_DRAFTS_BLOCK_REASON
+      ? [
+          OBJECT_MATERIAL_MULTIPLE_DRAFTS_BLOCK_REASON,
+          material.applyBlockReason,
+          absorbingBoundary?.applyBlockReason,
+        ].filter((reason): reason is string => Boolean(reason)).join(" ")
       : onlyDirtyOwner?.applyBlockReason,
     apply: async () => {
       if (bothDirty || (!materialDirty && !boundaryDirty)) return false;

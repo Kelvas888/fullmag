@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { inspectorActionState, type InspectorEditSession } from "../InspectorEditSession";
 import {
+  createObjectMaterialMutationCoordinator,
   combineObjectMaterialEditSessions,
   OBJECT_MATERIAL_MULTIPLE_DRAFTS_BLOCK_REASON,
   resolveObjectMaterialDraftApplyPolicy,
@@ -23,6 +24,22 @@ function session(
 }
 
 describe("ObjectMaterialPanel edit session composition", () => {
+  it("acquires one synchronous object lease before any React update can admit a second writer", () => {
+    const coordinator = createObjectMaterialMutationCoordinator();
+    const scopeKey = "session-a|object-a";
+    const first = coordinator.acquire(scopeKey, "Create and assign material");
+
+    if (!first) throw new Error("The first object mutation lease should be available");
+    expect(coordinator.getActive(scopeKey)).toBe(first);
+    expect(coordinator.acquire(scopeKey, "Apply assignment")).toBeNull();
+    const otherObjectLease = coordinator.acquire("session-a|object-b", "Apply assignment");
+    if (!otherObjectLease) throw new Error("A separate object should have an independent lease");
+    expect(coordinator.finish({ ...first, token: Symbol("stale") })).toBe(false);
+    expect(coordinator.getActive(scopeKey)).toBe(first);
+    expect(coordinator.finish(first)).toBe(true);
+    expect(coordinator.acquire(scopeKey, "Apply assignment")).not.toBeNull();
+  });
+
   it("blocks multi-scope Apply and explains available local actions", () => {
     expect(
       resolveObjectMaterialDraftApplyPolicy([], new Set<ObjectMaterialDraftScope>()),

@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -57,6 +57,7 @@ import { InspectorFooter } from "../InspectorFooter";
 import { shouldGuardInspectorSelection } from "../InspectorDirtySelectionGuard";
 import { ObjectMaterialPanelEditSessionBridge } from "./ObjectMaterialPanelEditSessionBridge";
 import { ObjectAbsorbingBoundaryPanel } from "./ObjectAbsorbingBoundaryPanel";
+import { createObjectMaterialMutationCoordinator } from "./ObjectMaterialPanelEditSession";
 
 function ObjectMaterialCompositionHarness({
   boundaryStore,
@@ -69,6 +70,8 @@ function ObjectMaterialCompositionHarness({
   materialDirty: boolean;
   parentStore: InspectorEditSessionStore;
 }) {
+  const [mutationCoordinator] = useState(createObjectMaterialMutationCoordinator);
+  const mutationScopeKey = "session=A&epoch=1|object-a";
   return (
     <InspectorEditSessionProvider store={parentStore}>
       <ObjectMaterialPanelEditSessionBridge
@@ -81,10 +84,17 @@ function ObjectMaterialCompositionHarness({
           reset: () => undefined,
           valid: true,
         }}
+        mutationCoordinator={mutationCoordinator}
+        mutationScopeKey={mutationScopeKey}
       />
       <InspectorFooter onFocus={() => undefined} />
       <InspectorEditSessionProvider store={boundaryStore}>
-        <ObjectAbsorbingBoundaryPanel objectId="object-a" baseRevision={10} />
+        <ObjectAbsorbingBoundaryPanel
+          objectId="object-a"
+          baseRevision={10}
+          mutationCoordinator={mutationCoordinator}
+          mutationScopeKey={mutationScopeKey}
+        />
       </InspectorEditSessionProvider>
     </InspectorEditSessionProvider>
   );
