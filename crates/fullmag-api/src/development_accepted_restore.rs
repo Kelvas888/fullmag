@@ -29,6 +29,8 @@ use crate::types::{
     AppState, CurrentLiveRequestContext, CurrentLiveSnapshotRequest, RunManifest, SessionManifest,
 };
 
+mod terminal_observation;
+
 const INPUT_ENV: &str = "FULLMAG_DEVELOPMENT_ACCEPTED_REATTACH_STDIN";
 const LEGACY_INPUT_ENV: &str = "FULLMAG_DEVELOPMENT_RESTORE_STDIN";
 const RUNTIME_CONTROL_ROOT_ENV: &str = "FULLMAG_RUNTIME_CONTROL_ROOT";
@@ -288,6 +290,9 @@ impl Drop for RestoreCheckpoint {
 /// listening.  An absent environment switch is a no-op so ordinary startup
 /// and the legacy authoring restore retain their existing behavior.
 pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), String> {
+    if std::env::var_os(terminal_observation::ENV).is_some() {
+        return terminal_observation::restore_before_listen(state).await;
+    }
     match std::env::var_os(INPUT_ENV) {
         None => return Ok(()),
         Some(value) if value == "1" => {}
@@ -436,7 +441,16 @@ pub(crate) async fn restore_before_listen(state: &Arc<AppState>) -> Result<(), S
 fn validate_current_build(input: &AcceptedRestoreInput) -> Result<()> {
     let build = fullmag_build_info::identity();
     validate_compiled_target(input, build)?;
+    validate_current_build_provenance(build)
+}
 
+fn validate_current_build_identity(target_commit: &str, target_snapshot: &str) -> Result<()> {
+    let build = fullmag_build_info::identity();
+    validate_compiled_target_identity(target_commit, target_snapshot, build)?;
+    validate_current_build_provenance(build)
+}
+
+fn validate_current_build_provenance(build: fullmag_build_info::BuildIdentity) -> Result<()> {
     let configured = std::env::var_os(RUNTIME_PROVENANCE_ENV)
         .context("accepted-run reattach requires Docker runtime provenance")?;
     let configured = Path::new(&configured);
@@ -492,13 +506,21 @@ fn validate_compiled_target(
     input: &AcceptedRestoreInput,
     build: fullmag_build_info::BuildIdentity,
 ) -> Result<()> {
+    validate_compiled_target_identity(&input.target_build_id, &input.target_source_sha256, build)
+}
+
+fn validate_compiled_target_identity(
+    target_build_id: &str,
+    target_source_sha256: &str,
+    build: fullmag_build_info::BuildIdentity,
+) -> Result<()> {
     validate_commit(build.git_commit, "compiled build commit")?;
     validate_digest(
         build.source_snapshot_sha256,
         "compiled build source snapshot",
     )?;
-    if input.target_build_id != build.git_commit
-        || input.target_source_sha256 != build.source_snapshot_sha256
+    if target_build_id != build.git_commit
+        || target_source_sha256 != build.source_snapshot_sha256
     {
         bail!("accepted-run reattach input targets a different compiled build");
     }
@@ -888,7 +910,6 @@ fn publish_restore_ack(
     if expected_api != api_instance_id {
         bail!("accepted-run restore ack path does not bind the current API instance");
     }
-    let destination = fullmag_session::repository_path::checked_path(proof_root, ack_relative)?;
     let ack = AcceptedRestoreAck {
         schema: RESTORE_ACK_SCHEMA.into(),
         state: "consumed".into(),
@@ -914,48 +935,53 @@ fn publish_restore_ack(
     if bytes.len() > MAX_PROOF_BYTES {
         bail!("accepted-run restore ack exceeds its size bound");
     }
+    publish_immutable_restore_bytes(proof_root, ack_relative, &bytes)
+}
+
+fn publish_immutable_restore_bytes(proof_root: &Path, relative: &str, bytes: &[u8]) -> Result<String> {
+    let destination = fullmag_session::repository_path::checked_path(proof_root, relative)?;
     match OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&destination)
     {
         Ok(mut file) => {
-            file.write_all(&bytes)
-                .context("write accepted-run restore ack")?;
+            file.write_all(bytes)
+                .context("write accepted-run restore receipt")?;
             file.sync_all()
-                .context("sync accepted-run restore ack")?;
+                .context("sync accepted-run restore receipt")?;
             drop(file);
-            fs::File::open(destination.parent().context("restore ack has no parent")?)
-                .context("open accepted-run restore ack directory")?
+            fs::File::open(destination.parent().context("restore receipt has no parent")?)
+                .context("open accepted-run restore receipt directory")?
                 .sync_all()
-                .context("sync accepted-run restore ack directory")?;
+                .context("sync accepted-run restore receipt directory")?;
             let published = fullmag_session::repository_path::read_bounded_regular_file(
                 proof_root,
-                ack_relative,
+                relative,
                 MAX_PROOF_BYTES,
             )?;
-            if published != bytes {
-                bail!("accepted-run restore ack changed during publication");
+            if published.as_slice() != bytes {
+                bail!("accepted-run restore receipt changed during publication");
             }
             Ok(fullmag_session::hex_sha256(&published))
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(&destination)
-                .context("inspect existing accepted-run restore ack")?;
+                .context("inspect existing accepted-run restore receipt")?;
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                bail!("accepted-run restore ack destination is not a regular file");
+                bail!("accepted-run restore receipt destination is not a regular file");
             }
             let existing = fullmag_session::repository_path::read_bounded_regular_file(
                 proof_root,
-                ack_relative,
+                relative,
                 MAX_PROOF_BYTES,
             )?;
-            if existing != bytes {
-                bail!("accepted-run restore ack already exists with different bytes");
+            if existing.as_slice() != bytes {
+                bail!("accepted-run restore receipt already exists with different bytes");
             }
             Ok(fullmag_session::hex_sha256(&existing))
         }
-        Err(error) => Err(error).context("create accepted-run restore ack exclusively"),
+        Err(error) => Err(error).context("create accepted-run restore receipt exclusively"),
     }
 }
 
@@ -3313,9 +3339,49 @@ fn restored_preparation_failure_snapshot(
     })
 }
 
+/// Neutral read-model inputs shared by held recovery and failed observations.
+/// No activation, reconciliation or predecessor ACK is fabricated here.
+struct SnapshotHydration {
+    run_id: RunId,
+    project_id: ProjectId,
+    specification: RunSpecification,
+    scene: SceneDocument,
+    logical_session_id: String,
+    session_epoch: u64,
+    source_request_id: String,
+    source_sha256: String,
+    startup_provenance_sha256: Option<String>,
+    config_sha256: String,
+    proof_sha256: String,
+    total_steps: usize,
+    terminal_outcome: Option<String>,
+    preparation_failure: Option<Value>,
+    metadata_schema: &'static str,
+    started_at_unix_ms: Option<u64>,
+    stage_execution: Option<crate::types::StageExecutionState>,
+}
+
 fn build_snapshot(
     workspace_root: &Path,
     loaded: &LoadedAcceptedRestore,
+) -> Result<crate::types::SessionStateResponse> {
+    build_snapshot_from_hydration(workspace_root, &SnapshotHydration {
+        run_id: loaded.run_id.clone(), project_id: loaded.project_id.clone(),
+        specification: loaded.specification.clone(), scene: loaded.scene.clone(),
+        logical_session_id: loaded.logical_session_id.clone(), session_epoch: loaded.session_epoch,
+        source_request_id: loaded.source_request_id.clone(), source_sha256: loaded.source_sha256.clone(),
+        startup_provenance_sha256: Some(loaded.startup_provenance_sha256.clone()),
+        config_sha256: loaded.config_sha256.clone(), proof_sha256: loaded.proof_sha256.clone(),
+        total_steps: loaded.total_steps, terminal_outcome: loaded.terminal_outcome.clone(),
+        preparation_failure: loaded.preparation_failure.clone(),
+        metadata_schema: INPUT_SCHEMA, started_at_unix_ms: None,
+        stage_execution: None,
+    })
+}
+
+fn build_snapshot_from_hydration(
+    workspace_root: &Path,
+    loaded: &SnapshotHydration,
 ) -> Result<crate::types::SessionStateResponse> {
     let requested = &loaded.specification.requested_execution;
     let session_id = loaded.logical_session_id.clone();
@@ -3337,7 +3403,10 @@ fn build_snapshot(
         .join(&run_id)
         .display()
         .to_string();
-    let now = crate::unix_time_millis_now();
+    let now = loaded
+        .started_at_unix_ms
+        .map(u128::from)
+        .unwrap_or_else(crate::unix_time_millis_now);
     let session = SessionManifest {
         session_id: session_id.clone(),
         run_id: run_id.clone(),
@@ -3403,7 +3472,7 @@ fn build_snapshot(
         session_status: Some(session_status.clone()),
         metadata: Some(json!({
             "accepted_run_reattach": {
-                "schema": INPUT_SCHEMA,
+                "schema": loaded.metadata_schema,
                 "run_id": loaded.run_id.as_str(),
                 "project_id": loaded.project_id.as_str(),
                 "source_request_id": &loaded.source_request_id,
@@ -3445,6 +3514,9 @@ fn build_snapshot(
     snapshot.run = request.run;
     snapshot.metadata = request.metadata.map(Into::into);
     snapshot.scene_document = Some(loaded.scene.clone());
+    if let Some(execution) = &loaded.stage_execution {
+        crate::session::replace_current_live_stage_execution(&mut snapshot, execution.clone());
+    }
     if let Some(failure) = loaded.preparation_failure.as_ref() {
         snapshot.metadata.as_deref_mut()
             .and_then(Value::as_object_mut)
@@ -3728,6 +3800,47 @@ mod tests {
                 .and_then(Value::as_str),
             Some("run-accepted-test")
         );
+    }
+
+    #[test]
+    fn terminal_hydration_preserves_stage_evidence_without_scientific_progress() {
+        let loaded = loaded_snapshot_fixture(AcceptedRestoreMode::Consumed, Some("failed"), None);
+        let legacy = build_snapshot(Path::new("test-workspace"), &loaded).unwrap();
+        assert!(legacy.stage_execution.is_none());
+        assert_eq!(legacy.stage_execution_revision, 0);
+        let mut record = crate::session::accepted_stage_record(
+            "runtime-stage", None, crate::types::StageLifecycleState::Failed);
+        record.antenna_solve_stage_id = Some("authored-inspection".into());
+        record.started_at_unix_ms = Some(100);
+        record.completed_at_unix_ms = Some(250);
+        record.state_transition_reason = Some("retained native failure".into());
+        let execution = crate::session::accepted_stage_execution_state(
+            vec![record], crate::types::RuntimeLifecycleState::Failed);
+        let hydration = SnapshotHydration {
+            run_id: loaded.run_id.clone(), project_id: loaded.project_id.clone(),
+            specification: loaded.specification.clone(), scene: loaded.scene.clone(),
+            logical_session_id: loaded.logical_session_id.clone(), session_epoch: loaded.session_epoch,
+            source_request_id: loaded.source_request_id.clone(), source_sha256: loaded.source_sha256.clone(),
+            startup_provenance_sha256: Some(loaded.startup_provenance_sha256.clone()),
+            config_sha256: loaded.config_sha256.clone(), proof_sha256: loaded.proof_sha256.clone(),
+            total_steps: loaded.total_steps, terminal_outcome: loaded.terminal_outcome.clone(),
+            preparation_failure: None, metadata_schema: INPUT_SCHEMA, started_at_unix_ms: Some(50),
+            stage_execution: Some(execution.clone()),
+        };
+        let snapshot = build_snapshot_from_hydration(Path::new("test-workspace"), &hydration).unwrap();
+        assert_eq!(snapshot.stage_execution.as_ref(), Some(&execution));
+        assert_eq!(snapshot.stage_execution_revision, 1);
+        assert_eq!(snapshot.session.status, "failed");
+        assert_eq!(snapshot.run.as_ref().unwrap().status, "failed");
+        let stage = &snapshot.stage_execution.as_ref().unwrap().stages[0];
+        assert!(stage.artifact_refs.is_empty());
+        assert!(stage.applied_step.is_none());
+        assert!(stage.completed_step.is_none());
+        assert!(stage.applied_time_seconds.is_none());
+        assert!(stage.command_id.is_none());
+        assert!(snapshot.field_publication_bundles.is_empty());
+        assert!(snapshot.fem_mesh.is_none());
+        assert!(snapshot.live_state.is_none());
     }
 
     #[test]

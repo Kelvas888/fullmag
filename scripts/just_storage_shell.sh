@@ -419,7 +419,7 @@ case "${recipe}" in
     docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --restart-backend)?( --prestart-reconciliation '([0-9a-f]{32})' --prestart-reconciliation-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
     docker_dev_discover_script_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" script --script '([^']+)'( --source-root '([^']+)')?( --port '([0-9]{4,5})')?( --request-id '([^']+)')?[[:space:]]*$"
     docker_dev_activate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" activate-script --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --script '([^']+)'( --request-id '([^']+)')?[[:space:]]*$"
-    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'([[:space:]]+--recovery-authorization '([^']+)')?([[:space:]]+--fresh-state)?([[:space:]]+--completed-recreation-attempt '([0-9a-f]{32})'[[:space:]]+--completed-recreation-sha256 '([0-9a-f]{64})')?([[:space:]]+--drained-successor-proof '([a-zA-Z0-9_./-]+)'[[:space:]]+--drained-successor-proof-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
+    docker_dev_volume_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'([[:space:]]+--recovery-authorization '([^']+)')?([[:space:]]+--fresh-state)?([[:space:]]+--completed-recreation-attempt '([0-9a-f]{32})'[[:space:]]+--completed-recreation-sha256 '([0-9a-f]{64})')?([[:space:]]+--drained-successor-proof '([a-zA-Z0-9_./-]+)'[[:space:]]+--drained-successor-proof-sha256 '([0-9a-f]{64})')?([[:space:]]+--terminal-observation-proof '([a-zA-Z0-9_./-]+)'[[:space:]]+--terminal-observation-proof-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
     docker_dev_resume_recreation_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})' --resume-recreation '([0-9a-f]{32})'[[:space:]]*$"
     docker_dev_frontend_refresh_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" refresh-frontend-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'[[:space:]]*$"
     docker_dev_idle_restart_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" restart-idle-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --saved-authoring-checkpoint '([a-zA-Z0-9_./-]+)' --saved-authoring-checkpoint-sha256 '([0-9a-f]{64})')?( --stop-only)?( --allow-prepared-session)?[[:space:]]*$"
@@ -483,6 +483,9 @@ case "${recipe}" in
       fi
       if [[ -n "${BASH_REMATCH[11]:-}" ]]; then
         docker_dev_args+=(--drained-successor-proof "${BASH_REMATCH[12]}" --drained-successor-proof-sha256 "${BASH_REMATCH[13]}")
+      fi
+      if [[ -n "${BASH_REMATCH[14]:-}" ]]; then
+        docker_dev_args+=(--terminal-observation-proof "${BASH_REMATCH[15]}" --terminal-observation-proof-sha256 "${BASH_REMATCH[16]}")
       fi
     elif [[ "${recipe}" =~ ${docker_dev_frontend_refresh_pattern} ]]; then
       docker_dev_args+=(refresh-frontend-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"

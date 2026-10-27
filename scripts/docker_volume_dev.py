@@ -1614,7 +1614,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
           native_restart_metadata=None, accepted_reattach_environment=None,
           accepted_reattach_metadata=None, recreation_resume_proof=None,
           post_build_generation=None, retained_device_access=None, maintenance=None,
-          startup_diagnostic_restart=None):
+          startup_diagnostic_restart=None, terminal_observation=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1624,6 +1624,13 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     if retained_device_access is not None and retained_device_access not in ("cpu", "gpu"):
         raise BuildControlError("Retained device access must be cpu or gpu")
     maintenance = _validate_cancellation_maintenance(maintenance)
+    from docker_volume_terminal_observation import validate_context
+    terminal_observation = validate_context(terminal_observation)
+    if terminal_observation is not None and (reuse_state is None or args.script is not None
+            or any(value is not None for value in (maintenance, accepted_reattach_environment,
+                accepted_reattach_metadata, startup_diagnostic_restart, recreation_resume_proof,
+                post_build_generation))):
+        raise BuildControlError("Terminal observation requires retained storage without activation or another restore")
     if maintenance is not None:
         if (provided_operation is None or reuse_state is None or args.script is not None
                 or any(value is not None for value in (
@@ -1780,6 +1787,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         operation_inputs["native_failed_restart"] = validated_native_restart_metadata
     if validated_accepted_reattach_metadata is not None:
         operation_inputs["accepted_reattach"] = validated_accepted_reattach_metadata
+    if terminal_observation is not None:
+        operation_inputs["terminal_observation"] = terminal_observation["metadata"]
     if validated_startup_diagnostic_restart is not None:
         operation_inputs["startup_diagnostic_restart"] = validated_startup_diagnostic_restart
     if validated_post_build_generation is not None:
@@ -1833,6 +1842,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             operation["receipt"]["startup_diagnostic_restart"] = validated_startup_diagnostic_restart
         if validated_accepted_reattach_metadata is not None:
             operation["receipt"]["accepted_reattach"] = validated_accepted_reattach_metadata
+        if terminal_observation is not None:
+            operation["receipt"]["terminal_observation"] = terminal_observation["metadata"]
         if validated_post_build_generation is not None:
             operation["receipt"]["post_build_generation"] = validated_post_build_generation
         token = operation["receipt"]["attempt"]
@@ -2075,6 +2086,11 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST", None)
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256", None)
         backend["environment"].update(validated_accepted_reattach_environment)
+        for name in ("FULLMAG_TERMINAL_OBSERVATION_REQUEST", "FULLMAG_TERMINAL_OBSERVATION_REQUEST_SHA256",
+                     "FULLMAG_DEVELOPMENT_TERMINAL_OBSERVATION_STDIN"):
+            backend["environment"].pop(name, None)
+        if terminal_observation is not None:
+            backend["environment"].update(terminal_observation["environment"])
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
                 FULLMAG_STARTUP_SCRIPT=startup["authorization"]["container_script_path"],
@@ -6194,6 +6210,27 @@ def _retained_operation(
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
         raise BuildControlError("Resume source selection differs")
+    retained_terminal_observation = any(
+        name.startswith("FULLMAG_TERMINAL_OBSERVATION_")
+        for name in document["services"]["backend"]["environment"]
+    )
+    terminal_observation_exit = (
+        (restart_idle_service and not recreate_services)
+        or (recreate_services and bool(getattr(args, "fresh_state", False)))
+    )
+    terminal_observation_failed_resume = (
+        previous.get("state") == "failed-confirmed"
+        and bool(getattr(args, "restart_backend", False))
+        and not recreate_services and not restart_idle_service and not stop_after_drain
+        and not refresh_frontend_service and resume_recreation_id is None
+    )
+    if (retained_terminal_observation
+            and not getattr(args, "terminal_observation_proof", None)
+            and not terminal_observation_exit
+            and not terminal_observation_failed_resume):
+        raise BuildControlError(
+            "Retained terminal observation requires proof pins, managed stop-only, explicit fresh state, or same-container failed-start resume"
+        )
     if resume_recreation_id is not None:
         if (recreate_services or restart_idle_service or stop_after_drain or refresh_frontend_service
                 or getattr(args, "completed_recreation_attempt", None)
@@ -6222,6 +6259,15 @@ def _retained_operation(
     if bool(successor_path) != bool(successor_sha):
         raise BuildControlError("Drained successor requires paired exact proof pins")
     drained_successor_pins = (successor_path, successor_sha) if successor_path else None
+    observation_path = getattr(args, "terminal_observation_proof", None)
+    observation_sha = getattr(args, "terminal_observation_proof_sha256", None)
+    if bool(observation_path) != bool(observation_sha):
+        raise BuildControlError("Terminal observation requires paired proof pins")
+    if observation_path and (not recreate_services or getattr(args, "fresh_state", False)
+            or args.script is not None or successor_path or resume_recreation_id is not None
+            or getattr(args, "completed_recreation_attempt", None)
+            or getattr(args, "recovery_authorization", None)):
+        raise BuildControlError("Terminal observation requires plain retained recreation")
     if drained_successor_pins and (not recreate_services or getattr(args, "fresh_state", False)
             or getattr(args, "recovery_authorization", None) or getattr(args, "script", None)):
         raise BuildControlError("Drained successor only permits retained empty-workspace recreation")
@@ -6541,6 +6587,17 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 "accepted_reattach_environment": accepted_environment,
                 "accepted_reattach_metadata": accepted_pins,
             }
+        terminal_observation = None
+        if observation_path:
+            if accepted_reattach_context or reconciliation is not None:
+                raise BuildControlError("Terminal observation cannot combine with accepted run reattach")
+            from docker_volume_terminal_observation import prepare_context
+            terminal_observation = prepare_context(
+                control, proof_relative=observation_path, proof_sha256=observation_sha,
+                store_root=state / "runs" / "docker-all" / "session-store",
+                source_root=str(selected), attempt=args.attempt, config_sha256=args.config_sha256,
+                actual=actual,
+            )
         native_recovery_context = dict(recovery_context)
         post_build_generation = None
         # A validated pre-API cancellation pins byte-identical native config;
@@ -6773,7 +6830,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 ]
             if post_build_generation is not None:
                 operation["receipt"]["post_build_generation"] = post_build_generation
-            if post_build_generation is not None or native_init_successor or drained_successor or startup_diagnostic_stopped:
+            if (post_build_generation is not None or native_init_successor or drained_successor
+                    or startup_diagnostic_stopped or terminal_observation is not None):
                 # The retained snapshot was observed before this lease. Pin
                 # both application services again under the recreate lease;
                 # the post-build proof must never authorize stop/rm from a
@@ -6819,6 +6877,13 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                         raise BuildControlError("Native init successor service changed under lease")
                     leased_actual[service] = observed
                 _retained_certificate(state, document)
+                if terminal_observation is not None:
+                    from docker_volume_terminal_observation import revalidate_context
+                    revalidate_context(
+                        control, terminal_observation, source_root=str(selected),
+                        attempt=args.attempt, config_sha256=args.config_sha256, actual=leased_actual,
+                    )
+                    operation["receipt"]["terminal_observation"] = terminal_observation["metadata"]
                 actual = leased_actual
             if pre_admission_recreate_proof is not None:
                 # Re-pin both app containers after the durable recreate lease is
@@ -6984,7 +7049,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 observed = json.loads(docker_text("inspect", identifier))[0]
                 if observed["State"]["Running"]:
                     raise BuildControlError("An owned service is still running; resources retained")
-                if fresh_state and (
+                if (fresh_state or terminal_observation is not None) and (
                     observed.get("Id") != actual[service].get("Id")
                     or observed.get("Image") != actual[service].get("Image")
                     or observed["State"].get("StartedAt") != actual[service]["State"].get("StartedAt")
@@ -7060,7 +7125,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             "operator_probe_environment_record": operator_probe_record}
         recovery_context.update(accepted_reattach_context)
         return start(args, reuse_state=reuse, retained_device_access=retained_device_access,
-                     **recovery_context)
+                     terminal_observation=terminal_observation, **recovery_context)
     restart_backend = bool(getattr(args, "restart_backend", False))
     if restart_backend:
         if actual["backend"]["State"]["Running"]:

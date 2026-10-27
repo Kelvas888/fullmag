@@ -105,6 +105,35 @@ impl ProjectionPublicationFence {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StageJournalDetails {
+    reason: Option<String>,
+    started_at_unix_ms: Option<u64>,
+    completed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedStageJournalDetails {
+    run_id: String,
+    input_fingerprint: String,
+    attempt_id: Option<String>,
+    ownership_epoch: Option<u64>,
+    lifecycle: fullmag_session::FmsTaskLifecycle,
+    details: StageJournalDetails,
+}
+
+impl CachedStageJournalDetails {
+    fn matches(&self, run_id: &str, task: &fullmag_session::FmsTaskCatalogEntry) -> bool {
+        self.run_id == run_id
+            && self.input_fingerprint == task.input_fingerprint
+            && self.attempt_id == task.attempt_id
+            && self.ownership_epoch == task.ownership_epoch
+            && self.lifecycle == task.lifecycle
+    }
+}
+
+type StageJournalDetailsCache = std::collections::BTreeMap<String, CachedStageJournalDetails>;
+
 #[derive(Debug, Clone, PartialEq)]
 struct ProjectionCursor {
     api_instance_id: String,
@@ -124,6 +153,7 @@ struct ProjectionCursor {
     live_observation_sequence: Option<u64>,
     live_magnetization_sequence: Option<u64>,
     stage_execution: crate::types::StageExecutionState,
+    stage_journal_details: StageJournalDetailsCache,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +191,7 @@ struct DurableProjection {
     live_magnetization_sequence: Option<u64>,
     solver_profile: Option<crate::schemas::diagnostics::SolverProfileResource>,
     stage_execution: crate::types::StageExecutionState,
+    stage_journal_details: StageJournalDetailsCache,
 }
 
 /// Start the read-only accepted-output projector for the Docker API-only
@@ -256,6 +287,7 @@ async fn poll_once(
         live_observation_sequence: projection.live_observation_sequence,
         live_magnetization_sequence: projection.live_magnetization_sequence,
         stage_execution: projection.stage_execution.clone(),
+        stage_journal_details: projection.stage_journal_details.clone(),
     };
     if cursor.as_ref() == Some(&next_cursor) {
         return Ok(());
@@ -667,12 +699,15 @@ fn load_durable_projection(
     } else {
         Vec::new()
     };
-    let stage_terminal_details = if durable_changed
-        && (artifact_catalog.is_some() || status == "failed")
-    {
-        load_stage_terminal_details(&store, &context.run_id, &run_catalog.tasks)?
+    let previous_stage_details = previous_cursor
+        .filter(|cursor| cursor_matches_context(cursor, context))
+        .map(|cursor| &cursor.stage_journal_details);
+    // Heartbeats change catalog revisions, not attempt lifecycle. Reuse their
+    // immutable journal details; sidecar-only updates never read the journal.
+    let stage_journal_details = if durable_changed {
+        load_stage_journal_details(&store, &run_catalog, previous_stage_details)?
     } else {
-        std::collections::BTreeMap::new()
+        previous_stage_details.cloned().unwrap_or_default()
     };
     let latest_state = verified
         .iter()
@@ -728,7 +763,7 @@ fn load_durable_projection(
                 &run_catalog.tasks,
                 live_observation.as_ref(),
                 &verified,
-                &stage_terminal_details,
+                &stage_journal_details,
                 status,
             )?
         }
@@ -738,7 +773,7 @@ fn load_durable_projection(
             &run_catalog.tasks,
             live_observation.as_ref(),
             &verified,
-            &stage_terminal_details,
+            &stage_journal_details,
             status,
         )?
     };
@@ -803,6 +838,7 @@ fn load_durable_projection(
         live_observation_sequence,
         live_magnetization_sequence,
         stage_execution,
+        stage_journal_details,
     }))
 }
 
@@ -897,12 +933,45 @@ fn accepted_runtime_capabilities_for_state(
     Some(capabilities)
 }
 
+/// Build a terminal read model from evidence already pinned by the caller's
+/// native fence. This function acquires no locks and publishes no effects.
+pub(crate) fn build_terminal_observation_stage_execution(
+    accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
+    catalog: &fullmag_session::FmsRunCatalog,
+    journal: &[fullmag_session::FmsCoordinatorJournalEntry],
+    status: &'static str,
+) -> Result<crate::types::StageExecutionState, ApiError> {
+    if catalog.run_id != accepted.run.specification.run_id.as_str()
+        || !matches!(status, "failed" | "completed" | "cancelled" | "interrupted")
+        || catalog.tasks.is_empty()
+        || catalog.tasks.iter().any(|task| !matches!(task.lifecycle,
+            fullmag_session::FmsTaskLifecycle::Succeeded
+                | fullmag_session::FmsTaskLifecycle::Failed
+                | fullmag_session::FmsTaskLifecycle::Cancelled
+                | fullmag_session::FmsTaskLifecycle::Interrupted))
+    {
+        return Err(ApiError::conflict("terminal stage observation requires its exact terminal catalog"));
+    }
+    let mut details = StageJournalDetailsCache::new();
+    for task in &catalog.tasks {
+        details.insert(task.task_id.clone(), CachedStageJournalDetails {
+            run_id: catalog.run_id.clone(),
+            input_fingerprint: task.input_fingerprint.clone(),
+            attempt_id: task.attempt_id.clone(),
+            ownership_epoch: task.ownership_epoch,
+            lifecycle: task.lifecycle,
+            details: stage_journal_details_for_task(&catalog.run_id, task, journal)?,
+        });
+    }
+    build_stage_execution(accepted, &catalog.tasks, None, &[], &details, status)
+}
+
 fn build_stage_execution(
     accepted: &fullmag_runtime_control::AcceptedStudySnapshot,
     tasks: &[fullmag_session::FmsTaskCatalogEntry],
     live_observation: Option<&(usize, crate::accepted_study_worker::AcceptedLiveObservation)>,
     verified_outputs: &[VerifiedOutput],
-    terminal_details: &std::collections::BTreeMap<String, Option<String>>,
+    journal_details: &StageJournalDetailsCache,
     status: &'static str,
 ) -> Result<crate::types::StageExecutionState, ApiError> {
     let tasks_by_id = tasks
@@ -948,11 +1017,12 @@ fn build_stage_execution(
             }),
             _ => None,
         };
-        if let Some(detail) = task
-            .and_then(|task| terminal_details.get(&task.task_id))
-            .and_then(Option::as_ref)
+        if let Some(cached) = task.and_then(|task| journal_details.get(&task.task_id)
+            .filter(|cached| cached.matches(accepted.run.specification.run_id.as_str(), task)))
         {
-            record.state_transition_reason = Some(detail.clone());
+            record.state_transition_reason = cached.details.reason.clone();
+            record.started_at_unix_ms = cached.details.started_at_unix_ms;
+            record.completed_at_unix_ms = cached.details.completed_at_unix_ms;
         }
         if let Some(output) = verified_outputs
             .iter()
@@ -1023,96 +1093,245 @@ fn refresh_live_stage_progress(
     }
 }
 
-/// Read raw terminal details only from the exact task attempt journal. The
-/// task catalog remains authoritative for lifecycle, and this path does not
-/// infer a typed scientific stop criterion from a generic task outcome.
-fn load_stage_terminal_details(
+/// Reuse details only for the same task input, attempt and lifecycle. Durable
+/// entries are immutable; heartbeat revisions must not trigger a full replay.
+fn load_stage_journal_details(
     store: &fullmag_session::SessionStore,
-    run_id: &str,
-    tasks: &[fullmag_session::FmsTaskCatalogEntry],
-) -> Result<
-    std::collections::BTreeMap<String, Option<String>>,
-    ApiError,
-> {
-    use fullmag_session::{FmsCoordinatorJournalDirection as Direction, FmsTaskLifecycle as Life};
+    catalog: &fullmag_session::FmsRunCatalog,
+    previous: Option<&StageJournalDetailsCache>,
+) -> Result<StageJournalDetailsCache, ApiError> {
+    use fullmag_session::FmsTaskLifecycle as Life;
 
-    let terminal_tasks = tasks
-        .iter()
-        .filter(|task| {
-            matches!(task.lifecycle, Life::Failed | Life::Cancelled | Life::Interrupted)
-        })
-        .collect::<Vec<_>>();
-    if terminal_tasks.is_empty() {
-        return Ok(std::collections::BTreeMap::new());
+    let mut details = StageJournalDetailsCache::new();
+    let mut missing = Vec::new();
+    for task in &catalog.tasks {
+        if let Some(cached) = previous
+            .and_then(|cache| cache.get(&task.task_id))
+            .filter(|cached| cached.matches(&catalog.run_id, task))
+        {
+            details.insert(task.task_id.clone(), cached.clone());
+            continue;
+        }
+        details.insert(
+            task.task_id.clone(),
+            CachedStageJournalDetails {
+                run_id: catalog.run_id.clone(),
+                input_fingerprint: task.input_fingerprint.clone(),
+                attempt_id: task.attempt_id.clone(),
+                ownership_epoch: task.ownership_epoch,
+                lifecycle: task.lifecycle,
+                details: StageJournalDetails::default(),
+            },
+        );
+        if task.attempt_id.is_some()
+            && task.ownership_epoch.is_some()
+            && matches!(
+                task.lifecycle,
+                Life::Running
+                    | Life::Stopping
+                    | Life::Succeeded
+                    | Life::Failed
+                    | Life::Cancelled
+                    | Life::Interrupted
+            )
+        {
+            missing.push(task);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(details);
+    }
+
+    // This is a real shared native fence, not an unlocked snapshot or writer
+    // takeover. A busy store defers the existing projector poll with its cursor intact.
+    let transaction = store.read_transaction().map_err(|error| {
+        ApiError::conflict(format!("read accepted stage journal fence: {error}"))
+    })?;
+    if store
+        .read_run_catalog(&catalog.run_id)
+        .map_err(|error| ApiError::conflict(format!("read accepted stage catalog: {error}")))?
+        .as_ref()
+        != Some(catalog)
+    {
+        return Err(ApiError::conflict(
+            "accepted stage catalog changed before journal capture",
+        ));
     }
     let journal = store
-        .read_coordinator_journal(run_id)
-        .map_err(|error| ApiError::conflict(format!("read accepted terminal journal: {error}")))?;
-    let mut reasons = std::collections::BTreeMap::new();
-    for task in terminal_tasks {
-        let mut failure_detail = None;
-        let mut stop_detail = None;
-        if let (Some(attempt_id), Some(ownership_epoch)) =
-            (task.attempt_id.as_deref(), task.ownership_epoch)
+        .read_coordinator_journal_readonly(&catalog.run_id, &transaction)
+        .map_err(|error| ApiError::conflict(format!("read accepted stage journal: {error}")))?;
+    for task in missing {
+        details
+            .get_mut(&task.task_id)
+            .expect("current task cache entry")
+            .details = stage_journal_details_for_task(&catalog.run_id, task, &journal)?;
+    }
+    Ok(details)
+}
+
+/// UTC timestamps describe durable worker stage events, not native-call or CPU time.
+fn stage_journal_details_for_task(
+    run_id: &str,
+    task: &fullmag_session::FmsTaskCatalogEntry,
+    journal: &[fullmag_session::FmsCoordinatorJournalEntry],
+) -> Result<StageJournalDetails, ApiError> {
+    use fullmag_application::{
+        CoordinatorMessage as Message, TaskLifecycle as TaskLife, WorkerCommand, WorkerEvent,
+    };
+    use fullmag_session::{FmsCoordinatorJournalDirection as Direction, FmsTaskLifecycle as Life};
+
+    let mut details = StageJournalDetails::default();
+    let (Some(attempt_id), Some(epoch)) = (task.attempt_id.as_deref(), task.ownership_epoch) else {
+        return Ok(details);
+    };
+    let mut failure_reason = None;
+    let mut stop_reason = None;
+    let mut saw_started = false;
+    for entry in journal.iter().filter(|entry| {
+        entry.task_id == task.task_id
+            && entry.attempt_id == attempt_id
+            && entry.ownership_epoch == epoch
+    }) {
+        entry.validate_for_task(task).map_err(|error| {
+            ApiError::conflict(format!("invalid accepted stage journal entry: {error}"))
+        })?;
+        let transition: fullmag_application::CoordinatorTransition =
+            serde_json::from_value(entry.payload.clone()).map_err(|error| {
+                ApiError::conflict(format!(
+                    "accepted task coordinator transition is invalid: {error}"
+                ))
+            })?;
+        let checkpoint = &transition.checkpoint;
+        let claim = &checkpoint.claim;
+        if entry.run_id != run_id
+            || claim.run_id.as_str() != run_id
+            || claim.task_id.as_str() != task.task_id
+            || claim.attempt_id.as_str() != attempt_id
+            || claim.ownership_epoch.value() != epoch
+            || entry.lease_token != claim.lease.lease_token.as_str()
+            || transition.schema_version != fullmag_application::COORDINATOR_TRANSITION_SCHEMA
+            || checkpoint.schema_version != fullmag_application::COORDINATOR_CHECKPOINT_SCHEMA
+            || checkpoint.task.run_id != claim.run_id
+            || checkpoint.task.task_id != claim.task_id
+            || checkpoint.task.attempt_id.as_ref() != Some(&claim.attempt_id)
+            || checkpoint.task.ownership_epoch != Some(claim.ownership_epoch)
+            || checkpoint.task.input_fingerprint != task.input_fingerprint
         {
-            for entry in journal.iter().filter(|entry| {
-                entry.task_id == task.task_id
-                    && entry.attempt_id == attempt_id
-                    && entry.ownership_epoch == ownership_epoch
-            }) {
-                let transition: fullmag_application::CoordinatorTransition =
-                    serde_json::from_value(entry.payload.clone()).map_err(|error| {
+            return Err(ApiError::conflict(
+                "accepted stage journal claim differs from its task attempt",
+            ));
+        }
+        checkpoint.task.fence(claim).map_err(|error| {
+            ApiError::conflict(format!(
+                "accepted stage checkpoint claim is invalid: {error}"
+            ))
+        })?;
+        let timestamp = u64::try_from(entry.created_at.timestamp_millis())
+            .ok()
+            .filter(|value| *value > 0);
+        match (entry.direction, &transition.message) {
+            (Direction::Command, Message::Command(envelope)) => {
+                envelope
+                    .validate_for_claim(&claim.identity())
+                    .map_err(|error| {
                         ApiError::conflict(format!(
-                            "accepted task coordinator transition is invalid: {error}"
+                            "accepted stage command claim is invalid: {error}"
                         ))
                     })?;
-                let claim = &transition.checkpoint.claim;
-                if claim.run_id.as_str() != run_id
-                    || claim.task_id.as_str() != task.task_id
-                    || claim.attempt_id.as_str() != attempt_id
-                    || claim.ownership_epoch.value() != ownership_epoch
+                if entry.entry_id != envelope.message_id
+                    || entry.sequence != envelope.sequence
+                    || checkpoint.command_sequence != envelope.sequence
+                    || entry.terminal
                 {
                     return Err(ApiError::conflict(
-                        "accepted terminal journal claim differs from its task attempt",
+                        "accepted stage command identity differs from journal",
                     ));
                 }
-                match (entry.direction, &transition.message) {
-                    (
-                        Direction::Command,
-                        fullmag_application::CoordinatorMessage::Command(envelope),
-                    ) => {
-                        if let fullmag_application::WorkerCommand::Stop { reason } =
-                            &envelope.command
-                        {
-                            stop_detail = Some(reason.clone());
-                        }
-                    }
-                    (
-                        Direction::Event,
-                        fullmag_application::CoordinatorMessage::Event(envelope),
-                    ) => match &envelope.event {
-                        fullmag_application::WorkerEvent::Failed { reason, .. }
-                        | fullmag_application::WorkerEvent::Rejected { reason } => {
-                            failure_detail = Some(reason.clone());
-                        }
-                        _ => {}
-                    },
-                    _ => {
-                        return Err(ApiError::conflict(
-                            "accepted terminal journal direction differs from its transition",
-                        ));
-                    }
+                if let WorkerCommand::Stop { reason } = &envelope.command {
+                    stop_reason = Some(reason.clone());
                 }
             }
+            (Direction::Event, Message::Event(envelope)) => {
+                envelope
+                    .validate_for_claim(&claim.identity())
+                    .map_err(|error| {
+                        ApiError::conflict(format!(
+                            "accepted stage event claim is invalid: {error}"
+                        ))
+                    })?;
+                if entry.entry_id != envelope.message_id
+                    || entry.sequence != envelope.sequence
+                    || checkpoint.event_sequence != envelope.sequence
+                    || entry.terminal
+                        != matches!(
+                            &envelope.event,
+                            WorkerEvent::Completed { .. }
+                                | WorkerEvent::Failed { .. }
+                                | WorkerEvent::Rejected { .. }
+                        )
+                {
+                    return Err(ApiError::conflict(
+                        "accepted stage event identity differs from journal",
+                    ));
+                }
+                let expected_terminal = match &envelope.event {
+                    WorkerEvent::Started => {
+                        if saw_started || checkpoint.task.lifecycle != TaskLife::Running {
+                            return Err(ApiError::conflict(
+                                "accepted stage has inconsistent Started evidence",
+                            ));
+                        }
+                        saw_started = true;
+                        details.started_at_unix_ms = timestamp;
+                        None
+                    }
+                    WorkerEvent::Completed { .. } => Some((Life::Succeeded, TaskLife::Succeeded)),
+                    WorkerEvent::Stopped => Some((Life::Cancelled, TaskLife::Cancelled)),
+                    WorkerEvent::Failed { reason, .. } | WorkerEvent::Rejected { reason } => {
+                        failure_reason = Some(reason.clone());
+                        Some((Life::Failed, TaskLife::Failed))
+                    }
+                    _ => None,
+                };
+                if let Some((lifecycle, checkpoint_lifecycle)) = expected_terminal {
+                    if checkpoint.task.lifecycle != checkpoint_lifecycle {
+                        return Err(ApiError::conflict(
+                            "accepted terminal event differs from its checkpoint",
+                        ));
+                    }
+                    // Interrupted has no worker event of its own. Keep its historical
+                    // failure reason without inventing a process termination timestamp.
+                    if task.lifecycle == Life::Interrupted && lifecycle == Life::Failed {
+                        continue;
+                    }
+                    if task.lifecycle != lifecycle {
+                        return Err(ApiError::conflict(
+                            "accepted terminal event differs from task lifecycle",
+                        ));
+                    }
+                    details.completed_at_unix_ms = timestamp;
+                }
+            }
+            _ => {
+                return Err(ApiError::conflict(
+                    "accepted stage journal direction differs from its transition",
+                ))
+            }
         }
-        let detail = match task.lifecycle {
-            Life::Failed | Life::Interrupted => failure_detail,
-            Life::Cancelled => stop_detail,
-            _ => continue,
-        };
-        reasons.insert(task.task_id.clone(), detail);
     }
-    Ok(reasons)
+    details.reason = match task.lifecycle {
+        Life::Failed | Life::Interrupted => failure_reason,
+        Life::Cancelled => stop_reason,
+        _ => None,
+    };
+    if details
+        .started_at_unix_ms
+        .zip(details.completed_at_unix_ms)
+        .is_some_and(|(start, end)| end < start)
+    {
+        details.completed_at_unix_ms = None;
+    }
+    Ok(details)
 }
 
 fn cursor_matches_context(cursor: &ProjectionCursor, context: &ProjectionContext) -> bool {
@@ -2832,6 +3051,412 @@ mod tests {
     }
 
     #[test]
+    fn accepted_stage_records_copy_only_current_attempt_journal_times() {
+        let (_directory, store, context, mut catalog) = preclaim_cancelled_fixture();
+        let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
+            &store,
+            &fullmag_application::RunId::parse(context.run_id).unwrap(),
+            &fullmag_application::ProjectId::parse("project-cancel").unwrap(),
+        )
+        .unwrap();
+        let task = &mut catalog.tasks[0];
+        task.lifecycle = fullmag_session::FmsTaskLifecycle::Succeeded;
+        task.attempt_id = Some("attempt-timing".into());
+        task.ownership_epoch = Some(1);
+        let cached = CachedStageJournalDetails {
+            run_id: catalog.run_id.clone(),
+            input_fingerprint: task.input_fingerprint.clone(),
+            attempt_id: task.attempt_id.clone(),
+            ownership_epoch: task.ownership_epoch,
+            lifecycle: task.lifecycle,
+            details: StageJournalDetails {
+                reason: None,
+                started_at_unix_ms: Some(2000),
+                completed_at_unix_ms: Some(4000),
+            },
+        };
+        let mut cache = [(task.task_id.clone(), cached)]
+            .into_iter()
+            .collect::<StageJournalDetailsCache>();
+        let projected =
+            build_stage_execution(&accepted, &catalog.tasks, None, &[], &cache, "completed")
+                .unwrap();
+        assert_eq!(projected.stages[0].started_at_unix_ms, Some(2000));
+        assert_eq!(projected.stages[0].completed_at_unix_ms, Some(4000));
+        assert!(projected.stages[1].started_at_unix_ms.is_none());
+        cache.values_mut().next().unwrap().attempt_id = Some("old-attempt".into());
+        let stale =
+            build_stage_execution(&accepted, &catalog.tasks, None, &[], &cache, "completed")
+                .unwrap();
+        assert!(stale.stages[0].started_at_unix_ms.is_none());
+        assert!(stale.stages[0].completed_at_unix_ms.is_none());
+    }
+
+    // Focused parser fixtures; production reads also validate the complete
+    // journal stream and capture its exact catalog under a native shared fence.
+    fn timing_task(
+        lifecycle: fullmag_session::FmsTaskLifecycle,
+    ) -> (
+        fullmag_application::TaskRecord,
+        fullmag_session::FmsTaskCatalogEntry,
+    ) {
+        use fullmag_application::{ResourceBudget, ResourceKind, ResourceLease, RunId, TaskRecord};
+        let mut application =
+            TaskRecord::new(RunId::parse("run-timing").unwrap(), "a".repeat(64)).unwrap();
+        application.queue().unwrap();
+        let claim = application
+            .claim(
+                ResourceLease::new(
+                    "cpu-timing",
+                    ResourceKind::Cpu,
+                    ResourceBudget {
+                        cpu_millis: 1000,
+                        memory_bytes: 1024,
+                        gpu_memory_bytes: 0,
+                        storage_bytes: 1024,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        application.begin_running(&claim).unwrap();
+        let mut catalog = task(lifecycle);
+        catalog.task_id = application.task_id.as_str().into();
+        catalog.attempt_id = Some(claim.attempt_id.as_str().into());
+        catalog.ownership_epoch = Some(claim.ownership_epoch.value());
+        (application, catalog)
+    }
+
+    fn timing_event(
+        application: &fullmag_application::TaskRecord,
+        event: fullmag_application::WorkerEvent,
+        sequence: u64,
+        timestamp_ms: i64,
+    ) -> fullmag_session::FmsCoordinatorJournalEntry {
+        use chrono::TimeZone;
+        use fullmag_application::{
+            CoordinatorCheckpoint, CoordinatorMessage, CoordinatorTransition, TaskLifecycle,
+            WorkerEvent, WorkerEventEnvelope,
+        };
+        let claim = application.claim.as_ref().unwrap().clone();
+        let mut task = application.clone();
+        task.lifecycle = match &event {
+            WorkerEvent::Completed { .. } => TaskLifecycle::Succeeded,
+            WorkerEvent::Failed { .. } | WorkerEvent::Rejected { .. } => TaskLifecycle::Failed,
+            WorkerEvent::Stopped => TaskLifecycle::Cancelled,
+            _ => TaskLifecycle::Running,
+        };
+        let terminal = matches!(
+            &event,
+            WorkerEvent::Completed { .. }
+                | WorkerEvent::Failed { .. }
+                | WorkerEvent::Rejected { .. }
+        );
+        let message_id = format!("event-{sequence}");
+        let transition = CoordinatorTransition {
+            schema_version: fullmag_application::COORDINATOR_TRANSITION_SCHEMA.into(),
+            checkpoint: CoordinatorCheckpoint {
+                schema_version: fullmag_application::COORDINATOR_CHECKPOINT_SCHEMA.into(),
+                task,
+                claim: claim.clone(),
+                command_sequence: 2,
+                event_sequence: sequence,
+            },
+            message: CoordinatorMessage::Event(WorkerEventEnvelope {
+                schema_version: fullmag_application::WORKER_PROTOCOL_SCHEMA.into(),
+                message_id: message_id.clone(),
+                sequence,
+                claim: claim.identity(),
+                event,
+            }),
+        };
+        let payload = serde_json::to_value(transition).unwrap();
+        fullmag_session::FmsCoordinatorJournalEntry {
+            schema_version: fullmag_session::FMS_COORDINATOR_JOURNAL_SCHEMA.into(),
+            entry_id: message_id,
+            run_id: claim.run_id.as_str().into(),
+            task_id: claim.task_id.as_str().into(),
+            attempt_id: claim.attempt_id.as_str().into(),
+            ownership_epoch: claim.ownership_epoch.value(),
+            lease_token: claim.lease.lease_token.as_str().into(),
+            direction: fullmag_session::FmsCoordinatorJournalDirection::Event,
+            sequence,
+            terminal,
+            payload_sha256: fullmag_session::canonical_json_sha256(&payload),
+            payload,
+            created_at: chrono::Utc
+                .timestamp_millis_opt(timestamp_ms)
+                .single()
+                .unwrap(),
+        }
+    }
+
+    fn timing_command(
+        application: &fullmag_application::TaskRecord,
+        command: fullmag_application::WorkerCommand,
+    ) -> fullmag_session::FmsCoordinatorJournalEntry {
+        let mut entry = timing_event(
+            application,
+            fullmag_application::WorkerEvent::Started,
+            2,
+            1000,
+        );
+        let claim = application.claim.as_ref().unwrap();
+        entry.direction = fullmag_session::FmsCoordinatorJournalDirection::Command;
+        entry.entry_id = "command-2".into();
+        entry.payload["checkpoint"]["task"]["lifecycle"] = serde_json::to_value(match &command {
+            fullmag_application::WorkerCommand::Start => {
+                fullmag_application::TaskLifecycle::Preparing
+            }
+            fullmag_application::WorkerCommand::Stop { .. } => {
+                fullmag_application::TaskLifecycle::Stopping
+            }
+            _ => application.lifecycle,
+        })
+        .unwrap();
+        entry.payload["message"] =
+            serde_json::to_value(fullmag_application::CoordinatorMessage::Command(
+                fullmag_application::WorkerCommandEnvelope {
+                    schema_version: fullmag_application::WORKER_PROTOCOL_SCHEMA.into(),
+                    message_id: entry.entry_id.clone(),
+                    sequence: 2,
+                    claim: claim.identity(),
+                    command,
+                },
+            ))
+            .unwrap();
+        entry.payload_sha256 = fullmag_session::canonical_json_sha256(&entry.payload);
+        entry
+    }
+
+    #[test]
+    fn accepted_stage_times_use_started_event_and_matching_terminal_not_start_command() {
+        use fullmag_application::{ScientificAssessment, WorkerCommand, WorkerEvent};
+        let (application, mut task) = timing_task(fullmag_session::FmsTaskLifecycle::Running);
+        let command = timing_command(&application, WorkerCommand::Start);
+        let pending =
+            stage_journal_details_for_task("run-timing", &task, &[command.clone()]).unwrap();
+        assert_eq!(pending.started_at_unix_ms, None);
+        let started = timing_event(&application, WorkerEvent::Started, 2, 2000);
+        let running = stage_journal_details_for_task(
+            "run-timing",
+            &task,
+            &[command.clone(), started.clone()],
+        )
+        .unwrap();
+        assert_eq!(running.started_at_unix_ms, Some(2000));
+        assert_eq!(running.completed_at_unix_ms, None);
+        task.lifecycle = fullmag_session::FmsTaskLifecycle::Succeeded;
+        let completed = timing_event(
+            &application,
+            WorkerEvent::Completed {
+                assessment: ScientificAssessment::Unassessed,
+            },
+            3,
+            4000,
+        );
+        let journal = [command, started, completed];
+        let done = stage_journal_details_for_task("run-timing", &task, &journal).unwrap();
+        assert_eq!(
+            (done.started_at_unix_ms, done.completed_at_unix_ms),
+            (Some(2000), Some(4000))
+        );
+        // A fresh reader of the same durable entries reconstructs the same times.
+        assert_eq!(
+            done,
+            stage_journal_details_for_task("run-timing", &task, &journal).unwrap()
+        );
+    }
+
+    #[test]
+    fn accepted_stage_times_preserve_failure_and_stop_reasons_without_inventing_start() {
+        use fullmag_application::{WorkerCommand, WorkerEvent};
+        let (application, mut task) = timing_task(fullmag_session::FmsTaskLifecycle::Failed);
+        let failure = timing_event(
+            &application,
+            WorkerEvent::Failed {
+                retryable: false,
+                reason: "native failure".into(),
+            },
+            3,
+            4000,
+        );
+        let failed =
+            stage_journal_details_for_task("run-timing", &task, &[failure.clone()]).unwrap();
+        assert_eq!(failed.reason.as_deref(), Some("native failure"));
+        assert_eq!(
+            (failed.started_at_unix_ms, failed.completed_at_unix_ms),
+            (None, Some(4000))
+        );
+        task.lifecycle = fullmag_session::FmsTaskLifecycle::Interrupted;
+        let interrupted = stage_journal_details_for_task("run-timing", &task, &[failure]).unwrap();
+        assert_eq!(interrupted.reason.as_deref(), Some("native failure"));
+        assert_eq!(interrupted.completed_at_unix_ms, None);
+        task.lifecycle = fullmag_session::FmsTaskLifecycle::Cancelled;
+        let stop = timing_command(
+            &application,
+            WorkerCommand::Stop {
+                reason: "operator stop".into(),
+            },
+        );
+        let stopped = timing_event(&application, WorkerEvent::Stopped, 3, 5000);
+        let cancelled =
+            stage_journal_details_for_task("run-timing", &task, &[stop, stopped]).unwrap();
+        assert_eq!(cancelled.reason.as_deref(), Some("operator stop"));
+        assert_eq!(
+            (cancelled.started_at_unix_ms, cancelled.completed_at_unix_ms),
+            (None, Some(5000))
+        );
+    }
+
+    #[test]
+    fn accepted_stage_times_reject_crossed_envelope_checkpoint_and_journal_fences() {
+        let (application, task) = timing_task(fullmag_session::FmsTaskLifecycle::Running);
+        let entry = timing_event(
+            &application,
+            fullmag_application::WorkerEvent::Started,
+            2,
+            2000,
+        );
+        for (pointer, value) in [
+            ("/checkpoint/claim/run_id", json!("foreign-run")),
+            ("/checkpoint/task/attempt_id", json!("foreign-attempt")),
+            (
+                "/message/envelope/claim/attempt_id",
+                json!("foreign-attempt"),
+            ),
+            ("/message/envelope/claim/ownership_epoch", json!(2)),
+            (
+                "/message/envelope/claim/lease_token",
+                json!("foreign-lease"),
+            ),
+            ("/message/envelope/message_id", json!("foreign-message")),
+            ("/message/envelope/sequence", json!(3)),
+        ] {
+            let mut corrupt = entry.clone();
+            *corrupt.payload.pointer_mut(pointer).unwrap() = value;
+            corrupt.payload_sha256 = fullmag_session::canonical_json_sha256(&corrupt.payload);
+            assert!(
+                stage_journal_details_for_task("run-timing", &task, &[corrupt]).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut foreign_run = entry.clone();
+        foreign_run.run_id = "foreign-run".into();
+        assert!(stage_journal_details_for_task("run-timing", &task, &[foreign_run]).is_err());
+        let mut foreign_lease = entry.clone();
+        foreign_lease.lease_token = "foreign-lease".into();
+        assert!(stage_journal_details_for_task("run-timing", &task, &[foreign_lease]).is_err());
+        let mut crossed = entry;
+        crossed.direction = fullmag_session::FmsCoordinatorJournalDirection::Command;
+        assert!(stage_journal_details_for_task("run-timing", &task, &[crossed]).is_err());
+    }
+
+    #[test]
+    fn accepted_stage_times_ignore_old_attempts_and_reject_wrong_terminal_lifecycle() {
+        use fullmag_application::{ScientificAssessment, WorkerEvent};
+        let (application, task) = timing_task(fullmag_session::FmsTaskLifecycle::Running);
+        let mut old = timing_event(&application, WorkerEvent::Started, 2, 1000);
+        old.attempt_id = "old-attempt".into();
+        let details = stage_journal_details_for_task("run-timing", &task, &[old]).unwrap();
+        assert_eq!(details, StageJournalDetails::default());
+        let completed = timing_event(
+            &application,
+            WorkerEvent::Completed {
+                assessment: ScientificAssessment::Unassessed,
+            },
+            3,
+            4000,
+        );
+        assert!(stage_journal_details_for_task("run-timing", &task, &[completed]).is_err());
+        let started = timing_event(&application, WorkerEvent::Started, 2, 2000);
+        assert!(
+            stage_journal_details_for_task("run-timing", &task, &[started.clone(), started])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn accepted_stage_times_omit_invalid_utc_and_backwards_completion() {
+        use fullmag_application::{ScientificAssessment, WorkerEvent};
+        let (application, task) = timing_task(fullmag_session::FmsTaskLifecycle::Succeeded);
+        for start in [0, -1] {
+            let details = stage_journal_details_for_task(
+                "run-timing",
+                &task,
+                &[timing_event(&application, WorkerEvent::Started, 2, start)],
+            )
+            .unwrap();
+            assert_eq!(details.started_at_unix_ms, None);
+        }
+        let details = stage_journal_details_for_task(
+            "run-timing",
+            &task,
+            &[
+                timing_event(&application, WorkerEvent::Started, 2, 4000),
+                timing_event(
+                    &application,
+                    WorkerEvent::Completed {
+                        assessment: ScientificAssessment::Unassessed,
+                    },
+                    3,
+                    2000,
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            (details.started_at_unix_ms, details.completed_at_unix_ms),
+            (Some(4000), None)
+        );
+    }
+
+    #[test]
+    fn accepted_stage_journal_cache_reuses_heartbeat_but_invalidates_exact_identity() {
+        let (_directory, store, _context, mut catalog) = preclaim_cancelled_fixture();
+        let task = &mut catalog.tasks[0];
+        task.lifecycle = fullmag_session::FmsTaskLifecycle::Running;
+        task.attempt_id = Some("attempt-timing".into());
+        task.ownership_epoch = Some(1);
+        let cached = CachedStageJournalDetails {
+            run_id: catalog.run_id.clone(),
+            input_fingerprint: task.input_fingerprint.clone(),
+            attempt_id: task.attempt_id.clone(),
+            ownership_epoch: task.ownership_epoch,
+            lifecycle: task.lifecycle,
+            details: StageJournalDetails {
+                started_at_unix_ms: Some(2000),
+                ..Default::default()
+            },
+        };
+        let previous = [(task.task_id.clone(), cached)]
+            .into_iter()
+            .collect::<StageJournalDetailsCache>();
+        catalog.revision += 100; // A heartbeat revision alone must not reacquire any store fence.
+        let _writer = store.write_transaction().unwrap();
+        let reused = load_stage_journal_details(&store, &catalog, Some(&previous)).unwrap();
+        assert_eq!(
+            reused[&catalog.tasks[0].task_id].details.started_at_unix_ms,
+            Some(2000)
+        );
+        assert!(load_stage_journal_details(&store, &catalog, None).is_err());
+        for key in ["run", "fingerprint", "attempt", "epoch", "lifecycle"] {
+            let mut changed = catalog.clone();
+            match key {
+                "run" => changed.run_id = "different-run".into(),
+                "fingerprint" => changed.tasks[0].input_fingerprint = "b".repeat(64),
+                "attempt" => changed.tasks[0].attempt_id = Some("next-attempt".into()),
+                "epoch" => changed.tasks[0].ownership_epoch = Some(2),
+                _ => changed.tasks[0].lifecycle = fullmag_session::FmsTaskLifecycle::Succeeded,
+            }
+            assert!(
+                load_stage_journal_details(&store, &changed, Some(&previous)).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn preclaim_cancellation_projects_terminal_metadata_without_creating_artifacts() {
         let (_directory, store, context, catalog) = preclaim_cancelled_fixture();
         assert!(preclaim_cancelled_without_artifacts(&store, &catalog).unwrap());
@@ -3269,6 +3894,7 @@ mod tests {
                 Vec::new(),
                 crate::types::RuntimeLifecycleState::Unknown,
             ),
+            stage_journal_details: StageJournalDetailsCache::new(),
         };
         assert!(!cursor_matches_context(&previous, &context));
     }

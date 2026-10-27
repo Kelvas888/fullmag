@@ -2704,6 +2704,8 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--completed-recreation-sha256", help="SHA-256 of the completed removal terminal receipt")
     recreate_volume.add_argument("--drained-successor-proof", help="Exact control-volume proof of a later successful managed drain")
     recreate_volume.add_argument("--drained-successor-proof-sha256", help="SHA-256 of the exact drained-successor proof")
+    recreate_volume.add_argument("--terminal-observation-proof", help="Exact private control-volume proof of one terminal observation")
+    recreate_volume.add_argument("--terminal-observation-proof-sha256", help="SHA-256 of the exact terminal observation proof")
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the previous session and archive its runtime state before starting an empty session")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
                                  include_untracked=None, script=None)
@@ -2948,6 +2950,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = stop_bootstrap(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
+            if bool(args.terminal_observation_proof) != bool(args.terminal_observation_proof_sha256):
+                raise _fail("Terminal observation requires paired proof and SHA-256")
+            if args.terminal_observation_proof and any((args.fresh_state, args.recovery_authorization, args.resume_recreation, args.completed_recreation_attempt, args.drained_successor_proof)):
+                raise _fail("Terminal observation requires plain retained recreation without another restore or recovery request")
             if bool(args.completed_recreation_attempt) != bool(args.completed_recreation_sha256):
                 raise _fail("completed recreation requires both attempt and terminal SHA-256")
             if args.completed_recreation_attempt and (args.fresh_state or args.recovery_authorization or args.resume_recreation):
