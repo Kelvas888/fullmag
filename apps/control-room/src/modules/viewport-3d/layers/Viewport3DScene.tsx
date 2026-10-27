@@ -152,6 +152,8 @@ import { ArtifactFieldLayer } from "./ArtifactFieldLayer";
 import type { ArtifactFieldOverlayModel } from "../model/artifactFieldOverlayModel";
 import { AntennaFieldLayer } from "./AntennaFieldLayer";
 import type { AntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
+import type { SavedAntennaSourceModel } from "../model/savedAntennaSourceModel";
+import { SavedAntennaSourceLayer } from "./SavedAntennaSourceLayer";
 import { HysteresisReplayGlyphLayer } from "./HysteresisReplayGlyphLayer";
 import { Viewport3DLightingRig } from "./Viewport3DLightingRig";
 import {
@@ -198,6 +200,7 @@ const EMPTY_REGION_OVERLAYS: readonly RegionOverlayInput[] = [];
 interface Viewport3DSceneProps {
   artifactFieldOverlay?: ArtifactFieldOverlayModel | null;
   antennaFieldOverlay?: AntennaFieldOverlayModel | null;
+  savedAntennaSourceModel?: SavedAntennaSourceModel | null;
   adoptionRegistry?: Viewport3DRenderAdoptionRegistry;
   sessionIdentity?: SessionResourceIdentity | null;
   bounds: Viewport3DBounds | null;
@@ -1840,6 +1843,7 @@ function useViewport3DRenderAdoptionFrame({
 export function Viewport3DScene({
   artifactFieldOverlay,
   antennaFieldOverlay,
+  savedAntennaSourceModel,
   adoptionRegistry,
   sessionIdentity,
   bounds,
@@ -2303,6 +2307,7 @@ export function Viewport3DScene({
     <VectorGlyphDerivedBufferCacheProvider tracker={tracker}>
       <ArtifactFieldLayer adoptionRegistry={adoptionRegistry} model={artifactFieldOverlay ?? null} colors={colors} tracker={tracker} sessionIdentity={sessionIdentity ?? null} />
       <AntennaFieldLayer model={antennaFieldOverlay ?? null} colors={colors} tracker={tracker} sessionIdentity={sessionIdentity ?? null} />
+      <SavedAntennaSourceLayer model={savedAntennaSourceModel ?? null} colors={colors} tracker={tracker} />
       <Viewport3DBackground colors={colors} mode={appearance.backgroundMode} strength={appearance.backgroundStrength} tracker={tracker} />
       <Viewport3DCaptureSource onFrameReady={onCaptureFrameReady} />
       <Viewport3DLightingRig profileId={visualProfileId} appearance={appearance} />

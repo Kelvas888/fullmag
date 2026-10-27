@@ -507,7 +507,7 @@ describe("FDM Airbox mesh demand", () => {
     );
 
     expect(settingsBlock).toContain(
-      "visualizationState: femLaneActive ? renderingState : null",
+      "visualizationState: renderingState",
     );
   });
 
@@ -799,13 +799,13 @@ describe("useViewport3DSceneModel", () => {
   it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
-      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: femLaneActive ? renderingState : null,",
+      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: renderingState,",
     );
     const fdmSingleGridAirboxBlock = source.slice(
       source.indexOf("const fdmSingleGridAirboxSettings ="),
       source.indexOf("const fdmVectorScale =", source.indexOf("const fdmSingleGridAirboxSettings =")),
     );
-    expect(fdmSingleGridAirboxBlock).toContain("fdmMultilayerAirboxDomain");
+    expect(fdmSingleGridAirboxBlock).toContain("fdmMultilayerLayout.data?.available");
     expect(fdmSingleGridAirboxBlock).toContain(": airboxSettings");
     expect(fdmSingleGridAirboxBlock).not.toContain("fdmUniverseOutsideSupportSettings");
   });
@@ -820,9 +820,10 @@ describe("useViewport3DSceneModel", () => {
     expect(airboxSettingsBlock).toContain("resolveTargetVisualization({");
     expect(airboxSettingsBlock).toContain("target: AIRBOX_VISUALIZATION_TARGET");
     expect(airboxSettingsBlock).toContain(
-      "visualizationState: femLaneActive ? renderingState : null",
+      "visualizationState: renderingState",
     );
     expect(airboxSettingsBlock).not.toContain("resolveViewport3DFdmTargetVisualization({");
+    expect(airboxSettingsBlock).not.toContain("femLaneActive ? renderingState : null");
 
     const singleGridDisplayBlock = source.slice(
       source.indexOf("const fdmAirboxMaxVectorGlyphs ="),
@@ -964,7 +965,7 @@ describe("useViewport3DSceneModel", () => {
       "(fdmLaneActive ? fdmBuildState?.error?.message : null)",
     );
     expect(source).toContain(
-      "[femLaneActive, objectVisualizationSnapshot, renderingState]",
+      "[objectVisualizationSnapshot, renderingState]",
     );
   });
 

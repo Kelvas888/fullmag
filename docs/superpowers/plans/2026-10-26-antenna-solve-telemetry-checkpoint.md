@@ -681,3 +681,76 @@ przygotowania muszą nastąpić po terminalu pełnego workera, nigdy przez przer
 jego obliczeń. Zmiana prawdziwego profilu po materializacji nadal wymaga
 bind-before-geometry jak w istniejącym flow UI; ta poprawka nie obiecuje jej obsługi
 w CLI i nie pomija walidatora. Pełny cel E0–E12 pozostaje nieukończony.
+
+### Archiwalny przewodnik przy zapisanym H — 27.10.2026
+
+Kontynuacja jest postępem implementacyjnym oraz zweryfikowanym oczekiwaniem na
+konkretny żywy worker. Pełny run 5654db21… nadal ma lifecycle running; potwierdzono
+PID 9549 i niezmieniony starttime, rosnący CPU oraz brak opublikowanego katalogu.
+Nie restartowano backendu, nie anulowano próby i nie wykonano kolejnego Solve.
+
+Audyt wykazał brak kontekstu przewodnika w trybie Saved H: dotychczasowy adapter
+tworzy tylko zapisany sampling carrier, a zasoby live są prawidłowo wyłączone.
+Nowa poprawka używa istniejącego pinned SolutionSet/member oraz istniejących
+materializedDataset, savedFieldGeometry i savedFieldTopology w typowanym kliencie.
+Nie tworzy endpointu, pina, drugiego view­portu ani zastępczego modelu fizycznego.
+
+Mapa źródeł:
+- kernel/resources/savedAntennaSourceContextResources.ts::
+  resolveSavedAntennaSourceDataset i loadSavedAntennaSourceContext wiążą H_ant
+  z dokładnie jednym V_electric sibling; hook useSavedAntennaSourceContextResources
+  odcina stary kontekst synchronicznie po zmianie wyboru.
+- modules/viewport-3d/model/savedAntennaSourceModel.ts::
+  buildSavedAntennaSourceModel buduje wyłącznie powierzchnię źródłową bez pola.
+- modules/viewport-3d/layers/SavedAntennaSourceLayer.tsx::
+  SavedAntennaSourceLayer renderuje złoty materiał z dotychczasową subtelną fakturą
+  i jawnie zwalnia geometrię, materiał oraz obie tekstury.
+- hooks/useViewport3DSceneModel.ts oraz layers/Viewport3DScene.tsx dołączają
+  oddzielną warstwę i uwzględniają jej bounds w dopasowaniu kamery.
+
+Powiązanie wymaga zgodności project/run/SolutionSet, containing i owner revision,
+member, run_spec_digest, item_id pakietu i producenta closed-loop-inspection v2.
+Brak lub duplikat zgodnego V daje jawny brak kontekstu, bez live fallbacku.
+Discovery jest ograniczone do dziesięciu stron po 100 metadanych, a geometria
+przechodzi dotychczasowe ograniczenia, kontrolę manifestu/hashu i dekodowanie.
+Nie pobiera się wartości V ani nie przypisuje H do węzłów przewodnika.
+H zachowuje własną siatkę, maskę wsparcia, wartości i jednostki A/m.
+
+Rzeczywisty nowy loader wykonano w stałym frontendzie przez ControlRoomApi
+na istniejącym wyniku diagnostyki 20 punktów. PASS: siedem GET HTTP 200,
+H pozostaje 20 próbek; archived source ma 677 węzłów, 1856 Tet4 i 1322 trójkąty
+powierzchniowe, ten sam bundle. Brak odczytu slice V, live API i mutacji.
+To rzeczywista weryfikacja danych/integracji klienta, nie dowód obrazu WebGL.
+
+Kontrole:
+- 24/24 focused Vitest: identity i unikalność, paginacja/manifest drift,
+  stare zaznaczenie, brak wartości/live fallbacku, geometra SI, lifecycle zasobów
+  oraz istniejąca walidacja pól Saved.
+- pnpm run typecheck: exit 0; ESLint siedmiu zmienionych plików: exit 0,
+  --max-warnings=0; architecture hygiene: exit 0.
+- check-saved-field-presentation.mjs: PASS przy wymaganym
+  node --experimental-vm-modules. Pierwsza próba bez flagi nie mogła utworzyć
+  vm.SourceTextModule; nie zmieniono kontrolera ani aplikacji w celu jej obejścia.
+- istniejące regresje sceny/modelu: pierwotnie 216 pass / 4 fail. Cztery błędy
+  są dawnymi asercjami tekstowymi Airbox, niezgodnymi również z blokiem w HEAD
+  47557600a400a8f038987c1f7d1b5937b58dee41. Sprawdzały historyczną bramkę FEM,
+  choć wspólny target już stosuje renderingState dla obu ścieżek FDM/FEM.
+  Uaktualniono sześć asercji do istniejącego kontraktu, dodając kontrolę braku
+  dawnej bramki. Bez zmiany runtime: 166/166 testów modelu pass;
+  54/54 testów sceny pozostało pass. Łącznie 244 testy wskazanych plików pass.
+- Niezależny review nowego delta: brak Required dla identity, integracji i lifecycle.
+  Zgodność źródeł worktree z cieniem frontendu potwierdzona hashami.
+  Obcy ArtifactInspectionSource.tsx i jego staged blob pozostają bez zmian.
+
+Dowody w wolumenie kontrolnym:
+verification/saved-antenna-source-context-20261027/:
+before-source.json, actual-typed-api.json, focused-tests.json, typecheck.json,
+lint.json, architecture-hygiene.json, saved-presentation-contract.json,
+existing-viewport-tests.json, preexisting-airbox-test-drift.json,
+scene-model-tests-final.json, scene-model-test-lint.json i source-view.json.
+Pełne logi nieudanych prób zachowano; status zbiorczy dotyczy końcowych kontroli.
+
+Status: implementacja i kontrole źródeł/klienta API zweryfikowane w opisanym zakresie.
+Browser/WebGL, obraz pełnego Universe i cold reopen nadal NOT VERIFIED.
+Nie ponawiano zablokowanego dostępu do przeglądarki. Baza per A, LLG, FFT,
+kwalifikacja naukowa i odtworzenie publikacji nie wynikają z tej poprawki.

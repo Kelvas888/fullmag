@@ -328,6 +328,8 @@ import { resolveViewport3DCameraFovDegrees } from "../viewport3dCameraFov";
 import { useMaterializedDatasetResource } from "@/kernel/resources/solutionSetResources";
 import { useSavedFieldViewportResources } from "@/kernel/resources/savedFieldViewportResources";
 import { buildSavedFieldViewportSceneModel } from "../savedFieldViewportAdapter";
+import { useSavedAntennaSourceContextResources } from "@/kernel/resources/savedAntennaSourceContextResources";
+import { buildSavedAntennaSourceModel } from "../model/savedAntennaSourceModel";
 
 export function resolveViewport3DAirboxVectorSampleBudget(
   requestedBudget: number,
@@ -3083,6 +3085,16 @@ export function useViewport3DSceneModel({
     savedDatasetForViewport,
     savedSelectionActive,
   );
+  const savedAntennaSourceContext = useSavedAntennaSourceContextResources(
+    savedDatasetForViewport,
+    savedSelectionActive,
+  );
+  const sourceGeometry = savedAntennaSourceContext.status === "ready" ? savedAntennaSourceContext.geometry : null;
+  const sourceTopology = savedAntennaSourceContext.status === "ready" ? savedAntennaSourceContext.topology : null;
+  const savedAntennaSourceModel = useMemo(
+    () => sourceGeometry && sourceTopology ? buildSavedAntennaSourceModel(sourceGeometry, sourceTopology) : null,
+    [sourceGeometry, sourceTopology],
+  );
   const savedViewportResourcesFresh =
     savedDatasetForViewport !== null &&
     savedViewportResourceHasFreshData(savedViewportResources.geometry) &&
@@ -3938,9 +3950,12 @@ export function useViewport3DSceneModel({
   const savedViewportBounds = useMemo(
     () =>
       savedViewportResourcesFresh && savedViewportResources.topology.data
-        ? resolveTopologyBounds(savedViewportResources.topology.data)
+        ? combineViewport3DBounds([
+            resolveTopologyBounds(savedViewportResources.topology.data),
+            savedAntennaSourceModel?.bounds ?? null,
+          ].filter((entry): entry is Viewport3DBounds => entry !== null))
         : null,
-    [savedViewportResources.topology.data, savedViewportResourcesFresh],
+    [savedAntennaSourceModel?.bounds, savedViewportResources.topology.data, savedViewportResourcesFresh],
   );
   const savedViewportCamera = useSavedViewportCamera({
     bounds: savedViewportBounds,
@@ -7408,7 +7423,11 @@ export function useViewport3DSceneModel({
     sessionDiscretization: savedSelectionActive ? null : sessionDiscretization,
     domainSummary: savedSelectionActive
       ? savedViewportSceneModel
-        ? "saved sampling domain"
+        ? savedAntennaSourceModel
+          ? "saved sampling domain · archived antenna source"
+          : savedDatasetForViewport?.field.descriptor.quantity_id === "H_ant"
+            ? "saved sampling domain · antenna context: " + (savedAntennaSourceContext.status === "ready" ? "surface unavailable" : savedAntennaSourceContext.reason)
+            : "saved sampling domain"
         : "saved domain unavailable"
       : domainSummary,
     fallbackSettings: effectiveViewportFallbackSettings,
@@ -7524,6 +7543,7 @@ export function useViewport3DSceneModel({
     regionOverlays: savedSelectionActive ? [] : regionOverlays,
     resourceFrameKey,
     savedViewportActive: savedSelectionActive,
+    savedAntennaSourceModel: savedSelectionActive && savedViewportResourcesFresh ? savedAntennaSourceModel : null,
     savedFieldIdentity: savedSelectionActive ? savedPresentation?.selection.nodeId ?? savedDatasetSelection?.nodeId ?? null : null,
     savedFieldUnit: savedSelectionActive ? savedDatasetResource.data?.field.descriptor.unit ?? null : null,
     selectedLabel,
