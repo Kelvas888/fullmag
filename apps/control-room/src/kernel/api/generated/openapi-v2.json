@@ -3140,6 +3140,30 @@
         ],
         "type": "object"
       },
+      "AntennaInspectionDiscoveryResource": {
+        "properties": {
+          "reason_code": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AntennaInspectionDiscoveryState"
+          }
+        },
+        "required": [
+          "state",
+          "reason_code"
+        ],
+        "type": "object"
+      },
+      "AntennaInspectionDiscoveryState": {
+        "description": "Discovery of a registered inspection owner, not validation of its numerical payload.",
+        "enum": [
+          "retained",
+          "absent",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "AntennaInspectionDisplayCapabilities": {
         "properties": {
           "current_density": {
@@ -42490,6 +42514,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "antenna_inspection": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaInspectionDiscoveryResource"
+              }
             ]
           },
           "antenna_progress": {

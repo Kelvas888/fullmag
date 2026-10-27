@@ -1459,6 +1459,7 @@ interface Viewport3DFrameProps
     | "orbitDebugRevision"
   > {
   artifactInspectionDefinitions: ReadonlyArray<{ id?: string; source_object_id?: string }>;
+  artifactPresentationTarget: VisualizationTargetRef | null;
   cameraDialogOpen: boolean;
   cameraResource: VisualizationStateResource["camera"] | null;
   clientReady: boolean;
@@ -2113,6 +2114,7 @@ function useViewport3DSelectionHandlers({
 
 const Viewport3DFrame = memo(function Viewport3DFrame({
   artifactInspectionDefinitions,
+  artifactPresentationTarget,
   captureRevision,
   canvasContextProfileId,
   cameraDialogOpen,
@@ -2166,8 +2168,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const antennaFieldOverlay = useAntennaFieldOverlay(!savedViewportActive);
   const artifactTarget = sceneProps.primitiveModel?.objects.find(object => object.objectId === sceneProps.selectedObjectId);
-  const artifactSettings = artifactTarget ? sceneProps.getObjectSettings(artifactTarget) : sceneProps.fdmSettings;
-  const artifactField = useArtifactFieldOverlay(quantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions);
+  const artifactSettings = artifactPresentationTarget?.kind === "airbox" ? sceneProps.airboxSettings :
+    artifactTarget ? sceneProps.getObjectSettings(artifactTarget) : sceneProps.fdmSettings;
+  const artifactQuantityId = artifactPresentationTarget?.kind === "airbox" ? artifactSettings.activeQuantityId : quantityId;
+  const artifactField = useArtifactFieldOverlay(artifactQuantityId, sceneProps.selectedObjectId, artifactSettings, Boolean(antennaFieldOverlay), artifactInspectionDefinitions, artifactPresentationTarget);
+  const ownUniverseInspection = artifactPresentationTarget?.kind === "airbox" && artifactField.historical;
+  const artifactBounds = ownUniverseInspection && artifactField.bounds ? artifactField.bounds : sceneProps.bounds;
   const liveQuantityDataAvailable = hasViewport3DQuantityData(quantityId, {
     fieldModel: sceneProps.fieldModel,
     fieldVectors: [visualizationDebugSource.fullFieldVector, sceneProps.fdmAirboxFieldVector, sceneProps.fdmMultilayerAirboxView?.fieldVector,
@@ -2317,7 +2323,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     meshQualityRange,
   );
   const hudSampleSummary = artifactField.model
-    ? `${artifactField.model.count} owned samples · historical inspection · ${artifactField.model.unit}`
+    ? `${artifactField.model.count} owned samples · ${ownUniverseInspection ? "accepted Universe" : "historical inspection"} · source ${artifactField.model.locator.owner.object_id} · run ${artifactField.model.locator.owner.run_id} · ${artifactField.model.unit}`
     : antennaFieldOverlay
       ? `${antennaFieldOverlay.count} samples`
       : domainSummary;
@@ -2852,7 +2858,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       )}
       data-topology-freshness={sceneProps.topologyFreshness}
       data-viewport-bounds={
-        sceneProps.bounds ? JSON.stringify(sceneProps.bounds) : ""
+        artifactBounds ? JSON.stringify(artifactBounds) : ""
       }
       data-visual-profile-id={sceneProps.visualProfileId}
       data-antenna-field-quantity={antennaFieldOverlay?.intent.quantity}
@@ -2905,7 +2911,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         {/* Informational pills share one shrinkable lane so they truncate with
             a tooltip instead of wrapping the HUD into extra rows. */}
         <div className="fm-viewport-3d__hud-info">
-          <Viewport3DFieldLabel quantityId={antennaFieldOverlay?.intent.quantity ?? quantityId} label={antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} liveDataAvailable={antennaFieldOverlay ? undefined : liveQuantityDataAvailable} />
+          <Viewport3DFieldLabel quantityId={artifactField.historical ? artifactField.model?.quantityId ?? "" : antennaFieldOverlay?.intent.quantity ?? quantityId} label={ownUniverseInspection ? "Accepted Universe inspection" : antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel} historical={!antennaFieldOverlay && artifactField.historical} model={artifactField.model} error={artifactField.error} liveDataAvailable={antennaFieldOverlay ? undefined : liveQuantityDataAvailable} />
           <span title={antennaFieldSourceLabel ?? selectedLabel}>{antennaFieldSourceLabel ?? selectedLabel}</span>
           {hysteresisReplayLabel ? <span title={hysteresisReplayLabel}>{hysteresisReplayLabel}</span> : null}
           <span title={hudSampleSummary}>{hudSampleSummary}</span>
@@ -3103,6 +3109,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             onVisibleColorScale={savedViewportActive ? onVisibleSavedColorScale : undefined}
             antennaFieldOverlay={antennaFieldOverlay}
             artifactFieldOverlay={artifactField.model}
+            airboxSettings={ownUniverseInspection ? { ...sceneProps.airboxSettings,
+              shaderVisible: false, wireframeVisible: false, vectorsVisible: false, pointsVisible: false, boundsVisible: false,
+            } : sceneProps.airboxSettings}
+            bounds={artifactBounds}
+            selectionBounds={ownUniverseInspection ? artifactBounds : sceneProps.selectionBounds}
             fieldModel={artifactField.historical ? null : sceneProps.fieldModel}
             fdmVectorSegments={artifactField.historical ? null : sceneProps.fdmVectorSegments}
             fdmVectorColors={artifactField.historical ? null : sceneProps.fdmVectorColors}

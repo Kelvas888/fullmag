@@ -93,7 +93,7 @@ async fn observation_source(state: &Arc<AppState>, context: &crate::types::Curre
     Ok(Some((root.to_owned(), Some(closure))))
 }
 
-pub(super) async fn stage_ids(state: &Arc<AppState>) -> Result<Vec<String>, ApiError> {
+pub(crate) async fn stage_ids(state: &Arc<AppState>) -> Result<Vec<String>, ApiError> {
     let context = crate::capture_current_live_request_context(state).await?;
     let Some((root, closure)) = observation_source(state, &context).await? else { return Ok(Vec::new()); };
     let Some(run) = context.run_id.clone() else { return Ok(Vec::new()); };

@@ -33,6 +33,8 @@ charge_max_iterations = 10000
 # Explicit caller-owned inspection budgets; these are not qualification receipts.
 surface_total_pairs = 4_000_000
 surface_target_pairs = 40_000
+# The 1162-node volume exceeded 30 minutes; retain all numerical tolerances.
+surface_maximum_seconds = 3 * 60 * 60
 surface_policy = fm.AntennaSurfaceFieldPolicy(
     policy_version="caller_supplied_rt0_surface.inspection.v1",
     limits={
@@ -56,7 +58,7 @@ surface_policy = fm.AntennaSurfaceFieldPolicy(
         "maximum_reduced_fraction_bits": 8192,
         "maximum_lifetime_peak_rss_bytes": 6 * 1024**3,
         "guard_interval_events": 256,
-        "maximum_total_seconds": 1800.0,
+        "maximum_total_seconds": surface_maximum_seconds,
         "maximum_target_seconds": 90.0,
     },
     tolerances={

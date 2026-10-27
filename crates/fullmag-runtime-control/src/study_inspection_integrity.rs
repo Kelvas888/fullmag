@@ -1,7 +1,7 @@
 //! Offline cold integrity gate: no admission, lease, journal or CAS mutation.
 use anyhow::{bail, Context, Result};
 use fullmag_application::{AcceptedPreparationReceipt, CoordinatorCheckpoint, ProjectId, RunId, TaskLifecycle, WorkerEvent};
-use fullmag_session::{FmsTaskLifecycle, SessionStore};
+use fullmag_session::{FmsTaskLifecycle, ReadTransaction, SessionStore};
 
 fn exact_attempt(actual_attempt: Option<&str>, actual_epoch: Option<u64>, attempt: &str, epoch: u64) -> Result<()> {
     if epoch == 0 || actual_attempt != Some(attempt) || actual_epoch != Some(epoch) {
@@ -16,7 +16,9 @@ pub fn verify_saved_inspection(
     store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
     attempt_id: &str, epoch: u64, expected_object: &str,
 ) -> Result<serde_json::Value> {
-    read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
+    let transaction = store.read_transaction()
+        .context("inspection cold-load requires a valid shared store snapshot")?;
+    read_saved_inspection(store, &transaction, project, run, task_id, attempt_id, epoch,
         expected_object, false, |evidence, _| Ok(evidence))
 }
 
@@ -25,20 +27,51 @@ pub fn load_saved_inspection(
     store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
     attempt_id: &str, epoch: u64, expected_object: &str,
 ) -> Result<(serde_json::Value, fullmag_runner::LoadedAntennaClosedLoopInspection)> {
-    read_saved_inspection(store, project, run, task_id, attempt_id, epoch,
+    // HTTP callers already run in the admitted blocking reader lane. Keep
+    // synchronous export verification above immediate; never sleep its Tokio thread.
+    let transaction = acquire_inspection_read_transaction(store, std::time::Duration::from_secs(5))
+        .context("inspection cold-load requires a valid shared store snapshot")?;
+    read_saved_inspection(store, &transaction, project, run, task_id, attempt_id, epoch,
         expected_object, true, |evidence, loaded| {
             Ok((evidence, loaded.context("verified completion did not retain its inspection reader")?))
         })
 }
 
+/// Retry only acquisition, before any catalog, journal or payload has been read.
+/// Preserve the native error chain so the facade can still report store contention.
+fn acquire_inspection_read_transaction(store: &SessionStore, wait: std::time::Duration) -> Result<ReadTransaction> {
+    use std::hash::{Hash, Hasher};
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + wait;
+    let mut attempt = 0_u64;
+    loop {
+        match store.read_transaction() {
+            Ok(transaction) => return Ok(transaction),
+            Err(error) if error.chain().any(|cause| matches!(
+                cause.downcast_ref::<std::fs::TryLockError>(), Some(std::fs::TryLockError::WouldBlock)
+            )) && Instant::now() < deadline => {
+                // Match the existing store-writer backoff without changing its error classification.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::process::id().hash(&mut hasher);
+                std::thread::current().id().hash(&mut hasher);
+                attempt.hash(&mut hasher);
+                attempt = attempt.saturating_add(1);
+                let delay = Duration::from_millis(5 + hasher.finish() % 36);
+                std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+                if Instant::now() >= deadline { return Err(error); }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn read_saved_inspection<T>(
-    store: &SessionStore, project: &ProjectId, run: &RunId, task_id: &str,
+    store: &SessionStore, transaction: &ReadTransaction, project: &ProjectId, run: &RunId, task_id: &str,
     attempt_id: &str, epoch: u64, expected_object: &str,
     retain_inspection: bool,
     build: impl FnOnce(serde_json::Value, Option<fullmag_runner::LoadedAntennaClosedLoopInspection>) -> Result<T>,
 ) -> Result<T> {
-    let transaction = store.read_transaction()
-        .context("inspection cold-load requires a valid shared store snapshot")?;
     let catalog = store.read_run_catalog(run.as_str())?.context("inspection run catalog missing")?;
     let task = catalog.tasks.iter().find(|task| task.task_id == task_id).context("inspection task missing")?;
     if task.lifecycle != FmsTaskLifecycle::Succeeded { bail!("inspection task is not succeeded"); }
@@ -65,7 +98,7 @@ fn read_saved_inspection<T>(
     // The shared lock replaces only the writer acquisition. This existing replay
     // validates the same causal transitions and current catalog without repairs.
     let recovered = crate::recover_coordinator_with_journal(store, &claim, ||
-        store.read_coordinator_journal_readonly(run.as_str(), &transaction))?;
+        store.read_coordinator_journal_readonly(run.as_str(), transaction))?;
     if recovered.coordinator.task().lifecycle != TaskLifecycle::Succeeded
         || !recovered.events.iter().any(|event| matches!(&event.event, WorkerEvent::Completed { .. })) {
         bail!("inspection cold-load requires exact durable successful Completed");
@@ -275,4 +308,76 @@ mod tests {
         assert!(exact_attempt(Some("a"), None, "a", 2).is_err());
         assert!(exact_attempt(Some("a"), Some(0), "a", 0).is_err());
     }
+
+    #[test]
+    fn snapshot_acquisition_waits_for_writer_release_without_owner_writes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let writer = store.write_transaction().unwrap();
+        let writer_owner = std::fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let writer_identity: serde_json::Value = serde_json::from_slice(&writer_owner).unwrap();
+        let root = store.root().to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let store = SessionStore::open_existing(root).unwrap();
+            ready_tx.send(()).unwrap();
+            let transaction = acquire_inspection_read_transaction(&store, Duration::from_secs(2)).unwrap();
+            let owner = std::fs::read(store.root().join("WRITER.owner.json")).unwrap();
+            result_tx.send(owner.clone()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner);
+            drop(transaction);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let pending = result_rx.recv_timeout(Duration::from_millis(50));
+        assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), writer_owner);
+        drop(writer);
+        assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)), "reader must wait while writer owns the native fence");
+        let owner = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reader_identity: serde_json::Value = serde_json::from_slice(&owner).unwrap();
+        assert_eq!(reader_identity["token"], writer_identity["token"], "reader must not establish a new writer identity");
+        assert_eq!(reader_identity["released"], true);
+        assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner);
+        let second_reader = store.read_transaction().expect("a second shared reader must coexist");
+        let descriptor = std::fs::OpenOptions::new().read(true).write(true).open(store.root().join("WRITER.lock")).unwrap();
+        assert!(matches!(descriptor.try_lock(), Err(std::fs::TryLockError::WouldBlock)), "shared reader must still exclude native writers");
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        drop(second_reader);
+    }
+
+    #[test]
+    fn snapshot_deadline_preserves_busy_error_and_owner() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        let _writer = store.write_transaction().unwrap();
+        let owner = std::fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let wait = Duration::from_millis(20);
+        let start = std::time::Instant::now();
+        let error = acquire_inspection_read_transaction(&store, wait).err().unwrap();
+        assert!(start.elapsed() >= wait, "persistent contention must wait through the acquisition deadline");
+        assert!(start.elapsed() < Duration::from_secs(2), "the short test deadline must not become the five-second production wait");
+        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<std::fs::TryLockError>(), Some(std::fs::TryLockError::WouldBlock))));
+        assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner);
+    }
+
+    #[test]
+    fn corrupt_read_descriptor_is_not_retried() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path()).unwrap();
+        std::fs::write(store.root().join("WRITER.lock"), b"invalid").unwrap();
+        let owner = std::fs::read(store.root().join("WRITER.owner.json")).unwrap();
+        let start = Instant::now();
+        let error = acquire_inspection_read_transaction(&store, Duration::from_secs(5)).err().unwrap();
+        assert!(error.to_string().contains("corrupt session read lock descriptor"));
+        assert!(start.elapsed() < Duration::from_secs(1), "non-contention errors must bypass the five-second wait");
+        assert_eq!(std::fs::read(store.root().join("WRITER.owner.json")).unwrap(), owner);
+    }
+
 }

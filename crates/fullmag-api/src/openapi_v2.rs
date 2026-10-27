@@ -1017,6 +1017,8 @@ use utoipa::OpenApi;
         crate::schemas::runtime::StageExecutionResource,
         crate::schemas::runtime::StageExecutionRecordResource,
         crate::schemas::runtime::AntennaOperationProgressResource,
+        crate::schemas::runtime::AntennaInspectionDiscoveryResource,
+        crate::schemas::runtime::AntennaInspectionDiscoveryState,
         crate::schemas::runtime::ParallelExecutionTelemetryResource,
         crate::schemas::hysteresis::HysteresisStagePlanSchema,
         crate::schemas::hysteresis::HysteresisStorageEstimateSchema,

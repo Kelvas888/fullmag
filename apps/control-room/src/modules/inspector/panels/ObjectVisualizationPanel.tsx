@@ -1,7 +1,7 @@
 "use client";
 import { isScalarSpatialQuantityId, resolveCanonicalQuantityId } from "@/kernel/api/quantityIds";
 
-import { artifactFieldCatalogMatchesOwner, type ArtifactFieldSelection, artifactCarrierPresentationKey, artifactInspectionQuantity, artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
+import { artifactFieldCatalogMatchesOwner, artifactFieldLocatorHasAcceptedGlobalSampling, type ArtifactFieldSelection, artifactCarrierPresentationKey, artifactInspectionQuantity, artifactInspectorFieldBinding } from "@/kernel/visualization/artifactFieldSelection";
 import { useVisualizationFieldMeta } from "@/kernel/resources/useVisualizationFieldMeta";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Eye } from "lucide-react";
@@ -272,6 +272,8 @@ function useObjectVisualizationPanelState(
   sceneOverride?: ReturnType<typeof useSceneResource>,
   artifactInspection = false,
   artifactInspectionOwner: ArtifactFieldSelection | null = null,
+  visualizationStateOverride?: ReturnType<typeof useVisualizationStateResource>,
+  quantityCatalogOverride?: ReturnType<typeof useQuantityCatalogResource>,
 ) {
   const selectionTarget = resolveVisualizationTargetFromSelection(selection);
   const kernel = useKernel();
@@ -310,9 +312,10 @@ function useObjectVisualizationPanelState(
   const visualizationStateEnabled = Boolean(
     target || (selection.ref?.type === "mesh-part" && selectionTarget),
   );
-  const visualizationState = useVisualizationStateResource({
-    enabled: visualizationStateEnabled,
+  const ownVisualizationState = useVisualizationStateResource({
+    enabled: visualizationStateEnabled && !visualizationStateOverride,
   });
+  const visualizationState = visualizationStateOverride ?? ownVisualizationState;
   const displayVisualizationState =
     visualizationState.optimisticData ?? visualizationState.data;
   const baselineVisualizationState = canonicalVisualizationStateForBaseline(
@@ -468,11 +471,12 @@ function useObjectVisualizationPanelState(
     resolvedTarget.kind === "object" || resolvedTarget.kind === "region" ||
       resolvedTarget.kind === "part" && Boolean(contextObjectId)
   ));
-  const rawQuantityCatalog = useQuantityCatalogResource({
+  const ownQuantityCatalog = useQuantityCatalogResource({
     stageId: artifactInspection ? artifactInspectionOwner?.runtimeStageId ?? "" : undefined,
     runId: artifactInspectionOwner?.runId,
-    enabled: artifactInspection ? Boolean(artifactInspectionOwner) : Boolean(resolvedTarget),
+    enabled: !quantityCatalogOverride && (artifactInspection ? Boolean(artifactInspectionOwner) : Boolean(resolvedTarget)),
   });
+  const rawQuantityCatalog = quantityCatalogOverride ?? ownQuantityCatalog;
   const quantityCatalog = useMemo(() => {
     const data = hasObjectContext
       ? resolveObjectVisualizationQuantityCatalog(rawQuantityCatalog.data, contextObject)
@@ -480,10 +484,10 @@ function useObjectVisualizationPanelState(
     return {
       ...rawQuantityCatalog,
       data: artifactInspection && data
-        ? { ...data, quantities: data.quantities.filter((entry) => artifactInspectionQuantity(data, entry.id)) }
+        ? { ...data, quantities: data.quantities.filter((entry) => artifactInspectionQuantity(data, entry.id) && (resolvedTarget?.kind !== "airbox" || entry.id === "H_ant")) }
         : data,
     };
-  }, [artifactInspection, contextObject, hasObjectContext, rawQuantityCatalog]);
+  }, [artifactInspection, resolvedTarget?.kind, contextObject, hasObjectContext, rawQuantityCatalog]);
   const objectContext = hasObjectContext ? {
     object: contextObject,
     // Resource keys already isolate session/run/stage; keep the last-good selection during refresh.
@@ -622,10 +626,11 @@ function useObjectVisualizationPanelState(
       quantities: rawFieldCatalog.data.quantities.filter((entry) =>
         (!hasObjectContext || Boolean(quantityCatalog.data?.quantities.some((quantity) =>
           resolveCanonicalQuantityId(quantity.id) === resolveCanonicalQuantityId(entry.quantity_id),
-        ))) && (!artifactInspection || catalogOwnerReady && artifactInspectionQuantity(quantityCatalog.data, entry.quantity_id)),
+        ))) && (!artifactInspection || catalogOwnerReady && artifactInspectionQuantity(quantityCatalog.data, entry.quantity_id) &&
+          (resolvedTarget?.kind !== "airbox" || entry.quantity_id === "H_ant" && artifactFieldLocatorHasAcceptedGlobalSampling(entry.artifact_field_locator))),
       ),
     },
-  }), [artifactInspection, catalogOwnerReady, hasObjectContext, quantityCatalog.data, rawFieldCatalog]);
+  }), [artifactInspection, resolvedTarget?.kind, catalogOwnerReady, hasObjectContext, quantityCatalog.data, rawFieldCatalog]);
   const requiresFieldData = Boolean(
     resolvedTarget &&
       settings?.activeQuantityId &&
@@ -650,11 +655,12 @@ function useObjectVisualizationPanelState(
     quantityId: settings?.activeQuantityId ?? "",
     selection: artifactSelection,
     sessionIdentity: artifactSession,
-    targetScope: artifactInspection && artifactSelection && artifactSelection.sourceObjectId === fieldAvailabilityQuery.scope_id
+    presentationTarget: artifactInspection ? resolvedTarget : null,
+    targetScope: artifactInspection && resolvedTarget?.kind === "airbox" ? { scopeKind: "full", scopeId: null } : artifactInspection && artifactSelection && artifactSelection.sourceObjectId === fieldAvailabilityQuery.scope_id
       ? { scopeKind: artifactSelection.carrierScopeKind ?? "", scopeId: artifactSelection.carrierScopeId ?? null }
       : fieldAvailabilityQuery ? { scopeKind: fieldAvailabilityQuery.scope_kind ?? "full", scopeId: fieldAvailabilityQuery.scope_id ?? null } : null,
   });
-  const artifactPresentationKey = artifactInspection ? artifactCarrierPresentationKey(artifactFieldBinding.expectedOwner, artifactFieldBinding.query) : null;
+  const artifactPresentationKey = artifactInspection ? artifactCarrierPresentationKey(artifactFieldBinding.expectedOwner, artifactFieldBinding.query, resolvedTarget) : null;
   const artifactPresentation = useViewport3DArtifactInspectionPresentation(artifactPresentationKey);
   const surfaceMetadataComponent = settings ? surfaceColorSourceFieldMetaComponent(settings.surfaceColorSource, settings.activeQuantityId) : undefined;
   const vectorMetadataComponent = settings ? vectorColorModeFieldMetaComponent(settings.vectorColorMode, settings.activeQuantityId) : undefined;
@@ -666,7 +672,7 @@ function useObjectVisualizationPanelState(
   const artifactQuantity = artifactFieldBinding.historical;
   const artifactOwnerReady = Boolean(artifactFieldBinding.query);
   const airboxFieldCarrierReady =
-    resolvedTarget?.kind !== "airbox" || airboxFieldCarrierIdentity !== null;
+    artifactInspection || resolvedTarget?.kind !== "airbox" || airboxFieldCarrierIdentity !== null;
   const fieldAvailability = useFieldAvailabilityResource({
     ...(artifactQuantity ? artifactFieldBinding.query : fieldAvailabilityQuery),
     enabled: Boolean(
@@ -703,7 +709,8 @@ function useObjectVisualizationPanelState(
     executionSelected: Boolean(artifactInspectionOwner),
     catalogReady: catalogOwnerReady && rawQuantityCatalog.status === "ready" && rawFieldCatalog.status === "ready",
     catalogError: catalogOwnerError || Boolean(rawQuantityCatalog.error || rawQuantityCatalog.refreshError || rawFieldCatalog.error || rawFieldCatalog.refreshError),
-    quantityAvailable: artifactInspectionQuantity(rawQuantityCatalog.data, settings?.activeQuantityId ?? ""),
+    quantityAvailable: artifactInspectionQuantity(quantityCatalog.data, settings?.activeQuantityId ?? "") &&
+      Boolean(fieldCatalog.data?.quantities.some(entry => entry.quantity_id === settings?.activeQuantityId)),
     ownerReady: Boolean(artifactInspectionOwner), presentationReady: Boolean(artifactPresentation),
   }) : ordinaryDataState;
   const targetFieldAvailability = resolvedTarget
@@ -749,6 +756,7 @@ function useObjectVisualizationPanelState(
     : null;
   const sections = settings && effectiveSettings
     ? buildVisualizationPanelSections({
+    artifactInspection,
         effectiveSettings: renderResolution?.finalSettings ?? effectiveSettings,
         settings,
         target: resolvedTarget ?? undefined,
@@ -1178,7 +1186,10 @@ function useObjectVisualizationPanelState(
     feedback,
     fdmTarget,
     fieldCatalog,
-    quantityCatalog,
+    quantityCatalog: artifactInspection && resolvedTarget?.kind === "airbox" && quantityCatalog.data
+      ? { ...quantityCatalog, data: { ...quantityCatalog.data, quantities: quantityCatalog.data.quantities.filter(entry =>
+          entry.id === "H_ant" && fieldCatalog.data?.quantities.some(field => field.quantity_id === "H_ant")) } }
+      : quantityCatalog,
     childRegionOverrideCount,
     childRegionTargets,
     dataState,
@@ -1264,6 +1275,8 @@ export function VisualizationTargetInspectorPanel({
   sceneOverride,
   artifactInspection = false,
   artifactInspectionOwner = null,
+  visualizationStateOverride,
+  quantityCatalogOverride,
 }: InspectorPanelProps & {
   /** Owner-specific nav sections (e.g. complex representation and phase for a mode), shown after "View" in 3D. */
   children?: React.ReactNode;
@@ -1271,8 +1284,10 @@ export function VisualizationTargetInspectorPanel({
   sceneOverride?: ReturnType<typeof useSceneResource>;
   artifactInspection?: boolean;
   artifactInspectionOwner?: ArtifactFieldSelection | null;
+  visualizationStateOverride?: ReturnType<typeof useVisualizationStateResource>;
+  quantityCatalogOverride?: ReturnType<typeof useQuantityCatalogResource>;
 }) {
-  const panel = useObjectVisualizationPanelState(selection, sceneOverride, artifactInspection, artifactInspectionOwner);
+  const panel = useObjectVisualizationPanelState(selection, sceneOverride, artifactInspection, artifactInspectionOwner, visualizationStateOverride, quantityCatalogOverride);
   const {
     carrierIdentity,
     displaySettings,
@@ -1531,7 +1546,7 @@ function ObjectVisualizationPanelView({
     displaySettings.vectorsVisible,
     displaySettings.pointsVisible,
   ].filter(Boolean).length;
-  const capabilities = visualizationTargetCapabilities(target);
+  const capabilities = visualizationTargetCapabilities(target, panel.artifactInspection);
   const executionRequired = panel.artifactInspection && !panel.artifactExecutionSelected;
   const fieldCatalogError = fieldCatalog.error?.message ?? quantityCatalog.error?.message
     ?? (panel.artifactInspection && panel.artifactExecutionSelected && fieldCatalog.data && !panel.catalogOwnerReady
@@ -1569,10 +1584,24 @@ function ObjectVisualizationPanelView({
     >
       {artifactQuantity && !artifactOwnerReady ? <p role="status" className="fm-artifact-inspection-owner-required">Select the field inspection source and execution in the viewport.</p> : null}
       <ObjectVisualizationOverview
+            context={target.kind === "airbox" ? (
+              <InspectorGroup title="Universe sampling domain">
+                <FieldRow label="Role" value="Field observation in the space around objects" />
+                <FieldRow label="Oersted field H" value="A/m · sampled in Universe" />
+                <FieldRow label="Current density J" value="A/m² · conductor mesh, under Antenna" />
+                <FieldRow label="Electric potential V" value="V · conductor mesh, under Antenna" />
+                <FieldRow label="Mesh source" value={panel.artifactInspection ? "Selected result’s saved Global mesh, when available" : "Current session’s Universe mesh, when available"} />
+                <p className="fm-universe-sampling-help">The mesh defines where a field is sampled. It does not create current, magnetization, or field values. To inspect the Oersted field, select an antenna execution with a computed field on this domain, then enable Vectors.</p>
+              </InspectorGroup>
+            ) : null}
             advanced={
-              <p className="m-0 text-fm-help leading-snug text-fm-muted">
-                Advanced rendering uses the active viewport quality profile.
-              </p>
+              <>
+                <FieldRow label="Requested extent" value={settings.geometryScope} />
+                <FieldRow label="Effective extent" value={displaySettings.geometryScope} />
+                <FieldRow label="Requested arrow budget" value={String(settings.vectorBudget)} />
+                <FieldRow label="Scene arrow limit" value={String(vectorSceneCap)} />
+                <FieldRow label="Rendering constraints" value={renderResolution?.degradedReasons.map(reason => reason.message).join(" ") || "None reported"} />
+              </>
             }
             camera={<ViewportCameraControls />}
             clipping={<ViewportClippingControls
@@ -1583,6 +1612,7 @@ function ObjectVisualizationPanelView({
             display={
               <>
                 <VisualizationDisplayPassesSection
+              artifactInspection={panel.artifactInspection}
               displaySettings={displaySettings}
               passControlsDisabled={passControlsDisabled}
               patch={patch}
@@ -1594,6 +1624,7 @@ function ObjectVisualizationPanelView({
               presentationRole={panel.presentationRole}
                 />
                 <VisualizationRenderModeSection
+              artifactInspection={panel.artifactInspection}
               displaySettings={displaySettings}
               passControlsDisabled={passControlsDisabled}
               isFieldPending={isFieldPending}
@@ -1637,7 +1668,7 @@ function ObjectVisualizationPanelView({
                   ? `Mode · ${shownAnalysisField.label}`
                   : quantitySelection.summary
             }
-            surfaceColoring={!capabilities.supportsFieldData || target.kind === "airbox" || isFdmUniverseOutsideSupportTarget(target) ? null : (
+            surfaceColoring={!capabilities.supportsFieldData || target.kind === "airbox" && !panel.artifactInspection || isFdmUniverseOutsideSupportTarget(target) ? null : (
               <VisualizationSurfaceColoringSection
               artifactFieldBinding={analysisFieldShown ? undefined : artifactFieldBinding}
               fieldMetaOverride={analysisFieldShown ? undefined : panel.sharedArtifactFieldMeta ?? undefined}

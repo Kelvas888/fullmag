@@ -124,6 +124,7 @@ jobs:
           cargo test -p fullmag-runtime-control --lib accepted_task_stop_is_durable_idempotent_and_terminal_after_stopped_event
           cargo test -p fullmag-runtime-control --lib failed_no_spawn_stop_without_start_preserves_public_stop_fence_and_replays
           cargo test -p fullmag-runtime-control --lib study_inspection_integrity
+          cargo test -p fullmag-api --bin fullmag-api router_v2::handlers::data::antenna_inspection::tests
 
       - name: Run accepted explicit Compute start-gate contracts
         run: |

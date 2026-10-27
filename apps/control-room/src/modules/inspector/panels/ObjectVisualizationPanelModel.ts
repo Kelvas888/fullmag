@@ -26,6 +26,7 @@ import {
   fieldCatalogQuantitySupportsSpatialVisualization,
   isScalarSpatialQuantityId,
   quantityCatalogEntrySupportsAnyAirboxVisualization,
+  quantityCatalogEntrySupportsAirbox,
   quantityCatalogEntrySupportsAnySpatialVisualization,
   quantityCatalogPickerItem,
   resolveCanonicalQuantityId,
@@ -756,7 +757,7 @@ export function resolveObjectVisualizationTargetForLane({
   selection: Selection;
   selectionTarget: VisualizationTargetRef | null;
 }): VisualizationTargetRef | null {
-  if (artifactInspection) return selectionTarget?.kind === "object" ? selectionTarget : null;
+  if (artifactInspection) return selectionTarget?.kind === "object" || selectionTarget?.kind === "airbox" && selectionTarget.id === "airbox" ? selectionTarget : null;
 
   const objectVisualizationSelection =
     selection.kind === "object.antenna.visualization" ||
@@ -3160,17 +3161,19 @@ export function buildAirboxVisibilityDiagnostic({
 }
 
 export function buildVisualizationPanelSections({
+  artifactInspection = false,
   effectiveSettings,
   settings,
   target,
 }: {
+  artifactInspection?: boolean;
   effectiveSettings: VisualizationTargetSettings;
   settings: VisualizationTargetSettings;
   target?: VisualizationTargetRef;
 }): VisualizationPanelSection[] {
   const passDisabled = !settings.visible;
-  const capabilities = target ? visualizationTargetCapabilities(target) : null;
-  const isAirboxTarget = target?.kind === "airbox";
+  const capabilities = target ? visualizationTargetCapabilities(target, artifactInspection) : null;
+  const isAirboxTarget = target?.kind === "airbox" && !artifactInspection;
   const isFdmAirboxTarget = target ? isFdmUniverseOutsideSupportTarget(target) : false;
 
   if (capabilities?.supportsFieldData === false) {
@@ -3339,7 +3342,7 @@ export function resolveArtifactInspectionDataState({ executionSelected = true, c
   if (!executionSelected) return "Select execution";
   if (catalogError) return "Unavailable";
   if (!catalogReady) return "Loading catalog";
-  if (!quantityAvailable) return "Select raw SI quantity";
+  if (!quantityAvailable) return "Select a compatible field";
   if (!ownerReady) return "Select execution";
   return presentationReady ? "Historical snapshot" : "Loading historical result";
 }

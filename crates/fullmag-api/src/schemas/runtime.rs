@@ -163,6 +163,21 @@ impl From<&fullmag_runner::LiveParallelExecutionTelemetry> for ParallelExecution
     }
 }
 
+/// Discovery of a registered inspection owner, not validation of its numerical payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AntennaInspectionDiscoveryState {
+    Retained,
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AntennaInspectionDiscoveryResource {
+    pub state: AntennaInspectionDiscoveryState,
+    pub reason_code: String,
+}
+
 /// Operation progress is independent of the LLG integration clock.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AntennaOperationProgressResource {
@@ -186,6 +201,8 @@ pub struct StageExecutionRecordResource {
     /// Exact authored antenna definition ID, not the study node or runtime ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub antenna_solve_stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_inspection: Option<AntennaInspectionDiscoveryResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub antenna_progress: Option<AntennaOperationProgressResource>,
     pub index: u32,

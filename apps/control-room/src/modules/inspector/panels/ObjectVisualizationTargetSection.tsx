@@ -122,6 +122,7 @@ type SectionDisabled = (
 ) => boolean;
 
 export function VisualizationDisplayPassesSection({
+  artifactInspection = false,
   displaySettings,
   passControlsDisabled,
   patch,
@@ -132,6 +133,7 @@ export function VisualizationDisplayPassesSection({
   primitiveDisplayToggleVisible,
   presentationRole,
 }: {
+  artifactInspection?: boolean;
   displaySettings: VisualizationTargetSettings;
   passControlsDisabled: boolean;
   patch: PatchVisualizationTarget;
@@ -142,7 +144,7 @@ export function VisualizationDisplayPassesSection({
   primitiveDisplayToggleVisible: boolean;
   presentationRole?: string | null;
 }) {
-  const capabilities = visualizationTargetCapabilities(target);
+  const capabilities = visualizationTargetCapabilities(target, artifactInspection);
   return (
     <div className="grid min-w-0 gap-0" data-slot="visualization-display-passes">
       {renderWarning ? (
@@ -240,19 +242,21 @@ export function VisualizationDisplayPassesSection({
 
 
 export function VisualizationRenderModeSection({
+  artifactInspection = false,
   displaySettings,
   passControlsDisabled,
   isFieldPending,
   patch,
   target,
 }: {
+  artifactInspection?: boolean;
   displaySettings: VisualizationTargetSettings;
   passControlsDisabled: boolean;
   isFieldPending: IsVisualizationFieldPending;
   patch: PatchVisualizationTarget;
   target: VisualizationTargetRef;
 }) {
-  const capabilities = visualizationTargetCapabilities(target);
+  const capabilities = visualizationTargetCapabilities(target, artifactInspection);
   const currentMode = resolveVisualizationDisplayMode(displaySettings);
   const renderModeOptions = RENDER_MODE_VALUES.filter(
     (option) =>
@@ -364,7 +368,7 @@ export function VisualizationSurfaceColoringSection({
     quantityId: settings.activeQuantityId,
     scopeId: historicalSurface ? artifactFieldBinding?.query?.scope_id : fieldMetaScopeQuery.scope_id,
     scopeKind: historicalSurface ? artifactFieldBinding?.query?.scope_kind : viewportRenderedRangeScopeKind(fieldMetaScopeQuery.scope_kind),
-    inspectionKey: historicalSurface ? artifactSurfaceRangeKey(artifactFieldBinding?.expectedOwner ?? null, artifactFieldBinding?.query ?? null, settings.surfaceProjectionMode) ?? "unavailable-artifact-owner" : null,
+    inspectionKey: historicalSurface ? artifactSurfaceRangeKey(artifactFieldBinding?.expectedOwner ?? null, artifactFieldBinding?.query ?? null, settings.surfaceProjectionMode, artifactFieldBinding?.presentationTarget) ?? "unavailable-artifact-owner" : null,
   });
   const ownFieldMeta = useVisualizationFieldMeta({
     binding: artifactFieldBinding,
@@ -904,7 +908,7 @@ export function VisualizationVectorsSection({
   vectorTopologyHash: string | null;
 }) {
   const supportsVectorSurfaceOffset =
-    visualizationTargetCapabilities(target).supportsVectorSurfaceOffset;
+    visualizationTargetCapabilities(target, artifactFieldBinding?.presentationTarget?.kind === "airbox").supportsVectorSurfaceOffset;
   const colorbarComponent = vectorColorModeFieldMetaComponent(
     settings.vectorColorMode,
     settings.activeQuantityId,

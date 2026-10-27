@@ -1,5 +1,7 @@
 # Recovery namespace z zachowaną historią terminalną — kontrakt v3
 
+> Aktualny checkpoint integracji i zakres dowodów: [27.10.2026, PR #247](2026-10-27-antenna-master-pr247-checkpoint.md). Poniższe statusy opisują kolejne historyczne etapy.
+
 ## Problem
 
 Owner `0c242b7c-66cf-4d66-b442-50555419d423` pozostaje Unknown, chociaż
@@ -1092,3 +1094,190 @@ tożsamych hashy ani uznać scope=full za dowód Universe.
 D: ma 27164454912 B wolnego (~25.3 GiB), poniżej 32 GiB wymaganych do kolejnego
 buildu. Poproszono o zwolnienie 10–15 GiB albo wybór przeglądu konkretnych
 nieużywanych zasobów. Nie wykonano usuwania i nie obchodzono preflightu.
+
+
+### Odblokowanie miejsca i prerejestracja kolejnego pomiaru — 25.10.2026
+
+Po odpowiedzi użytkownika o zwolnieniu miejsca pomiar D: wykazał
+196017139712 B wolnego (około 182.6 GiB). Wcześniejsza blokada 32 GiB
+nie jest już aktualna; agent nie usuwał danych ani cache.
+
+Commit `7ee53cd83de5ab9c382a3f757852a61b288cdd7f` zachowuje zweryfikowany
+odczyt/eksport historycznej inspekcji. Nie obejmuje jeszcze roboczego
+kontraktu Universe, frontendu ani optymalizacji zero-copy.
+
+Własny immutable input przygotowanego Universe potwierdza 1149 węzłów
+próbkowania i 6472 Tet4, odrębnie od źródła 677 węzłów / 1861 Tet4.
+Dowód: `universe-gmp-prepared-mesh-counts.json` w katalogu kontrolnym
+`verification/surface-rt0-performance-20261025`. To 2138289 par
+źródło–target; nie wykonano jeszcze Solve tej siatki.
+
+Przed wykonaniem następnego pomiaru zapisano request
+`gmp-zero-copy-submit-request.json`, SHA256
+`d325ecaa1574a192ef31ba9b4f2234d28d5738d9d33617d385688bb65fe09a0e`.
+Jedynymi zmianami względem poprzedniego wejścia są run_id oraz klucz
+idempotencji. Przyszły run: `run-surface-gmp-zero-copy-20261025-01`.
+Comparator `compare-gmp-zero-copy-results.py`, SHA256
+`e3144b6d733ca5272d3b9c4957b1cd98e4be7271ac784d1300fb84784281718c`,
+wymaga identycznych 21 payloadów, pełnych diagnostyk trzech precyzji,
+liczników, ograniczeń i tolerancji oraz czasu krótszego niż 346.505338649 s.
+Bazą jest zaakceptowany bundle GMP
+`fa991bac1f48f2abd08ef5b35af381f43558b112141d58d1e27cd8848fcb26f5`.
+Skrypt przeszedł kontrolę składni bez wykonania. Request nie został wysłany;
+piny nowego zbudowanego runtime pozostają warunkiem uruchomienia.
+
+Przed następnym zarządzanym buildem trwa zachowanie własnej przygotowanej
+sceny i przejście przez istniejący kontrakt saved-authoring. Samo zapisanie
+FMS lub odpowiedź 202 na cancellation nie dowodzi terminalnego stanu.
+Wyniki, historia i FMS użytkownika pozostają zachowane. Pełne Universe,
+nowy kontrakt API po cold-load oraz browser/WebGL nadal NOT VERIFIED.
+
+
+### Zapis sceny i rzeczywisty preflight restartu — 25.10.2026
+
+Publiczny eksport zachował pełną przygotowaną scenę w compact FMS
+31040064 B, SHA256
+`5086f095ed5d9e89540916cf95c98457c49a0eed007ed23bd7d8ff8b8d7d0703`.
+Porównanie project/scene_document.json z bieżącym zasobem sceny wykazało
+ścisłą zgodność. Parametryczna geometria nie wymaga zewnętrznych assetów.
+
+Wykryto rzeczywisty błąd zgodności: publiczne authoring_update_blocking
+zapisuje manifest.source=project/source.py, a restart akceptował wyłącznie
+project/source/script.py. Commit
+`d3daa9c62611b623fd80146936020c19b722cc3d` dopuszcza oba kanoniczne formaty,
+zachowując osobny pin oryginalnego skryptu i wszystkie kontrole archiwum.
+Commit `b15ea875191a5a1abf74b36da2b1234ab1350c38` zachowuje kontrolowaną
+odmowę także dla niepoprawnych typów JSON source (lista/obiekt). Finalny
+SHA256 scripts/docker_volume_dev.py:
+`69ce6eb33bc312b36e8455352528a9e7e9b2e98b01a6de200a32224543fed75a`.
+W istniejącym backendzie wykonano 13/13 interpretowanych regresji klasy
+SavedAuthoringRestartTests, exit 0; bez kompilacji testów natywnych.
+
+Własny przygotowany run-live-1f51b0… zakończono przez publiczne cancellation
+z aktualnym CAS: katalog rev4, Cancelled, brak attempt/resource, Released.
+Kontrola restartu ujawniła wcześniejszy własny manual run
+run-surface-prepared-source-20261025-01, z zachowaną intencją, lecz bez
+materializacji. Istniejąca publiczna materializacja i cancellation dały
+rev3/Cancelled bez wykonania Solve i bez dodania grantu Start. Oryginalna
+intencja pozostała identyczna; nie usunięto ani nie przeniesiono katalogu.
+
+Publiczna nowa sesja i ReplaceScene odtworzyły dokładną scenę:
+`session-18e1ddb52aba9abc000050d5`, epoch
+`session-18e1ddb52aba9abc000050d5@1792957896847`, revision1, run=null,
+commands=0. Archiwum autorskie 11841 B ma SHA256
+`92bc31e45bf1ada09305cf5dc752fea7c4c6d710d9f9bfc8f84461f1da303527`;
+pin oryginalnego skryptu zachowuje fcfba6ee… z przygotowanego Universe.
+
+Rzeczywisty _saved_authoring_probe PASS: wszystkie 20 katalogów wykonania
+są terminalne, wszystkie 36 rezerwacji Released. Checkpoint:
+`verification/universe-volume-policy-20261023/gmp-rebuild-authoring-20261025/checkpoint.json`,
+SHA256 `385248a64ff28d7da1f5b8d9710cf2a0e9ce031a1cd4707685bfad02490ae64a`.
+Obok zachowano preflight-summary.json, źródła/publiczne odpowiedzi i logi
+regresji. Nie uruchomiono dotąd restartu ani nowego Solve. Pełne pole Universe
+pozostaje nieobliczone; powyższe dowody kwalifikują zachowanie sceny i stan
+przed zarządzanym restartem, nie wynik naukowy ani widok WebGL.
+
+
+### Zamrożenie źródeł widoku Universe przed buildem — 25.10.2026
+
+Frontend rozdziela presentation target Airbox i immutable source owner
+anteny. Wspólny source picker, Inspector oraz renderer wymagają H_ant,
+zaakceptowanego wykonania i zweryfikowanego Global FEM sampling descriptor;
+V/J pozostają na przewodniku. Wykorzystywana jest własna siatka wyniku,
+nie bieżąca edytowalna domena magnetyczna. Przegląd wykrył i usunął regresję,
+która mogła rezerwować historyczną ścieżkę dla zwykłego H_demag albo jawnego
+live H_ant. Ich pozytywny kontrakt live pozostaje nadrzędny.
+
+Zamrożono 16 plików. Nowy ArtifactInspectionSource.tsx dodano do indeksu
+wyłącznie na potrzeby włączenia do managed snapshot. Pozostałe zmiany
+frontendu nie są jeszcze zacommitowane. Kontrole interpretowane:
+powierzchnia 36/36, selekcja 54/54, własny Universe carrier 25/25; łącznie115.
+Pełna kontrola TypeScript6.0.3/noEmit na3430plikach: 0diagnostyk,94.465s.
+Nie są to dowody działania przeglądarki ani rzeczywistego pola Universe.
+
+Dowody w verification/surface-rt0-performance-20261025/universe-carrier-proposal:
+frontend-source-freeze-proof.json oraz frontend-complete.patch, SHA256
+`ace96cba0bba254e4ed677093722d4c7e0d60e8a66fd2df2b4201b1333fa35f7`.
+Następne bramki: managed build/restart, kanoniczny OpenAPI codegen,
+rzeczywisty cold-load/API oraz nowy benchmark zero-copy. Browser/WebGL
+pozostaje niewykonany z powodu wcześniejszej blokady dostępu narzędzia.
+
+
+### Wynik iteracji, pomiar zero-copy i rzeczywista domena cold-load — 25.10.2026
+
+Zarządzany restart/build `39541a1e34754eddb244958a48a84897` zakończył się
+succeeded, bez zmiany stałego backendu i frontendowej grupy 3203. HEAD:
+`b15ea875191a5a1abf74b36da2b1234ab1350c38`; snapshot:
+`5a4cca50492b62c5a979568b9700d619e1d0e64904819a515932d12f8c669212`.
+Nowy libfullmag_fem.so ma SHA256
+`d1fcfc75a56c3c06ffd5e83339dc07c579ebce692e35a4c1f017bbb3be1f0f9f`.
+Health potwierdził pustą aktywną sesję przed jawnym odtworzeniem. Checkpoint
+sceny i wszystkie wcześniejsze wyniki pozostały zachowane.
+
+`just docker-dev-codegen` zakończył się succeeded. Wygenerowany OpenAPI ma
+SHA256 `09bf003ca683953ee963b4ec237b6f9d73599837678c943b16ffb15f7ebc957d`;
+locator ma opcjonalny sample_carrier. Cztery kontrole wygenerowanego klienta
+Python przeszły. TypeScript 6.0.3/noEmit po codegen: 0 diagnostyk, 72.393 s.
+Raport TypeScript zapisano w wolumenie frontendu jako
+`/state/development/frontend-typescript-after-codegen.json`. Pierwsza próba
+nie zapisała raportu, ponieważ frontend udostępnia tylko podkatalog wejść
+wolumenu kontrolnego; jej wyniku nie uznano za dowód. Nie kompilowano testów
+natywnych i nie przeprowadzono browser/WebGL smoke.
+
+Jedna prerejestrowana próba `run-surface-gmp-zero-copy-20261025-01` zakończyła
+się Succeeded, revision 298, task
+`task-03cda8cf4c19f60c29f27b17ab066c973d7f9e948ebf9b6648487471f87ab980`,
+attempt `attempt-8ebcc931ef944b509e4fb6d959158fcc`, epoch 1. Pakiet wyniku:
+`7cc8c59317e189347381a61525a0bb2da816383262bbf6e0d3799e751ea4a9a9`.
+Zgodność numeryczna PASS: 21 payloadów identycznych bajtowo, pełne diagnostyki
+trzech precyzji, nagłówek źródła/targetów, tolerancje i prerejestrowane
+liczniki pozostają identyczne. Bramka wydajności FAIL: 354.299891255 s wobec
+346.505338649 s, czyli +2.2495%. Nie deklarujemy przyspieszenia zero-copy.
+Peak RSS zmienił się z 545017856 na 546476032 B. Flagi obu buildów to
+-O3 -DNDEBUG, konfiguracja DEV identyczna; nie ma porównywalnych delt
+throttlingu rodzica z obu okien. Przyczyna różnicy czasu pozostaje nieustalona.
+Dowody: gmp-zero-copy-result-comparison-failed.json i
+ gmp-zero-copy-parity-and-timing.json w katalogu kontrolnym
+`verification/surface-rt0-performance-20261025`.
+
+Przed cold-load wykryto, że eksport speed (ZIP Stored), 102748559 B,
+przekracza po base64 limit żądania 128 MiB. Nie zwiększano limitu.
+Istniejący natywny eksport balanced zakończył się PASS: 31902967 B,
+SHA256 `4aa0d0e08463a6c2f84b6e25d5c681a4f8110770725e37ed71a6e0d21a3faf45`.
+Oba pliki zachowano. Z 1983 wpisów 1980 jest identycznych bajtowo; pozostałe
+trzy dokumenty różnią się wyłącznie sześcioma znacznikami czasu eksportu/
+projekcji. Wszystkie dane naukowe i accepted closure są niezmienione.
+
+Jednorazowy publiczny import visualization_only zwrócił 200 i utworzył
+obserwację completed, commandability=forbidden. Początkowy test błędnie
+oczekiwał publicznego runtime_status_code=imported_read_only; kod
+session::effective_runtime_status_code publikuje completed, podczas gdy
+importer zachowuje wewnętrzny znacznik imported_read_only. Importu nie
+ponowiono; kolejne kontrole są wyłącznie odczytowe.
+
+**Korekta zakresu dowodu:** rzeczywisty zaakceptowany wynik 14-punktowy
+run-live-255fa… ma sample_carrier.domain={kind:object, object_id:sampling},
+carrier_kind=fem_mesh_asset:sampling, scope object/sampling. To osobny obiekt
+próbkowania; nie Global Universe. Kontrola żądająca Global słusznie nie
+zaliczyła tej kwalifikacji. Kod API zachował prawidłową domenę historycznego
+wyniku. Nie przepisano metadanych na Global ani nie zmieniono siatki.
+Przygotowano osobną odczytową kontrolę owned-object (SHA256
+`0c1eac5c6a10b4edce158d15b50ec32c40270b5e8d8d25634e57c926ee94019c`).
+Jej wynik należy odczytać po zakończeniu; nie jest jeszcze dowodem PASS.
+
+Pełne Global Universe 1149 węzłów / 6472 Tet4 pozostaje nieobliczone.
+Nie uruchomiono kolejnego pełnego Solve bez podstaw do zmieszczenia się
+w jego istniejącym budżecie czasu. Widok browser/WebGL nadal NOT VERIFIED.
+
+
+### Plan sekwencyjny i aktualizacja kontroli — 25.10.2026
+
+Na żądanie użytkownika obowiązuje kolejność z dokumentu
+[raport i plan naprawczy](2026-10-25-antenna-universe-repair-plan.md):
+siatka → transport → pole → API/cold-load → UI. Komunikaty: Etap k/5.
+Kontrola owned-object zakończyła się błędem HTTP, ale zdążyła potwierdzić
+H_ant: 14 próbek, A/m, własną topologię i 5 negative pin checks. Pełny
+V/J/H cold-load nadal niezaliczony; nie ponawiano importu ani Solve.
+Poprawka dostępności drzewa Airbox: 6 scenariuszy PASS, focused ESLint PASS,
+TypeScript 6.0.3/noEmit: 0 diagnostyk, 215.509 s. Browser NOT VERIFIED.
+Pełne Global Universe nadal nieobliczone.

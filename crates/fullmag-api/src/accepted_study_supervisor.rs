@@ -829,9 +829,21 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
         (worker_gpu_uuid(&lease)?, BTreeSet::new(), 0)
     };
 
-    let recovered_before_spawn =
+    let recovered_before_spawn = match
         retry_store_writer_busy(|| fullmag_runtime_control::recover_coordinator(store, &claim))
-            .context("recover coordinator before spawning accepted worker")?;
+            .context("recover coordinator before spawning accepted worker")
+    {
+        Ok(recovered) => recovered,
+        Err(error) if host.is_some()
+            && error.chain().any(|cause| cause.is::<fullmag_session::StoreWriterBusy>()) => {
+            // Host-bound scheduling can resume this exact admitted claim.
+            // No launch token or child exists yet. Retain the lease and durable
+            // Start, releasing only this process's supervision slot.
+            slot.release().context("release deferred worker supervision slot")?;
+            return Err(error.context(WorkerLaunchDeferred));
+        }
+        Err(error) => return Err(error),
+    };
     if recovered_before_spawn.coordinator.phase() == CoordinatorPhase::Stopping
         && !recovered_before_spawn
             .events

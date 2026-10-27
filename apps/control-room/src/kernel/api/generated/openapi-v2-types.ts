@@ -5727,6 +5727,15 @@ export interface components {
             sampling_policy: string;
             schema_version: string;
         };
+        AntennaInspectionDiscoveryResource: {
+            reason_code: string;
+            state: components["schemas"]["AntennaInspectionDiscoveryState"];
+        };
+        /**
+         * @description Discovery of a registered inspection owner, not validation of its numerical payload.
+         * @enum {string}
+         */
+        AntennaInspectionDiscoveryState: "retained" | "absent" | "unknown";
         AntennaInspectionDisplayCapabilities: {
             current_density: boolean;
             display: boolean;
@@ -15759,6 +15768,7 @@ export interface components {
         };
         StageExecutionRecordResource: {
             action?: string | null;
+            antenna_inspection?: null | components["schemas"]["AntennaInspectionDiscoveryResource"];
             antenna_progress?: null | components["schemas"]["AntennaOperationProgressResource"];
             /** @description Exact authored antenna definition ID, not the study node or runtime ID. */
             antenna_solve_stage_id?: string | null;

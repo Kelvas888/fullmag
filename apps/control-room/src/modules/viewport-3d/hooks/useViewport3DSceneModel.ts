@@ -7605,6 +7605,7 @@ export function useViewport3DSceneModel({
     savedFieldIdentity: savedSelectionActive ? savedPresentation?.selection.nodeId ?? savedDatasetSelection?.nodeId ?? null : null,
     savedFieldUnit: savedSelectionActive ? savedDatasetResource.data?.field.descriptor.unit ?? null : null,
     selectedLabel,
+    artifactPresentationTarget: savedSelectionActive ? null : resolveVisualizationTargetFromSelection(selection),
     selectedObjectId: savedSelectionActive ? null : selectedObjectId,
     selectedRegionId: savedSelectionActive ? null : selectedRegionId,
     selectionBounds: savedSelectionActive ? null : selectionBounds,

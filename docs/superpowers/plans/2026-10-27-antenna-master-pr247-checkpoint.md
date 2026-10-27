@@ -1,0 +1,132 @@
+# Antena i Universe: integracja mastera oraz PR #247 — 27.10.2026
+
+Status: master zintegrowany; build, kontrakty i odczyt Saved sprawdzone. Odbiór PR, CI oraz rzeczywisty browser/WebGL pozostają osobnymi bramkami.
+To checkpoint przyrostu implementacji, nie zamknięcie E0–E12.
+
+## Zakres i baza
+
+Istniejący worktree `/home/kking/git/fullmag/worktrees/antenna-transport-e2e-20261011`,
+branch `codex/antenna-transport-e2e-20261011`,
+[PR #247](https://github.com/MateuszZelent/fullmag/pull/247) do `master`.
+Pobrany i zintegrowany `origin/master`:
+`38ffb49bf4f8dabfdf2b4921903c88183bb9f84e`.
+Commit integracji: `a11a5cba11035d2d54abca649782d10fcebb1b7d`.
+Zachowano lokalne zmiany anteny oraz oryginalny artefakt FMS poza indeksem.
+Pełne kopie źródeł, indeksu i diffów pozostają w control volume, w
+`verification/master-pr-integration-20261027/`; zachowany stash:
+`02f01f18537ce9b06e461ab548c90655e06e9b8b`.
+
+## Zachowanie aplikacji
+
+- `schemas/runtime.rs::StageExecutionRecordResource` udostępnia opcjonalne
+  `antenna_inspection`: `retained`, `absent` albo `unknown` z reason code.
+  `antenna_inspection.rs::inspection_discovery_metadata` sprawdza rejestr lub
+  istniejący rekord; nie kwalifikuje payloadów numerycznych. Handler
+  `simulation/runtime.rs::get_stage_execution` zachowuje fence sesji i rewizji.
+- `artifactInspectionAvailability.ts::artifactInspectionAvailability` wymaga
+  zgodnych session/epoch/request scope/run/runtime stage/authored stage.
+  Inspector oraz `useArtifactFieldOverlay` odczytują katalog pól dopiero dla
+  potwierdzonego właściciela `retained`. Brak wyniku nie staje się pustym
+  katalogiem ani fallbackiem do pola innej sesji.
+- `ArtifactInspectionSource.tsx` pokazuje stan wykonania i dostępność wyniku
+  osobno. `LayoutController.ts::openSavedResults` atomowo otwiera Results → Saved.
+  `ResultsNavigatorModule.tsx` korzysta z tego samego stanu layoutu, także przed
+  pierwszym zamontowaniem panelu. Zmiana wyboru nie uruchamia Solve.
+- Nośniki V/J przewodnika i H otoczenia pozostają osobne. Wybór Universe nie
+  zmienia zapisanej domeny wyniku na Global. Zapisany H używa własnej topologii,
+  a zgodna jawna publikacja live zachowuje pierwszeństwo.
+- Integracja zachowuje masterowe poprawki Inspectorów, ograniczone cache,
+  metadane przygotowania i read-only retry dowodów. Naprawiono brakujący import
+  `quantityCatalogEntrySupportsAirbox`; zaktualizowano regresje komponentów.
+
+## Build i kontrakt wygenerowany
+
+Jedyna grupa DEV:
+`fullmag-worktree-antenna-transport-e2e-20261011-5d5deadcd16e0fb1`, port 3203.
+Build odbył się w tym samym backendzie `cc32cb682ae5`, z zachowaniem frontendu
+`0dacc07deb1e`, obrazu, mountów i cache. Nie użyto hostowego Cargo/CMake ani
+oddzielnego kontenera budującego.
+
+Recepta z wybranego worktree:
+`FULLMAG_SCRIPT_OUTPUT_DIRECTORY=examples just docker-dev-restart-idle 37062974a42f4ad4aec3976df9dfafe6 66401b85878924fb0ca043cad95c27b219264e52e78461de7535f014d947ca9c <worktree> 3203 true`.
+Zmienna procesu zachowuje wcześniejszą zgodę na zapis wyników w `examples`;
+nie zmieniono wspólnego `.env`.
+
+Attempt `94ca9bf8ff37455a939d416150c3b10a`: succeeded, exit 0.
+Źródło: commit integracji + WIP, snapshot
+`cc9916130a4b98f0b3c35915de4a9ef930dcfc7090c9264e9aa04d509e61e649`.
+Wersja `0.1.0-dev.20261027.ga11a5cba1103.dirty.scc9916130a4b+9796`.
+Make 1479984 ms; bramki `linux-native-v1` i `worker-cgroup` PASS, API gotowe.
+Receipty: `iteration/attempts/94ca9bf8ff37455a939d416150c3b10a/` w control volume.
+
+Następnie `just docker-dev-codegen <worktree>` zakończył się succeeded.
+Kanoniczny receipt:
+`backend/codegen/openapi-v2/dc38a50cfd8760689f7bf4ebe01313ee9d58db3ecad7b2f5a3af1b6af2d64b3e.json`.
+OpenAPI SHA256: `f2469c172e1d009a3b12b32bf6faa40d1ca5594b01a98424c7b14ac785f265d5`.
+Zmiany wygenerowanych typów TS i Python odpowiadają wyłącznie discovery.
+Późniejszy import frontendu i korekty jego testów działają przez HMR; nie
+przypisujemy im źródłowego snapshotu wcześniejszej kompilacji backendu.
+
+## Zachowanie danych i rzeczywisty odczyt
+
+Po buildzie GET `/v2/sessions/current/simulation/stages/execution` zwrócił 200.
+Ta sama próba `run-live-62d110763485b10e2512922267a1aed284996710852d4fd27cb3f4ad71a1e496`
+pozostała Failed, a jej etap `script-execution-2df97d99b6b88a3c58d0b135696e390a819e720b84d6311f4f6d0a62a8969bec`
+ma `antenna_inspection={state:absent, reason_code:no_retained_inspection}`.
+Nie podstawiono pod nią starszego zapisanego wyniku.
+
+Porównanie before/after potwierdziło identyczne scene oraz logiczną sesję,
+wszystkie 1391 plików pełnego zapisanego runu, 43 katalogi runów i oba pliki
+odzyskanego rozwiązania. Zero dodanych, usuniętych lub zmienionych plików;
+zero aktywnych zadań. Dowód:
+`verification/inspection-availability-20261027/runtime-preservation-review.json`,
+SHA256 `f83740001b3647842bb9b6c97a20ca14bda5989ab39c3345cd4dc903de1cdb39`.
+
+## Weryfikacja frontendu po integracji
+
+Na rzeczywistych źródłach po codegen i poprawce importu przeszło 330/330
+wybranych testów Vitest w 23 plikach. Trzy interpretowane kontrole:
+Universe Inspector 27/27, selekcja pola 68/68, powierzchnia 39/39.
+Pełny typecheck, lint 27 plików i kontrola architektury PASS (exit 0).
+`summary.json` SHA256: `483ba0452159e345c65d8801746a180e481cc1268cc0b6d89d0104ab3936307a`.
+Dokładne polecenia i logi pozostają w wolumenie
+frontendu: `verification/final-antenna-frontend-20261027/commands.json`.
+
+Odczytowy harness rzeczywistych komponentów i API:
+`node /state/development/verification/final-antenna-frontend-20261027/verify.mjs --expect-absent --saved-flow`.
+Wynik: `retained_absence_gate=passed`, `saved_flow=passed`, 16 GET / wszystkie
+200, zero błędów, zero mutacji API, zero dodatkowych requestów i renderów
+w oknie idle. Przejście Airbox → Browse saved results → Saved → run5654 →
+odzyskane rozwiązanie rev1 → H_ant → Inspect ustawiło zapisany H w prezentacji
+Airbox. Wiersz przed Inspect pokazał H, A/m i 1145×3. Nie wysłano błędnego
+katalogu stage dla bieżącej próby Failed; nie uruchomiono kolejnego Solve.
+Dowód: `verification/final-antenna-frontend-20261027/report.json`.
+SHA256 raportu: `b39f646d86ef2e8ced703fa406858ab93619d8fe1a40bb1e07254398c9a2d34f`.
+To test TestDom + prawdziwy HTTP, bez kwalifikacji rzeczywistej przeglądarki.
+Trzech nowych regresji Rust discovery nie kompilowano lokalnie; dodano ich
+wykonanie do istniejącego workflow bootstrap CI. Wynik CI wymaga osobnej
+oceny dla HEAD wypchniętego PR.
+
+## Granice odbioru i retencja
+
+Odzyskany wynik `run-5654db21201dd6c660f7ecae78baf8588477fe2a7d90480d9d64b30e4d050080`
+ma surowe V/J/H; H zawiera 1145 wektorów A/m na siatce 6428 Tet4.
+Lifecycle tego runu nadal Failed; odzyskanie danych nie czyni wykonania
+Succeeded ani bazy pola zakwalifikowanej do LLG. Wcześniejsza kontrola
+zamrożonych wejść i wspólnych próbek H wykazała zgodność bajtową; nie jest
+niezależnym dowodem poprawności fizyki, zbieżności ani odtworzenia publikacji.
+
+Przeglądarka/WebGL nadal NOT VERIFIED: automatyczna kontrola URL zablokowała
+odczyt starej karty będącej stroną błędu z niedozwolonym protokołem. Nie
+obchodzono tej odmowy inną kartą, powierzchnią przeglądarki lub CDP.
+TestDom i HTTP nie zastępują screenshotu, kontroli canvas ani WebGL.
+Przekrój poprzeczny w UI, kwalifikowana baza → DC Relax/AC Run,
+spin-wave response oraz pełne porównanie BORIS pozostają otwarte.
+
+Retencja zarządzanego buildu: deferred (`outside-startup`). Zachowano bieżący
+pakiet, rollback, aktywny cache, wyniki, logi i receipty. Nie usuwano kontenerów,
+wolumenów ani danych użytkownika. Po buildzie dostępne logicznie w Dockerze
+321285468160 B; nie jest to gwarantowana niezależna pula od hosta.
+Skill `fullmag-build-stage-cleanup` nie jest dostępny; zastosowano reguły
+retencji governance. Ponowna ocena dopiero po wykazaniu zbędności i referencji
+rollback. Worktree i grupa pozostają do dalszej pracy oraz review PR.

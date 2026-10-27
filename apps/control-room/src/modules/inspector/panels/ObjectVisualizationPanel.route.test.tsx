@@ -69,6 +69,10 @@ vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
     requested: boolean;
     targetActive: boolean;
   }) => Boolean(targetActive && (requested || testState.fieldCatalogRequested)),
+  useStageExecutionResource: ({ enabled = true }: { enabled?: boolean } = {}) => {
+    resourceCall("stage-execution", enabled);
+    return { data: null, error: null, revision: null, status: "idle" };
+  },
   useFieldCatalogResource: ({ enabled }: { enabled: boolean }) => {
     resourceCall("field-catalog", enabled);
     return {
@@ -212,6 +216,7 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
 }));
 
 vi.mock("@/kernel/visualization/useObjectVisualization", () => ({
+  useSavedFieldPresentation: () => ({ presentation: null }),
   useObjectVisualizationController: () => ({
     clearTarget: vi.fn(),
     patchTarget: vi.fn(),
@@ -483,15 +488,15 @@ describe("ObjectVisualizationPanel lane routing", () => {
 
     const airbox = renderResolvedInspector(airboxSelection);
     expect(airbox).toContain('data-inspector-owner="airbox.visualization"');
-    expect(airbox).toContain("Airbox visualization");
-    expect(airbox).toContain("Target scope:Airbox");
+    expect(airbox).toContain("Universe visualization");
+    expect(airbox).toContain("Target scope:Universe (Airbox)");
     expect(airbox).toContain("Target ID:airbox");
     expect(airbox).toContain("Airbox-specific bounds and field support");
-    expect(airbox).toContain("Airbox extent, display passes, field quantity");
+    expect(airbox).toContain("Universe sampling mesh, computed field, and display settings");
     expectSharedVisualizationInspectorContract(
       airbox,
       "airbox.visualization",
-      "Airbox visualization",
+      "Universe visualization",
     );
 
     const meshPart = renderResolvedInspector(meshPartSelection);

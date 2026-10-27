@@ -273,7 +273,10 @@ const FDM_UNIVERSE_OUTSIDE_SUPPORT_TARGET_CAPABILITIES: VisualizationTargetCapab
 
 export function visualizationTargetCapabilities(
   target: VisualizationTargetRef,
+  artifactInspection = false,
 ): VisualizationTargetCapabilities {
+  // Display passes derive from the owned result topology, never from magnetic physics.
+  if (artifactInspection && target.kind === "airbox") return DEFAULT_VISUALIZATION_TARGET_CAPABILITIES;
   if (isFdmUniverseOutsideSupportTarget(target)) {
     return FDM_UNIVERSE_OUTSIDE_SUPPORT_TARGET_CAPABILITIES;
   }
