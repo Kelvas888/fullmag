@@ -1576,6 +1576,45 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             "volume", "inspect", "fullmag-control-fixture", allow_failure=True, timeout=60
         )
 
+
+    def test_shared_cache_project_uses_the_renderer_root_fallback(self):
+        project_root=str(ROOT.resolve())
+        self.assertEqual(self.qa.cache_project_id_for_layout({"project_root":project_root}),
+                         hashlib.sha256(project_root.encode()).hexdigest()[:16])
+
+    def test_frontend_shared_pnpm_requires_project_identity_and_exact_mount(self):
+        qa=self.qa
+        import docker_shared_build_storage as shared
+        identity={"project_id":"fullmag-fixture"}
+        descriptor=shared.volume_descriptors(identity["project_id"])[shared.PNPM_ROLE]
+        document={"Config":{"Env":["FULLMAG_SHARED_PNPM_STORE="+shared.SHARED_PNPM_TARGET]},
+                  "HostConfig":{"Mounts":[{"Type":"volume","Source":descriptor["name"],"Target":shared.SHARED_PNPM_TARGET,"VolumeOptions":{"NoCopy":True,"Subpath":"store"}}]},
+                  "Mounts":[{"Type":"volume","Name":descriptor["name"],
+                             "Destination":shared.SHARED_PNPM_TARGET,"RW":True}]}
+        volume={"Name":descriptor["name"],"Driver":"local","Options":{},
+                "Mountpoint":"/var/lib/docker/volumes/"+descriptor["name"]+"/_data",
+                "Labels":descriptor["labels"]}
+        with patch.object(qa,"_inspect_existing_volume",return_value=volume):
+            self.assertEqual(qa._validate_shared_frontend_pnpm(document,identity),{descriptor["name"]})
+            with self.assertRaises(qa.BuildControlError):
+                qa._validate_shared_frontend_pnpm(document,{"project_id":"foreign"})
+            for field,value in (("Name","foreign"),("Destination","/foreign"),("RW",False)):
+                changed=deepcopy(document);changed["Mounts"][0][field]=value
+                with self.subTest(field=field),self.assertRaises(qa.BuildControlError):
+                    qa._validate_shared_frontend_pnpm(changed,identity)
+            for options in ({"NoCopy":True,"Subpath":"foreign"},{"NoCopy":False,"Subpath":"store"}):
+                changed=deepcopy(document);changed["HostConfig"]["Mounts"][0]["VolumeOptions"]=options
+                with self.assertRaises(qa.BuildControlError):
+                    qa._validate_shared_frontend_pnpm(changed,identity)
+            changed=deepcopy(document);changed["Mounts"].append(deepcopy(changed["Mounts"][0]))
+            with self.assertRaises(qa.BuildControlError):
+                qa._validate_shared_frontend_pnpm(changed,identity)
+        for field,value in (("Labels",{}),("Driver","foreign"),("Options",{"type":"nfs","device":"/foreign"})):
+            changed=deepcopy(volume);changed[field]=value
+            with patch.object(qa,"_inspect_existing_volume",return_value=changed),self.subTest(field=field),self.assertRaises(qa.BuildControlError):
+                qa._validate_shared_frontend_pnpm(document,identity)
+        self.assertEqual(qa._validate_shared_frontend_pnpm({"Config":{"Env":[]},"Mounts":[]},identity),set())
+
     def test_frontend_volume_preflight_requires_deterministic_owned_labels(self):
         qa = self.qa
         inputs = {

@@ -35,6 +35,7 @@ from docker_build_control import (
 )
 from docker_compose_identity import compose_project_identity, source_labels, validate_source_labels
 from docker_dev_defaults import _validate_live_network, resolve_defaults
+from docker_backend_volume_cache import _safe_project_id as cache_project_id_for_layout
 
 
 PLAYWRIGHT_VERSION = "1.62.1"
@@ -361,6 +362,45 @@ def _read_recovered_development(control, original, selected, identity):
     }
 
 
+def _validate_shared_frontend_pnpm(document, identity):
+    """Admit only the canonical project-scoped pnpm mount introduced by DEV."""
+    import docker_shared_build_storage as shared
+    from docker_named_volume_safety import validate_local_named_volume
+    target = shared.SHARED_PNPM_TARGET
+    values = [entry.split("=", 1)[1] for entry in document.get("Config", {}).get("Env", [])
+              if isinstance(entry, str) and entry.startswith("FULLMAG_SHARED_PNPM_STORE=")]
+    mounts = document.get("Mounts") or []
+    if not values and not any(isinstance(m, Mapping) and m.get("Destination") == target for m in mounts):
+        return set()
+    if values != [target]:
+        raise BuildControlError("Frontend shared pnpm environment differs")
+    if not isinstance(identity.get("project_id"), str):
+        raise BuildControlError("Frontend shared pnpm cache project identity is unavailable")
+    descriptor = shared.volume_descriptors(identity["project_id"])[shared.PNPM_ROLE]
+    matches = [m for m in mounts if isinstance(m, Mapping) and
+               (m.get("Destination") == target or m.get("Name") == descriptor["name"])]
+    if (len(matches) != 1 or matches[0].get("Type") != "volume"
+            or matches[0].get("Destination") != target or matches[0].get("Name") != descriptor["name"]
+            or matches[0].get("RW") is not True):
+        raise BuildControlError("Frontend shared pnpm mount identity differs")
+    declarations = [m for m in document.get("HostConfig", {}).get("Mounts", [])
+                    if isinstance(m, Mapping) and m.get("Target") == target]
+    if (len(declarations) != 1 or declarations[0].get("Type") != "volume"
+            or declarations[0].get("Source") != descriptor["name"]
+            or declarations[0].get("ReadOnly", False) is not False
+            or declarations[0].get("VolumeOptions") != {"NoCopy": True, "Subpath": "store"}):
+        raise BuildControlError("Frontend shared pnpm subpath declaration differs")
+    volume = _inspect_existing_volume(descriptor["name"], "Shared frontend pnpm")
+    try:
+        validate_local_named_volume(volume, descriptor["name"])
+    except ValueError as error:
+        raise BuildControlError(str(error)) from error
+    labels = volume.get("Labels") or {}
+    if any(labels.get(key) != value for key, value in descriptor["labels"].items()):
+        raise BuildControlError("Frontend shared pnpm ownership differs")
+    return {descriptor["name"]}
+
+
 def _validate_frontend(
     document: dict[str, object],
     control: BuildControl,
@@ -368,6 +408,7 @@ def _validate_frontend(
     frontend_volume: str,
     current: Mapping[str, object],
     port: int,
+    *, cache_project_id: str | None = None,
 ) -> None:
     try:
         validate_source_labels(document, identity)
@@ -405,12 +446,13 @@ def _validate_frontend(
     control_mounts = [m for m in mounts if isinstance(m, Mapping) and m.get("Destination") == "/opt/fullmag/control"]
     if len(control_mounts) != 1 or control_mounts[0].get("Type") != "volume" or control_mounts[0].get("Name") != control.volume or control_mounts[0].get("RW") is not False:
         raise BuildControlError("Frontend control mount is not the selected readonly control namespace")
+    shared_volumes = _validate_shared_frontend_pnpm(document, {"project_id": cache_project_id})
     for mount in mounts:
         if not isinstance(mount, Mapping):
             raise BuildControlError("Frontend mount record is invalid")
         if mount.get("Type") == "bind" and mount.get("RW") is not False:
             raise BuildControlError("Frontend has a writable host bind")
-        if mount.get("Type") == "volume" and mount.get("Name") not in {frontend_volume, control.volume}:
+        if mount.get("Type") == "volume" and mount.get("Name") not in {frontend_volume, control.volume, *shared_volumes}:
             raise BuildControlError("Frontend has an unexpected named volume")
 
 
@@ -2304,7 +2346,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _validate_frontend_volume(control, frontend_volume, frontend_inputs)
     frontend = _inspect(frontend_id)
-    _validate_frontend(frontend, control, identity, frontend_volume, current, args.port)
+    _validate_frontend(frontend, control, identity, frontend_volume, current, args.port, cache_project_id=cache_project_id_for_layout(layout))
     try:
         _validate_live_network(backend_id, frontend_id, control.project, args.port)
     except BuildControlError as error:
