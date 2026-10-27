@@ -722,11 +722,13 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
         // The receipt keeps a bounded excerpt; the API log keeps the worker's
         // full native diagnostics (bounded) for root-cause analysis.
         let stderr = String::from_utf8_lossy(&outcome.output.stderr);
+        let stdout = String::from_utf8_lossy(&outcome.output.stdout);
         tracing::warn!(
             run_id = %process_exit_receipt.run_id,
             task_id = %process_exit_receipt.task_id,
             receipt_id = %process_exit_receipt.receipt_id,
             stderr = %bounded_head_and_tail(&stderr, WORKER_STDERR_LOG_EDGE_BYTES),
+            stdout = %bounded_head_and_tail(&stdout, WORKER_STDERR_LOG_EDGE_BYTES),
             "accepted worker process failed"
         );
     }
@@ -2385,9 +2387,21 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
             None => bounded_head_and_tail(&normalized, WORKER_FAILURE_EDGE_BYTES),
         }
     };
+    // Native libraries (HYPRE, the CUDA runtime) print their fatal diagnostics
+    // on stdout, which otherwise carries only the completion summary.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stdout_detail = match bounded_tail(&stdout, WORKER_FAILURE_STDOUT_BYTES) {
+        "" => String::new(),
+        tail if tail.len() < stdout.len() => format!(" | stdout: ...{tail}"),
+        tail => format!(" | stdout: {tail}"),
+    };
     // ExitStatus also preserves a Unix signal (where code() is None).
     // Stderr can contain only successful startup diagnostics after a crash.
-    format!("accepted worker process failed ({}): {detail}", output.status)
+    format!(
+        "accepted worker process failed ({}): {detail}{stdout_detail}",
+        output.status
+    )
 }
 
 const WORKER_FAILURE_MARKER: &str = "accepted worker failed:";
@@ -2400,9 +2414,10 @@ const NATIVE_ABORT_MARKERS: &[&str] = &[
     "panicked at",
 ];
 // The durable receipt bounds failure_reason to 4096 bytes, including the
-// status prefix and the elision marker.
-const WORKER_FAILURE_REPORT_BYTES: usize = 3072;
-const WORKER_FAILURE_EDGE_BYTES: usize = 1536;
+// status prefix, the stdout excerpt and the elision markers.
+const WORKER_FAILURE_REPORT_BYTES: usize = 2816;
+const WORKER_FAILURE_EDGE_BYTES: usize = 1408;
+const WORKER_FAILURE_STDOUT_BYTES: usize = 640;
 const WORKER_STDERR_LOG_EDGE_BYTES: usize = 32 * 1024;
 
 fn bounded_head(text: &str, limit: usize) -> &str {
@@ -2413,15 +2428,19 @@ fn bounded_head(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
+fn bounded_tail(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 fn bounded_head_and_tail(text: &str, edge: usize) -> String {
     if text.len() <= 2 * edge {
         return text.to_owned();
     }
-    let mut start = text.len() - edge;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("{} ... {}", bounded_head(text, edge), &text[start..])
+    format!("{} ... {}", bounded_head(text, edge), bounded_tail(text, edge))
 }
 
 fn commit_worker_command(
@@ -2653,8 +2672,12 @@ mod tests {
         assert!(reason.len() <= 4096, "{}", reason.len());
         let without_report = String::from_utf8_lossy(&outcome.output.stderr)
             .replace("Verification failed:", "error");
+        // HYPRE reports the failed device allocation on stdout (observed with
+        // CUDA_VISIBLE_DEVICES="" on 2026-10-27); the receipt must keep it.
         let unknown = ObservedWorkerProcess {
             output: Output {
+                stdout: b"CUDA ERROR (code = 100, no CUDA-capable device is detected) at memory.c:304\n"
+                    .to_vec(),
                 stderr: without_report.into_bytes(),
                 ..outcome.output
             },
@@ -2663,6 +2686,10 @@ mod tests {
         let reason = worker_failure_reason(&unknown);
         assert!(reason.contains("[fullmag-fem] cpu runtime"), "{reason}");
         assert!(reason.contains(" ... "), "{reason}");
+        assert!(
+            reason.ends_with(" | stdout: CUDA ERROR (code = 100, no CUDA-capable device is detected) at memory.c:304"),
+            "{reason}"
+        );
         assert!(reason.len() <= 4096, "{}", reason.len());
     }
 
@@ -2670,6 +2697,9 @@ mod tests {
     fn bounded_output_excerpts_respect_utf8_boundaries() {
         assert_eq!(bounded_head("ąb", 1), "");
         assert_eq!(bounded_head("ąb", 2), "ą");
+        assert_eq!(bounded_tail("aź", 1), "");
+        assert_eq!(bounded_tail("aź", 2), "ź");
+        assert_eq!(bounded_tail("ab", 5), "ab");
         assert_eq!(bounded_head_and_tail("abcdef", 3), "abcdef");
         assert_eq!(bounded_head_and_tail("ąbcdeź", 2), "ą ... ź");
     }
