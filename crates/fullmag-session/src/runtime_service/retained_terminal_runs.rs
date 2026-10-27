@@ -61,10 +61,38 @@ pub fn validate_retained_terminal_runs(
     pins: &[RetainedTerminalRunPin],
 ) -> Result<RetainedTerminalRunsPreflight> {
     if pins.is_empty() || pins.len() > retained_cancelled_runs::MAX_RETAINED_CANCELLED_RUN_PINS {
-        bail!(
-            "retained terminal-run pin count must be between 1 and {}",
-            retained_cancelled_runs::MAX_RETAINED_CANCELLED_RUN_PINS
-        );
+        bail!("retained terminal-run pin count must be between 1 and 128");
+    }
+    let mut budget = ReadBudget::default();
+    let actual = retained_cancelled_runs::list_run_inventory(store, &mut budget)?;
+    let expected = pins
+        .iter()
+        .map(|pin| pin.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    if actual.into_iter().collect::<BTreeSet<_>>() != expected {
+        bail!("retained terminal-run pins do not exactly match the durable run inventory");
+    }
+    let mut refs = BTreeSet::new();
+    let task_count = validate_terminal_runs_subset(store, pins, &mut budget, &mut refs)?;
+    retained_cancelled_runs::validate_run_cas_pins(store, &refs, &mut budget)?;
+    Ok(RetainedTerminalRunsPreflight {
+        run_count: pins.len(),
+        task_count,
+        inspected_file_count: budget.inspected_file_count(),
+        inspected_file_bytes: budget.inspected_file_bytes(),
+    })
+}
+
+/// Internal subset only. V4 owns union inventory, budget and global CAS pins;
+/// public v3 continues through its unchanged whole-inventory gate above.
+pub(super) fn validate_terminal_runs_subset(
+    store: &SessionStore,
+    pins: &[RetainedTerminalRunPin],
+    budget: &mut ReadBudget,
+    referenced_object_refs: &mut BTreeSet<String>,
+) -> Result<usize> {
+    if pins.len() > retained_cancelled_runs::MAX_RETAINED_CANCELLED_RUN_PINS {
+        bail!("terminal subset pin count must not exceed 128");
     }
 
     let mut pins_by_run = BTreeMap::new();
@@ -80,15 +108,8 @@ pub fn validate_retained_terminal_runs(
         }
     }
 
-    let mut budget = ReadBudget::default();
-    let run_ids = retained_cancelled_runs::list_run_inventory(store, &mut budget)?;
-    let pinned_run_ids = pins_by_run.keys().cloned().collect::<BTreeSet<_>>();
-    if run_ids.iter().cloned().collect::<BTreeSet<_>>() != pinned_run_ids {
-        bail!("retained terminal-run pins do not exactly match the durable run inventory");
-    }
-
+    let run_ids = pins_by_run.keys().cloned().collect::<Vec<_>>();
     let mut task_count = 0usize;
-    let mut referenced_object_refs = BTreeSet::new();
     for run_id in run_ids {
         let pin = pins_by_run
             .get(&run_id)
@@ -198,21 +219,20 @@ pub fn validate_retained_terminal_runs(
             }
         }
 
-        let solver_leases = read_solver_leases(store, &run_id, &tasks, &mut budget)?;
-        read_preparation_leases(store, &run_id, &tasks, &mut budget)?;
-        validate_cancellation_intents(store, &run_id, &tasks, catalog.revision, &mut budget)?;
+        let solver_leases = read_solver_leases(store, &run_id, &tasks, budget)?;
+        read_preparation_leases(store, &run_id, &tasks, budget)?;
+        validate_cancellation_intents(store, &run_id, &tasks, catalog.revision, budget)?;
         validate_task_admissions(
             store,
             &run_id,
             &tasks,
             catalog.revision,
             &solver_leases,
-            &mut referenced_object_refs,
-            &mut budget,
+            referenced_object_refs,
+            budget,
         )?;
-        let journals =
-            read_coordinator_journals(store, &run_id, &tasks, &solver_leases, &mut budget)?;
-        let inboxes = read_worker_inboxes(store, &run_id, &tasks, &solver_leases, &mut budget)?;
+        let journals = read_coordinator_journals(store, &run_id, &tasks, &solver_leases, budget)?;
+        let inboxes = read_worker_inboxes(store, &run_id, &tasks, &solver_leases, budget)?;
         validate_terminal_streams(
             store,
             &run_id,
@@ -220,7 +240,7 @@ pub fn validate_retained_terminal_runs(
             &journals,
             &inboxes,
             &solver_leases,
-            &mut budget,
+            budget,
         )?;
         validate_artifact_catalog(
             store,
@@ -228,19 +248,12 @@ pub fn validate_retained_terminal_runs(
             pin,
             &tasks,
             &solver_leases,
-            &mut referenced_object_refs,
-            &mut budget,
+            referenced_object_refs,
+            budget,
         )?;
     }
 
-    retained_cancelled_runs::validate_run_cas_pins(store, &referenced_object_refs, &mut budget)?;
-
-    Ok(RetainedTerminalRunsPreflight {
-        run_count: pins.len(),
-        task_count,
-        inspected_file_count: budget.inspected_file_count(),
-        inspected_file_bytes: budget.inspected_file_bytes(),
-    })
+    Ok(task_count)
 }
 
 fn read_solver_leases(

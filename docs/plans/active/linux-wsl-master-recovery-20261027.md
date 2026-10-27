@@ -70,3 +70,13 @@ Przed odrębną integracją host/bridge dodano kernelowy dowód odrębności obc
 Wariant v4 jest kolejnym etapem: rzeczywisty zestaw terminalnych referencji CAS przekracza agregat 128 MiB v3, więc v4 wymaga własnego ograniczonego budżetu agregatu 1 GiB przy zachowaniu limitu pojedynczego obiektu 128 MiB i niezmienionych limitów v1/v2/v3. Katalog całego store oraz CAS muszą być sprawdzane względem sumy terminalnych i held runów. Niepodłączony moduł v4 nie należy do pierwszego PR host/bridge.
 
 Pełny rzeczywisty dry-run kontrolera readmisji zatrzymał się bez zapisów na działających obcych kontenerach z literalnymi ścieżkami Windows w Docker Mounts.Source. Bieżący adapter nie kwalifikuje tych ścieżek na Linux/WSL. Bramka pozostaje fail-closed; należy dodać osobny kwalifikowany adapter albo uzyskać naturalne zatrzymanie tych konsumentów przed execute. Nie jest to podstawa do ich zatrzymania lub pominięcia.
+
+## Checkpoint v4 przed CI
+
+Etap host/bridge zapisano w `b19d561f1c7a709902a17693039df59bdd7f5998`; po integracji bazy master wynikowy HEAD to `6f2f233db7be7b4a8a87f5bf4e01a53724a2d508`, PR #301. Readmission nadal nie została wykonana.
+
+Natywne v4 dodano jako osobny etap źródeł: pełny union inventory/CAS/checkpointów, fixed budget 1 GiB, manual-held validator, outcome/replay/absence i pure capabilities. Niezależne review sześciu plików Rust nie wykazało P1/P2. Przygotowano 16 nowych testów; lokalnie wykonano wyłącznie parser/formatowanie oraz kontrole źródeł i diff. Kompilacja i wykonanie testów Rust wymagają osobnego CI; nie są zgłaszane jako PASS. Workflow zawiera osobną bramkę held module i testów manual_held.
+
+Ponowna kontrola magazynu po tych pracach: identyczne metadane wszystkich 1240 plików oraz SHA-256 44 katalogów, zero driftu. Przygotowano lokalne piny 15 terminalnych i 2 held runów; żaden status, release ani checkpoint nie został zmieniony.
+
+Badanie adaptera Windows wykazało potrzebę natywnej atestacji wolumenu, reparse/hardlinków oraz backing images. Nie wprowadzono niekwalifikowanej translacji ścieżek. Koordynator nie ma ownership pięciu blokujących grup; pytanie o rozszerzenie kontaktu z ich właścicielami pozostaje oczekujące. Nie zatrzymano żadnej z nich.
