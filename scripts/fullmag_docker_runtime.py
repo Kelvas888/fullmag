@@ -2607,7 +2607,11 @@ for name in sys.argv[1:]:
     descriptor = os.open(path, FLAGS)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        # A shared package links one sealed (read-only) payload into several
+        # groups; a writable artifact must still have exactly one link.
+        sealed = not metadata.st_mode & 0o222
+        if (not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_nlink != 1 and not sealed)):
             raise RuntimeError("runtime artifact is not one regular file")
         digest = hashlib.sha256()
         total = 0
