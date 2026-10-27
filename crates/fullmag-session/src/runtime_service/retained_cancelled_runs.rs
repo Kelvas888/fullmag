@@ -54,10 +54,20 @@ pub struct RetainedCancelledRunsPreflight {
 }
 
 #[derive(Default)]
-struct ReadBudget {
+pub(super) struct ReadBudget {
     entries: usize,
     files: BTreeSet<String>,
     file_bytes: u64,
+}
+
+impl ReadBudget {
+    pub(super) fn inspected_file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub(super) fn inspected_file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +78,7 @@ struct CasPinRecord {
 }
 
 impl ReadBudget {
-    fn observe_entry(&mut self) -> Result<()> {
+    pub(super) fn observe_entry(&mut self) -> Result<()> {
         self.entries = self
             .entries
             .checked_add(1)
@@ -79,7 +89,12 @@ impl ReadBudget {
         Ok(())
     }
 
-    fn observe_file(&mut self, root: &Path, relative: &str, maximum: usize) -> Result<()> {
+    pub(super) fn observe_file(
+        &mut self,
+        root: &Path,
+        relative: &str,
+        maximum: usize,
+    ) -> Result<()> {
         if !self.files.insert(relative.to_owned()) {
             return Ok(());
         }
@@ -265,7 +280,7 @@ pub fn validate_retained_cancelled_runs(
 /// retained run intents. Run-intent validation above proves these references
 /// match the accepted definition, study, catalog, and immutable asset records.
 /// This check is read-only and intentionally never releases pins.
-fn validate_run_cas_pins(
+pub(super) fn validate_run_cas_pins(
     store: &SessionStore,
     referenced_object_refs: &BTreeSet<String>,
     budget: &mut ReadBudget,
@@ -323,7 +338,10 @@ fn validate_run_cas_pins(
     Ok(())
 }
 
-fn list_run_inventory(store: &SessionStore, budget: &mut ReadBudget) -> Result<Vec<String>> {
+pub(super) fn list_run_inventory(
+    store: &SessionStore,
+    budget: &mut ReadBudget,
+) -> Result<Vec<String>> {
     let root = checked_path(store.root(), "runs")?;
     let metadata = fs::symlink_metadata(&root).context("retained-run inventory is missing")?;
     reject_link(&root)?;
@@ -576,12 +594,12 @@ fn scan_preparation_leases(
     Ok(())
 }
 
-fn required_directory(root: &Path, relative: &str) -> Result<PathBuf> {
+pub(super) fn required_directory(root: &Path, relative: &str) -> Result<PathBuf> {
     optional_directory(root, relative)?
         .with_context(|| format!("missing required directory {relative}"))
 }
 
-fn optional_directory(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
+pub(super) fn optional_directory(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
     let path = checked_path(root, relative)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) => {
@@ -596,7 +614,7 @@ fn optional_directory(root: &Path, relative: &str) -> Result<Option<PathBuf>> {
     }
 }
 
-fn validate_sha256(value: &str, field: &str) -> Result<()> {
+pub(super) fn validate_sha256(value: &str, field: &str) -> Result<()> {
     if value.len() != 64
         || !value
             .bytes()
