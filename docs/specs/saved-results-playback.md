@@ -1,6 +1,6 @@
 # Odtwarzanie zapisanych wyników z folderu
 
-Status: implementacja w toku; kwalifikacja runtime i przeglądarki wymaga osobnych dowodów.
+Status: zaimplementowano dla regularnego FDM/Zarr; rzeczywisty zapis YIG przeszedł kwalifikację API i UI. Dowody i zakres: saved-results-playback-verification-20261027.md.
 
 ## Cel i własność
 

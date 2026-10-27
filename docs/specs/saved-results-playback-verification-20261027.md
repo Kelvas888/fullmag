@@ -1,6 +1,6 @@
 # Odtwarzanie zapisanych wyników — weryfikacja 2026-10-27
 
-Status: odtwarzanie rzeczywistego YIG potwierdzone w UI; końcowe sprawdzenie po połączeniu z masterem i integracja CI w toku.
+Status: lokalne testy i końcowa kwalifikacja YIG po integracji mastera zakończone. Wynik integracji CI jest publikowany w PR #297: https://github.com/MateuszZelent/fullmag/pull/297.
 
 ## Zachowanie i zakres
 
@@ -18,22 +18,27 @@ poza tym zakresem. Starszy folder bez deskryptora otrzymuje błąd formatu.
 ## Potwierdzone sprawdzenia
 
 - Zarządzany build aplikacji backendowej: OK. Runtime zbudowano ze snapshotu
-  7443406cd401ef98603b9a1d3bfb5737b41528bbdd409b9017ad7ba6a6a70816
-  na bazie ad16c36079a48d4d0fbaca7a2a1bc9f3eff6d43c z opisanymi zmianami.
+  a1155fa90bfac7e193c5a85a7c56829de27168c0938ee1511615f2765d685a8c
+  na bazie 9a6cda090fd0608d31b96f2130b59107dbddd611, po integracji mastera.
+  Próba development 96597c79dc1a4f8e9120f56866a8e001, konfiguracja
+  ed0408d6f8af28f45ce517a08df71fdbb7689dc09f5d3dd074b51b9948f8f0ca.
 - Reader Rust: 56/56 testów, w backendzie własnej grupy.
 - Test HTTP saved_playback_routes_return_metadata_and_revision_checked_binary_frames:
   1/1, w backendzie własnej grupy.
-- Python: 64/64 regresje poświadczenia WSL, czytników dowodów, codegen i browser QA.
-- Typecheck i pełny lint: OK przed połączeniem najnowszego mastera; końcowe powtórzenie po integracji w toku.
-- Pełny frontend: pierwszy przebieg 8867 OK, 3 błędy, 1 skip. Poprawiono
-  użycie surowego invalidate, SSR-asercję suwaka oraz przypięcie testu Next
-  do źródeł. Testy cross-app wymagają FULLMAG_TEST_SOURCE_ROOT=/opt/fullmag/source.
-  Końcowy pełny przebieg po synchronizacji shadow pozostaje otwarty.
+- Python: 68/68 regresje poświadczenia WSL, czytników dowodów, codegen i browser QA.
+- Typecheck: OK po integracji mastera i poprawce stylów dokumentacji.
+- Pełny lint: OK; dodatkowy lint zmienionych stylów i komponentu dokumentacji: OK.
+- Pełny frontend po integracji: 8899 testów OK, 1 istniejący skip; 865 plików
+  OK, 1 skip. Testy cross-app uruchomiono z
+  FULLMAG_TEST_SOURCE_ROOT=/opt/fullmag/source.
+- Architecture hygiene: OK. Przyjęty z mastera fallback CSS dokumentacji
+  przeniesiono bez zmiany bajtów do centralnej warstwy stylów. Dodatkowo
+  przeszło 11 testów modelu dokumentacji.
 - Git diff --check i składnia YAML workflow: OK.
 
 ## Rzeczywisty podgląd YIG
 
-Zarządzana kwalifikacja browser-qa/attempts/4631bda06895459d81cf97c52a2b2f74
+Zarządzana kwalifikacja browser-qa/attempts/d5794403021b423e8f11e93718946fd6
 zakończyła się succeeded. Źródło scenariusza:
 88313211c68f37f482c4e89b348051f2296fb257daf132815593329ecac364bb.
 Playwright 1.62.1, SwiftShader WebGL (dowód UI, bez deklaracji sprzętowego GPU).
@@ -50,7 +55,7 @@ Potwierdzono: zmieniony obraz canvasu, niezmieniona geometria i kamera,
 stabilny Inspector, widoczny canvas, context_lost=false, drawing buffer
 649×683, brak błędów hooków, brak mutacji sesji i brak nowej sesji.
 Zrzut oraz JSON dowodowy wyeksportowano jako YIG-playback-20261027.png/json
-do dokumentów użytkownika. Obraz sprawdzono wizualnie: m_z przedstawia
+do dokumentów użytkownika; końcowe kopie mają sufiks -final. Obraz sprawdzono wizualnie: m_z przedstawia
 propagujące paczki na końcowej klatce +4 ns.
 
 Negatywne HTTP: klatka 801 i obcy etap → 404, nieaktualna rewizja → 409.
@@ -70,15 +75,29 @@ i dokładnym CAS, bez zmiany oryginalnego receipt.json; potwierdzono brak
 helpera i brak zachowanych runów. Zwykłe resume
 82b6809c6aa1486fa10a52c3e0dfb765 przywróciło API i frontend.
 
-## Pozostałe bramki
+## Utrzymanie cache
+
+Przypięta procedura cache-maintenance/attempts/0c242ff7ed4c4431bb7ef22f65d2e523
+zakończyła się succeeded dla próby development i konfiguracji powyżej.
+Dopasowano ścisły wrapper just do istniejącej recepty maintain-cache: dokładne
+piny, bez eval, bez dodatkowych flag retencji i komend złożonych. Regresja
+weryfikuje zarówno poprawny dispatch, jak i odrzucenie takich rozszerzeń.
+
+## Integracja i ograniczenia dowodów
 
 Użytkownik jawnie zezwolił na testy tej funkcji i wymagane CI.
 Wcześniejsza odmowa kompilacji testów nie blokuje już tego zadania.
+CI obejmuje teraz czytnik, test trasy HTTP i regresje helperów WSL/QA.
+Finalne CI, merge i kwalifikowany cleanup są rejestrowane w PR #297 oraz
+operacyjnym checkpointcie zadania. Nie są wnioskowane z testów lokalnych.
 
-Po integracji z aktualnym masterem: końcowy restart/synchronizacja, pełne
-testy frontendu, statyczne kontrole oraz ponowny browser QA; następnie PR,
-wymagane CI, merge i kwalifikowany cleanup. React Doctor w starym hooku miał
-błąd parsera oxlint (Unexpected discriminant 160); nie jest zaliczoną bramką.
+Narzędzie QA rozpoznaje nowy wspólny cache pnpm wyłącznie po tożsamości
+projektu cache wyznaczanej przez renderer Compose, nazwie i etykietach
+wolumenu, lokalnym driverze bez opcji, dokładnym subpath store i NoCopy.
+Wolumen pnpm nie jest dodatkowo montowany do samego browser helpera.
+
+Stary hostowy hook React Doctor miał błąd parsera oxlint
+(Unexpected discriminant 160); nie jest raportowany jako zaliczona bramka.
 
 Oryginalny zapis YIG zachowuje status nieudanej publikacji ENOSPC.
 Odtwarzanie nie przepisuje go na sukces. Rewizja API obejmuje deskryptor

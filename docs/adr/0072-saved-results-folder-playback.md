@@ -1,6 +1,6 @@
 # ADR 0072 — odtwarzanie pola z samodzielnego folderu wyników
 
-Status: accepted for implementation (decyzja użytkownika 27.10.2026); runtime i browser proof wymagają weryfikacji.
+Status: accepted; zrealizowano dla regularnego FDM/Zarr. [Dowody kwalifikacji YIG](../specs/saved-results-playback-verification-20261027.md).
 
 ## Kontekst
 
