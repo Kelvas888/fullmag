@@ -739,7 +739,7 @@ try {
   await page.waitForTimeout(100);
   const controlsGeometry = await overview.evaluate((element) => {
     const segmented = element.querySelector('[data-slot="segmented-control"]');
-    const quantity = element.querySelector('select[aria-label="Quantity Source"]');
+    const quantity = element.querySelector('[role="combobox"][aria-label="Quantity source"]');
     const renderMode = element.querySelector('[role="radiogroup"][aria-label="Render mode"]');
     return {
       overview: element.getBoundingClientRect().toJSON(),

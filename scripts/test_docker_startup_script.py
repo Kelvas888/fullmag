@@ -618,8 +618,11 @@ class StartupRejectionTests(unittest.TestCase):
                 POST_BUILD_START_SHA_ENV="FULLMAG_DOCKER_POST_BUILD_CONTINUATION_SHA256",
                 ensure_configuration=mock.Mock(return_value={}),
                 process_environment=mock.Mock(return_value={}),
+                terminal_observation_preflight=mock.Mock(return_value=None),
                 accepted_reattach_preflight=lambda _paths: None,
-                accepted_reattach_api_input=lambda _paths, **_kwargs: nullcontext(({}, None)),
+                terminal_observation_api_input=mock.Mock(
+                    side_effect=lambda _paths, **_kwargs: nullcontext(({}, None, None))
+                ),
                 process_receipt_path=mock.Mock(return_value=Path(directory) / "process-tree.json"),
                 start=mock.Mock(return_value=handle),
                 stop=mock.Mock(return_value={"state": "drained"}),
@@ -645,6 +648,10 @@ class StartupRejectionTests(unittest.TestCase):
                     mock.patch.object(startup, "_bounded_regular", side_effect=self.bounded_regular), \
                     mock.patch.object(startup, "activate", side_effect=startup.StartupScriptRejected(400, "bad_request", "unsupported model")):
                 self.assertEqual(module.serve(), 0)
+            service.terminal_observation_preflight.assert_called_once_with(paths)
+            service.terminal_observation_api_input.assert_called_once_with(
+                paths, terminal_preflight=None, accepted_preflight=None
+            )
             service.stop.assert_called_once_with(handle, timeout=30)
             self.assertEqual(receipts[-1]["state"], "drained")
 

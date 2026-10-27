@@ -52,7 +52,7 @@ describe("MeshPartLayer", () => {
     const controller = new ObjectVisualizationController();
     const target = { kind: "object" as const, id: "object:antenna" };
     const object = { id: "antenna", role: "antenna", physics_stack: [], magnetization_ref: null };
-    const primitive = { objectId: "antenna", meshState: "mesh-ready" } as never;
+    const primitive = { objectId: "antenna", role: "antenna", meshState: "mesh-ready" } as never;
     const surface = {
       part: { id: "signal", object_id: "antenna_geom" },
       surfaceIndices: new Uint32Array([0, 1, 2]),
@@ -79,11 +79,12 @@ describe("MeshPartLayer", () => {
         snapshot, target, objectContext: { object, quantityCatalog: null },
       });
       return { settings, ready, primitiveVisible: shouldRenderPrimitiveObject(primitive,
-        primitiveSettings, realized.has(object.id)) };
+        primitiveSettings, realized.has(object.id), object.role === "antenna"),
+        previewWithoutAdmission: shouldRenderPrimitiveObject(primitive, primitiveSettings, realized.has(object.id)) };
     };
     expect(resolve()).toMatchObject({
       settings: { activeQuantityId: "", shaderVisible: false },
-      ready: false, primitiveVisible: true,
+      ready: false, primitiveVisible: true, previewWithoutAdmission: false,
     });
     controller.patchTarget(target, { surfaceColorSource: "solid" });
     expect(resolve()).toMatchObject({ ready: true, primitiveVisible: false });

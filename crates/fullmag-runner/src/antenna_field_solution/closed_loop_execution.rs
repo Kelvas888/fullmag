@@ -415,13 +415,13 @@ mod native_failure_tests {
 
     #[test]
     fn controlled_return_preserves_diagnostic_and_other_errors_stay_opaque() {
-        let error = classify_execution_error(invalid("native diagnostic"),
+        let error = classify_execution_error(RunError { message: "native diagnostic".into() },
             known_native_call_failure(-3));
         assert!(matches!(error, ClosedLoopExecutionError::NativeCallFailed {
             status: KnownNativeCallFailure::Internal, ref message
         } if message == "native diagnostic"));
         for status in [0, -4, -5, 1, i32::MIN] {
-            let error = classify_execution_error(invalid("opaque"), known_native_call_failure(status));
+            let error = classify_execution_error(RunError { message: "opaque".into() }, known_native_call_failure(status));
             assert!(matches!(error, ClosedLoopExecutionError::Other(ref error) if error.message == "opaque"));
         }
         let validation = classify_execution_error(invalid("snapshot validation"), None);

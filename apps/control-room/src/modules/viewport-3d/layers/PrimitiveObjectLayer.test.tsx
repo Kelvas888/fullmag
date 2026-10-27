@@ -346,6 +346,8 @@ describe("PrimitiveObjectLayer geometry resources", () => {
       shouldRenderPrimitiveObject(
         { ...primitiveObject("box"), meshState: "mesh-ready" },
         { ...DEFAULT_OBJECT_VISUALIZATION, primitiveVisible: true },
+        false,
+        true,
       ),
     ).toBe(true);
     expect(
@@ -365,12 +367,13 @@ describe("PrimitiveObjectLayer geometry resources", () => {
   it("hands a ready object from primitive preview to realized geometry and back without changing settings", () => {
     const object = { ...primitiveObject("box"), meshState: "mesh-ready" as const };
     const settings = { ...DEFAULT_OBJECT_VISUALIZATION, primitiveVisible: false, shaderVisible: true };
-    expect(shouldRenderPrimitiveObject(object, settings, false)).toBe(true);
-    expect(resolvePrimitiveObjectRenderSettings(object, settings).primitiveVisible).toBe(true);
-    expect(shouldRenderPrimitiveObject(object, settings, true)).toBe(false);
-    expect(shouldRenderPrimitiveObject(object, settings, false)).toBe(true);
+    expect(shouldRenderPrimitiveObject(object, settings, false)).toBe(false);
+    expect(shouldRenderPrimitiveObject(object, settings, false, true)).toBe(true);
+    expect(resolvePrimitiveObjectRenderSettings(object, settings, true).primitiveVisible).toBe(true);
+    expect(shouldRenderPrimitiveObject(object, settings, true, true)).toBe(false);
+    expect(shouldRenderPrimitiveObject(object, settings, false, true)).toBe(true);
     expect(settings.primitiveVisible).toBe(false);
-    expect(shouldRenderPrimitiveObject(object, { ...settings, visible: false }, false)).toBe(false);
+    expect(shouldRenderPrimitiveObject(object, { ...settings, visible: false }, false, true)).toBe(false);
   });
 
   it("does not render a primitive fallback when a realized FDM carrier owns the object", () => {
@@ -429,6 +432,7 @@ describe("PrimitiveObjectLayer geometry resources", () => {
       resolvePrimitiveObjectRenderSettings(
         { ...primitiveObject("box"), meshState: "mesh-ready" },
         { ...DEFAULT_OBJECT_VISUALIZATION, primitiveVisible: false, shaderVisible: true },
+        true,
       ).primitiveVisible,
     ).toBe(true);
   });

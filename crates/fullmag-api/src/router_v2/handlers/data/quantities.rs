@@ -659,7 +659,7 @@ mod tests {
     fn field_only_stored_carrier_is_readable_without_solver_capabilities() {
         let mut snapshot = snapshot_with_field_provider("V_electric");
         snapshot.capabilities = None;
-        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present":false}));
+        snapshot.metadata = Some(serde_json::json!({"magnetic_state_present":false}).into());
         for id in ["V_electric", "J_charge"] {
             let spec = quantity_spec(id).unwrap();
             let carriers = current_field_carriers(spec, "object", Some("antenna"), "source-mesh",

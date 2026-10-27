@@ -28,7 +28,7 @@ vi.mock("./MeshPartLayer", () => ({
 
 describe("TopologyMeshLayer", () => {
   it("atomically replaces a primitive only after every matching surface upload is committed", () => {
-    const object = { objectId: "antenna", meshState: "mesh-ready" } as never;
+    const object = { objectId: "antenna", role: "antenna", meshState: "mesh-ready" } as never;
     const primitiveModel = { objects: [object] } as never;
     const part = (id: string, owner: string) => ({
       part: { id, object_id: owner }, surfaceIndices: new Uint32Array([0, 1, 2]),
@@ -43,7 +43,8 @@ describe("TopologyMeshLayer", () => {
         topologyModel, topologyFreshness: "current",
       });
       const ready = committed.length === 2;
-      expect(shouldRenderPrimitiveObject(object, DEFAULT_OBJECT_VISUALIZATION, ids.has("antenna"))).toBe(!ready);
+      expect(shouldRenderPrimitiveObject(object, DEFAULT_OBJECT_VISUALIZATION, ids.has("antenna"), true)).toBe(!ready);
+      expect(shouldRenderPrimitiveObject(object, DEFAULT_OBJECT_VISUALIZATION, ids.has("antenna"))).toBe(false);
       const markup = renderToStaticMarkup(
         <TopologyMeshLayer
           colors={{} as never} fieldModel={null}

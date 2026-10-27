@@ -130,3 +130,52 @@ wolumenów ani danych użytkownika. Po buildzie dostępne logicznie w Dockerze
 Skill `fullmag-build-stage-cleanup` nie jest dostępny; zastosowano reguły
 retencji governance. Ponowna ocena dopiero po wykazaniu zbędności i referencji
 rollback. Worktree i grupa pozostają do dalszej pracy oraz review PR.
+
+
+## Pierwszy CI i korekty kontraktów po integracji
+
+Dla HEAD `d4255dad0034ea785316ccfe4191f781948b6510` zakończyły się 32 kontrole:
+14 success, 8 failure i 10 skipped. Nie uznano początkowych lokalnych 330
+przypadków za dowód przejścia całego CI. Przejrzano pełne logi nieudanych jobów.
+Wszystkie poniższe poprawki dotyczą testów, fixture, audytu i selektora smoke;
+produkcja solvera, API, bramki providera, tolerancje i runtime pozostają bez zmian.
+
+| Rodzina nieudanych kontroli | Potwierdzona przyczyna i poprawka | Weryfikacja lokalna |
+|---|---|---|
+| source-contracts | Test klasyfikacji tworzył komunikat przez `invalid`, który dodaje prefiks, a oczekiwał dosłownego tekstu bez prefiksu. Fixture używa jawnego `RunError`; dokładne asercje i obsługa nieznanych statusów zachowane. | Parser Rust PASS; wykonanie Rust oczekuje na CI. Pierwszy CI miał 1820 PASS i tę jedną awarię. |
+| rust-contracts, checkpoint-windows-contracts | Jeden test `quantities.rs` podawał `Value` zamiast nowego `SharedJson`. Dodano `.into()` wyłącznie w fixture. | Parser Rust i diff PASS; testów Rust lokalnie nie kompilowano. |
+| terminal-artifact-attestation Ubuntu, python-contracts | Trzy stare konteksty testowe nie implementowały terminal-observation preflight i nowego context managera. Uzupełniono mocki i dokładne asercje wywołań. | 296 przypadków Python: 293 PASS, 3 oczekiwane skips; przed poprawką odtworzono dwie awarie. |
+| modal-observables, control-room-contracts | Fixture nie uwzględniały jawnego admission podglądu, jednego właściciela statusu stopki, atomowej kolejki kolory+macierze oraz rozstrzygniętego providera i projekcji tensora. Zachowano odmowy, dodano sześć negatywnych regresji. | Rodziny skupione 37 + 109 + 96 PASS; pełny typecheck, lint 12 zmienionych plików i architecture PASS. |
+| browser-fixture-smoke | Kontrola geometrii szukała starego natywnego selecta zamiast wspólnego comboboxa z aktualną etykietą. | Parser i odczytowy SSR/AST kontrakt selektora PASS; rzeczywisty smoke przeglądarkowy oczekuje na nowy CI. |
+
+Jeden pełny przebieg Vitest na zamrożonych źródłach zakończył się: 873/874
+pliki oraz 9127/9128 testów PASS, exit 1, 438,88 s. Jedyny błąd tego przebiegu
+nie dotyczył kodu produktu: cross-app test próbował otworzyć
+`apps/web/dev-server.mjs` w cieniu zawierającym tylko Control Room.
+Istniejący test obsługuje `FULLMAG_TEST_SOURCE_ROOT`; przy jawnym pinie do
+readonly `/opt/fullmag/source` cała ta rodzina przeszła 12/12 (exit 0).
+Nie zmieniono testu ani launchera, nie wyłączono przypadku i nie powtarzano
+873 niezmienionych zielonych plików. Osobno finalny SHA fixture jednostki
+`A/m^2` sprawdzono w 56/56 przypadkach capabilities. Nie przedstawiamy tych
+przebiegów jako jednego pełnego wykonania z exit 0.
+
+Dokładne logi/komendy/SHA są w wolumenie frontendu pod
+`verification/pr247-ci-20261027/`: `full-frontend-tests.log`,
+`post-full-focused.json`, `root-final-checks/summary.json`,
+`provider-tensor-planar-review.json` oraz `selector-contract.json`.
+Pełne logi i raporty backendu są w control volume pod tą samą ścieżką:
+`terminal-artifact-fixture-review.json` SHA256
+`22b3aba3c525a3f43435d4754ed4b8d6adb75be4e8eef89c6d534dde59f08f50`,
+`rust-checkpoint-fixture-review.json` SHA256
+`8acae5052788d5a93c03eb62c3abc6f8ced788a0cbc3fbcd366fdfbedf833819`.
+
+Następna bramka: nowy push i ponowny CI dla jego dokładnego HEAD. Nie zmieniono
+wyników ani nie uruchomiono Solve lub nowego buildu produkcji wyłącznie dla
+fixture. Odbiór rzeczywistego Saved viewportu i pełny E0–E12 pozostają otwarte.
+
+Niezależnie ponownie przejrzano przyszły przekrój Saved. Plan oraz przegląd
+ponownego użycia istniejącego FMVP z obowiązkową maską są w control volume
+`verification/antenna-saved-planar-design-current-20261027/`. To wyłącznie
+projekt: brak próbki musi pozostać brakiem, norma następuje po interpolacji
+wektora, cztery piny właściciela i maska muszą być spójne przed prezentacją.
+Nie wdrożono w tym przyroście nowego endpointu, codec ani przekroju UI.
