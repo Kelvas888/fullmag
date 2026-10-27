@@ -602,3 +602,82 @@ Nie zmieniono schematu API, wygenerowanych typów, native operatora ani źróde�
 pracującego solvera. Nie restartowano backendu. Nowa stopka nie udaje obserwacji
 innego runa: stan nowej próby należy czytać po jej jawnym wyborze w Saved Results.
 Nie wykonywano nowych kompilacji testów Rust ani ponownego Solve diagnostyki.
+
+
+### Zgodność Saved V/J/H i przygotowanie naprawy Auto — 27.10.2026
+
+Poprzednia kontynuacja jest postępem: zapisano poprawkę Saved Results
+c8774e112f2dd746c88110dcf537c243a209d858. W tej kontynuacji ponownie sprawdzono
+żywy worker 9549 i API pełnego runa; stan running, bez opublikowanych artefaktów.
+Nie rozpoczęto drugiego Solve ani buildu/restartu.
+
+Istniejący scripts/smoke_saved_antenna_fields.py::verify wykonano na rzeczywistym
+SolutionSet 20 punktów, rewizja 2. PASS: metadane, FMDS, geometria FMMT, maski FMSP,
+hashe, jednostki, producer i przypięcie do SolutionSet/member/manifest/tensor.
+Sprawdzono też odmowę obcego geometry_object_ref.
+Zapis: verification/rt0-geometry-cases-20261027/saved-vjh-http-gate.json.
+Osobne accepted-to-saved-value-comparison.json porównuje z wcześniej odczytanym
+pakietem accepted; wszystkie wartości są bitowo identyczne:
+
+| Quantity dla UI | Payload zaakceptowanego wyniku | Próbki × składowe | SI |
+|---|---|---:|---|
+| V_electric | v_raw | 677 × 1 | V |
+| J_charge | j_local_raw | 7424 × 3 | A/m² |
+| H_ant | h_raw | 20 × 3 | A/m |
+
+J pozostaje lokalne w czterech węzłach każdego Tet4, nie jest wygładzane do
+wspólnego nodalnego J. Zgodność ta nie kwalifikuje fizyki ani renderera.
+browser_qualified=false, physics_qualified=false, cold_reopen_qualified=false:
+nie wykonano restartu/reopen, bo pełna próba nadal pracuje.
+
+Rzeczywisty zasób /simulation/stages/execution istnieje i ma zgodne session,
+epoch, request_scope_epoch oraz run_id ze statusem starej sesji. Publikuje failed
+z powodem surface RT0 wall-time exhausted, a nie postęp nowego accepted runa.
+Kod FooterTelemetry.tsx w worktree i cieniu frontendu jest zgodny
+(SHA256 3d4b87cd1d40434eff82c408850fa03aa92d0c6f3dfbde9ace7e61b96dfa5596).
+Nie potwierdzono przez przeglądarkę, co faktycznie wyrenderował klient użytkownika.
+
+Audyt nierozwiązanego Auto/null:
+Python RuntimeSelection.to_runtime_metadata autoruje cpu_threads:null;
+antenna_coincident_materialization::materialize_antenna_coincident_loops
+włącza runtime_selection do przygotowanego preimage.
+Publiczny CLI binduje już przygotowaną geometrię przez
+script_pipeline_acceptance::compile_accepted_closed_loop_pipeline.
+execution_profile_binding::bind_materialized_execution usuwał null mimo
+niezmienionego typowanego Auto. Walidator planera prawidłowo odrzucał zmieniony
+digest. compute_resources::ComputeResourcesIR::validate_legacy_selection
+już dopuszcza null; nie jest potrzebna zmiana preimage ani walidatora.
+
+Nowy wariant w rt0_profile_180s/fem_antenna_rt0_auto_180s.py i
+auto-input-manifest.json zachowuje fizyczny AST, wszystkie trzy assety
+i politykę bazowego scenariusza czterech punktów. Usuwa tylko jawne CPU1
+i zachowuje domyślne Auto. Składnia Python, AST i hashe: PASS.
+SHA256 skryptu 1ee2b0001e1506e670f4d155e886c9942b9d23a149d29132999e7cac43191153.
+
+Rzeczywisty RED na aktualnym pakiecie:
+fullmag-bin run-script-accepted z tym skryptem, dotychczasowym base.fms,
+profile.json, resources.json, idempotency-key rt0-auto-four-preparation-20261027-01
+oraz --prepare-only: exit 1 po 40.639554970 s. Błąd:
+prepared source authored input digest does not bind actual geometry, closure,
+carrier, materials and intent. Stdout pusty; brak Submit/Solve.
+Pakiet 0.1.0-dev.20261027.g891918ab18fb.dirty.sbaef683051ad+9796.
+Dowody: verification/antenna-auto-identity-20261027/before-receipt.json,
+before-stderr.log i source-input-check.json.
+
+Poprawka źródeł w crates/fullmag-application/src/execution_profile_binding.rs:
+Auto zachowuje istniejące null i brak klucza; nadal usuwa kolidującą nienullową
+wartość legacy. Jawna liczba wątków działa jak dotychczas. To zachowuje replay
+starszych zaakceptowanych katalogów z pominiętym kluczem.
+Nowa regresja w tests/execution_profile_binding.rs porównuje cały ProblemIR
+i powtórny bind obu wariantów. Istniejące testy tego pliku już obejmują
+liczbę4, usuwanie legacy8 przy Auto oraz odrzucenie zmodyfikowanego requestu;
+nie dodano ich duplikatów. Test API script.rs oczekuje teraz zachowanego null,
+lecz nadal odrzuca rzeczywistą zmianę device:auto→cpu po przygotowaniu geometrii.
+Niezależny review implementacji: brak Required.
+
+Status: SOURCE ONLY; GREEN publicznego prepare-only nadal NOT VERIFIED.
+Nie kompilowano ani nie uruchamiano testów Rust. Zarządzany build i GREEN
+przygotowania muszą nastąpić po terminalu pełnego workera, nigdy przez przerwanie
+jego obliczeń. Zmiana prawdziwego profilu po materializacji nadal wymaga
+bind-before-geometry jak w istniejącym flow UI; ta poprawka nie obiecuje jej obsługi
+w CLI i nie pomija walidatora. Pełny cel E0–E12 pozostaje nieukończony.

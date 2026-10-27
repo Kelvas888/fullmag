@@ -1927,7 +1927,9 @@ mod tests {
         let bound = bind(light.ir);
         let selection = &bound.problem.problem_meta.runtime_metadata["runtime_selection"];
         assert_eq!(selection["device"], "cpu");
-        assert!(!selection.as_object().unwrap().contains_key("cpu_threads"));
+        assert!(selection.as_object().unwrap().contains_key("cpu_threads"));
+        assert!(selection["cpu_threads"].is_null());
+        // The old order still changes device Auto to CPU after source preparation.
         let old = scene_document_to_prepared_script_config_with_asset_root(
             &root, workspace.path(), None, &scene, &request,
         ).unwrap();
