@@ -1372,7 +1372,9 @@
 .fm-inspector .fm-select-trigger {
   height: var(--fm-inspector-control-height);
   min-height: var(--fm-inspector-control-height);
+  border-color: var(--fm-border-default);
   border-radius: var(--fm-inspector-control-radius);
+  background: var(--fm-bg-panel-raised);
   font-size: var(--fm-inspector-control-font-size);
 }
 
@@ -1395,7 +1397,7 @@
 }
 
 .fm-inspector .fm-select-trigger {
-  border-color: var(--fm-border-subtle);
+  border-color: var(--fm-border-default);
   background: var(--fm-bg-panel-raised);
   color: var(--fm-text-primary);
   font-family: var(--fm-font-ui);
@@ -1416,6 +1418,7 @@
 
 .fm-inspector .fm-inspector-input:disabled,
 .fm-inspector .fm-inspector-select:disabled,
+.fm-inspector .fm-inspector-textarea:disabled,
 .fm-inspector .fm-select-trigger:disabled {
   border-color: var(--fm-border-disabled);
   background: var(--fm-bg-disabled);
@@ -1428,8 +1431,16 @@
 .fm-inspector textarea.fm-inspector-input {
   height: auto;
   min-height: 72px;
+  border-color: var(--fm-border-default);
   border-radius: var(--fm-inspector-control-radius);
+  background: var(--fm-bg-panel-raised);
   font-size: var(--fm-inspector-control-font-size);
+}
+
+.fm-inspector .fm-inspector-textarea:disabled {
+  border-color: var(--fm-border-disabled);
+  background: var(--fm-bg-disabled);
+  color: var(--fm-text-disabled);
 }
 
 .fm-inspector .fm-inspector-textarea::placeholder,

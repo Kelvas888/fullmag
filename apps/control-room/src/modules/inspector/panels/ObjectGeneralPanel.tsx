@@ -894,6 +894,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
             <FormField
               label="Notes"
               type="textarea"
+              rows={3}
               value={draftNotes}
               onChange={(event) => updateDraft("notes", event.target.value)}
             />
