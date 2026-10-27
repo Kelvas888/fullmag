@@ -9,7 +9,6 @@ import {
   useProjectRunsResource,
 } from "@/kernel/resources/projectRunResources";
 import {
-  useMaterializedDatasetResource,
   useSolutionSetArtifactsResource,
   useSolutionSetDiscoveryResource,
   useSolutionSetMembersResource,
@@ -17,13 +16,7 @@ import {
   isSolutionScalarArtifact,
   useSolutionScalarResource,
 } from "@/kernel/resources/solutionSetResources";
-import {
-  pinnedMaterializedDatasetSelectionRef,
-  selectionRefEquals,
-  type PinnedMaterializedDatasetSelectionRef,
-} from "@/kernel/selection/selectionTypes";
 import type {
-  MaterializedDatasetResource,
   SolutionSetArtifactResource,
   SolutionSetDiscoveryPageResource,
   SolutionSetMemberResource,
@@ -33,6 +26,10 @@ import type {
 import { Badge } from "@/shared/ui/Badge";
 import { Button } from "@/shared/ui/Button";
 
+import { SavedMaterializedArtifactRow } from "./SavedMaterializedArtifactRow";
+export { materializedDatasetMatchesArtifact } from "./savedMaterializedDatasetBinding";
+
+const MATERIALIZED_FIELDS_PER_PAGE = 4;
 const MATERIALIZED_DATASET_SCHEMA = "fullmag.materialized_dataset.v1";
 
 type SavedResultsBrowserProps = Pick<ModuleProps, "kernel" | "moduleId">;
@@ -501,6 +498,7 @@ function SavedMemberArtifacts({
 }) {
   const [artifactCursor, setArtifactCursor] = useState<string | null>(null);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const [fieldPage, setFieldPage] = useState(0);
   const artifacts = useSolutionSetArtifactsResource(
     projectId,
     runId,
@@ -523,22 +521,16 @@ function SavedMemberArtifacts({
   );
   const artifactPageMatchesSolution =
     manifestDigest !== null && artifacts.data?.manifest_digest === manifestDigest;
-  const selectedArtifact = materializedArtifacts.find(
-    (artifact) => artifact.artifact_id === selectedArtifactId,
-  ) ?? null;
+  const fieldPageCount = Math.ceil(materializedArtifacts.length / MATERIALIZED_FIELDS_PER_PAGE);
+  const currentFieldPage = Math.min(fieldPage, Math.max(0, fieldPageCount - 1));
+  const visibleMaterializedArtifacts = materializedArtifacts.slice(
+    currentFieldPage * MATERIALIZED_FIELDS_PER_PAGE,
+    (currentFieldPage + 1) * MATERIALIZED_FIELDS_PER_PAGE,
+  );
   const [selectedScalarArtifactId, setSelectedScalarArtifactId] = useState<string | null>(null);
   const selectedScalarArtifact = scalarArtifacts.find(
     (artifact) => artifact.artifact_id === selectedScalarArtifactId,
   ) ?? null;
-  const metadata = useMaterializedDatasetResource(
-    projectId,
-    runId,
-    solution.solution_set_id,
-    solution.revision,
-    memberId,
-    selectedArtifactId,
-    { enabled: selectedArtifactId !== null && artifactPageMatchesSolution },
-  );
   const scalar = useSolutionScalarResource(
     projectId,
     runId,
@@ -555,67 +547,7 @@ function SavedMemberArtifacts({
       : null,
     { enabled: selectedScalarArtifact !== null && artifactPageMatchesSolution },
   );
-  const metadataMatchesSelection = materializedDatasetMatchesPath(
-    metadata.data,
-    projectId,
-    runId,
-    solution.solution_set_id,
-    solution.revision,
-    memberId,
-    selectedArtifactId,
-  );
   const scalarError = scalar.error ?? scalar.refreshError;
-  const metadataMatchesSelectedArtifact = materializedDatasetMatchesArtifact(
-    metadata.data,
-    selectedArtifact,
-  );
-  const metadataBindingError =
-    metadata.status === "ready" &&
-    metadata.data !== null &&
-    (!selectedArtifact || !metadataMatchesSelectedArtifact);
-  const canInspect =
-    metadata.status === "ready" &&
-    metadata.data !== null &&
-    artifactPageMatchesSolution &&
-    metadataMatchesSelection &&
-    metadataMatchesSelectedArtifact;
-  const inspectSelected = () => {
-    const data = metadata.data;
-    if (
-      !canInspect ||
-      !data ||
-      !selectedArtifact ||
-      !materializedDatasetMatchesArtifact(data, selectedArtifact)
-    ) return;
-    const ref: PinnedMaterializedDatasetSelectionRef =
-      pinnedMaterializedDatasetSelectionRef({
-        artifactId: data.artifact_id,
-        containingRevision: data.containing_solution_revision,
-        datasetId: data.dataset.dataset_id,
-        datasetRevision: data.dataset.revision,
-        fieldId: data.field_id,
-        itemId: data.item_id,
-        manifestObjectRef: data.manifest_object_ref,
-        memberId: data.member_id,
-        projectId: data.project_id,
-        runId: data.run_id,
-        sampleId: data.sample_id,
-        solutionSetId: data.solution_set_id,
-      });
-    kernel.selection.set(
-      {
-        kind: ref.kind,
-        label: data.dataset.dataset_id,
-        nodeId: ref.nodeId,
-        objectId: null,
-        ref,
-      },
-      moduleId,
-    );
-    if (selectionRefEquals(kernel.selection.get().ref, ref)) {
-      kernel.visualization.setSavedFieldPresentation(ref, data.field.descriptor.quantity_id, data.field.coverage.component_count);
-    }
-  };
 
   return (
     <section
@@ -627,7 +559,7 @@ function SavedMemberArtifacts({
           Materialized fields
         </h5>
         <p className="m-0 text-fm-xs text-fm-muted">
-          Choose a saved field to verify its manifest and inspect its source.
+          Choose a saved field by quantity and unit, then inspect its source.
         </p>
       </header>
       {artifacts.status === "loading" && !artifacts.data ? (
@@ -649,16 +581,33 @@ function SavedMemberArtifacts({
         </p>
       ) : artifactPageMatchesSolution ? (
         <ul className="m-0 grid min-w-0 list-none gap-1 p-0" aria-label="Materialized dataset artifacts">
-          {materializedArtifacts.map((artifact) => (
-            <li className="grid min-w-0" key={artifact.artifact_id}>
-            <ArtifactButton
-              artifact={artifact}
-              selected={selectedArtifactId === artifact.artifact_id}
-              onSelect={() => setSelectedArtifactId(artifact.artifact_id)}
-            />
+          {visibleMaterializedArtifacts.map((artifact) => (
+            <li className="grid min-w-0 gap-2" key={artifact.artifact_id}>
+              <SavedMaterializedArtifactRow
+                artifact={artifact}
+                kernel={kernel}
+                moduleId={moduleId}
+                projectId={projectId}
+                runId={runId}
+                solutionSetId={solution.solution_set_id}
+                revision={solution.revision}
+                memberId={memberId}
+                pageManifestMatches={artifactPageMatchesSolution}
+                selected={selectedArtifactId === artifact.artifact_id}
+                onSelect={() => setSelectedArtifactId(artifact.artifact_id)}
+              />
             </li>
           ))}
         </ul>
+      ) : null}
+      {artifactPageMatchesSolution && fieldPageCount > 1 ? (
+        <nav className="flex items-center gap-2" aria-label="Materialized field pages">
+          <Button size="sm" variant="ghost" disabled={currentFieldPage === 0}
+            onClick={() => setFieldPage(currentFieldPage - 1)}>Previous fields</Button>
+          <span className="text-fm-xs text-fm-muted">Fields page {currentFieldPage + 1} / {fieldPageCount}</span>
+          <Button size="sm" variant="ghost" disabled={currentFieldPage + 1 >= fieldPageCount}
+            onClick={() => setFieldPage(currentFieldPage + 1)}>Next fields</Button>
+        </nav>
       ) : null}
       {artifactPageMatchesSolution && artifacts.data?.next_after_artifact_id ? (
         <Button
@@ -668,41 +617,12 @@ function SavedMemberArtifacts({
           onClick={() => {
             setSelectedArtifactId(null);
             setSelectedScalarArtifactId(null);
+            setFieldPage(0);
             setArtifactCursor(artifacts.data?.next_after_artifact_id ?? null);
           }}
         >
           Next artifacts
         </Button>
-      ) : null}
-      {selectedArtifactId ? (
-        <div className="grid min-w-0 gap-2">
-          {metadataBindingError ? (
-            <p className="m-0 text-fm-xs text-fm-danger" role="alert">
-              The verified manifest does not match the selected artifact page entry; Inspector is blocked.
-            </p>
-          ) : null}
-          <p className="m-0 text-fm-xs text-fm-muted" role="status">
-            {metadataBindingError
-              ? "Manifest verification failed against the current artifact entry."
-              : metadata.status === "loading"
-              ? "Verifying the selected manifest…"
-              : metadata.status === "ready"
-                ? "Manifest verified. Open Inspector to view its details."
-                : metadata.error
-                  ? `Manifest unavailable: ${metadata.error.message}`
-                  : "Select the verified manifest to open its Inspector details."}
-          </p>
-          {canInspect ? (
-            <Button
-              className="justify-self-start"
-              size="sm"
-              variant="secondary"
-              onClick={inspectSelected}
-            >
-              Inspect pinned dataset
-            </Button>
-          ) : null}
-        </div>
       ) : null}
       <section className="grid min-w-0 gap-2 border-t border-fm-subtle pt-2" aria-label={`Scalar artifacts for member ${memberId}`}>
         <header className="grid min-w-0 gap-1">
@@ -836,39 +756,5 @@ function SolutionScalarDetails({ data }: { data: SolutionScalarResource }) {
         </div>
       ) : null}
     </dl>
-  );
-}
-
-export function materializedDatasetMatchesArtifact(
-  data: MaterializedDatasetResource | null,
-  artifact: SolutionSetArtifactResource | null,
-): boolean {
-  return Boolean(
-    data &&
-      artifact &&
-      data.artifact_id === artifact.artifact_id &&
-      data.manifest_object_ref === artifact.object_ref &&
-      data.manifest_byte_length === artifact.byte_length,
-  );
-}
-
-function materializedDatasetMatchesPath(
-  data: MaterializedDatasetResource | null,
-  projectId: string,
-  runId: string,
-  solutionSetId: string,
-  revision: string,
-  memberId: string,
-  artifactId: string | null,
-): boolean {
-  return Boolean(
-    data &&
-      artifactId &&
-      data.project_id === projectId &&
-      data.run_id === runId &&
-      data.solution_set_id === solutionSetId &&
-      data.containing_solution_revision === revision &&
-      data.member_id === memberId &&
-      data.artifact_id === artifactId,
   );
 }
