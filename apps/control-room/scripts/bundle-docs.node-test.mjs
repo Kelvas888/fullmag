@@ -7,6 +7,7 @@ import { test } from "node:test";
 import {
   bundleDocumentation,
   extractRelativeAssetPaths,
+  findBuiltDocsSource,
   injectEmbedAssetsHtml,
   isSkipped,
   parseDocnamesFromSearchIndex,
@@ -124,6 +125,46 @@ test("bundles local built docs and overlays fullmag-embed assets", async () => {
     assert.ok(nestedIndex.includes('src="../_static/fullmag-embed.js"'));
     assert.equal(embedCss, "/* embed css */");
     assert.equal(embedJs, "// embed js");
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("rejects stale local _build/html that lacks fullmag-embed assets when conf.py is present", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "fullmag-docs-stale-test-"));
+  try {
+    const fakeRepoRoot = join(tempRoot, "repo");
+    const fakeSiteDir = join(fakeRepoRoot, "public_docs", "site");
+    const fakeBuildDir = join(fakeSiteDir, "_build", "html");
+
+    await mkdir(join(fakeSiteDir, "physics"), { recursive: true });
+    await mkdir(join(fakeSiteDir, "changelog"), { recursive: true });
+    await mkdir(join(fakeBuildDir, "physics"), { recursive: true });
+    await mkdir(join(fakeBuildDir, "changelog"), { recursive: true });
+    await mkdir(join(fakeBuildDir, "_static"), { recursive: true });
+
+    await writeFile(join(fakeSiteDir, "conf.py"), "# conf", "utf-8");
+    await writeFile(join(fakeSiteDir, "physics", "index.md"), "# physics", "utf-8");
+    await writeFile(join(fakeSiteDir, "changelog", "index.md"), "# changelog", "utf-8");
+    await writeFile(join(fakeBuildDir, "index.html"), "<html></html>", "utf-8");
+    await writeFile(join(fakeBuildDir, "searchindex.js"), "Search.setIndex({})", "utf-8");
+    await writeFile(join(fakeBuildDir, "physics", "index.html"), "<html></html>", "utf-8");
+    await writeFile(join(fakeBuildDir, "changelog", "index.html"), "<html></html>", "utf-8");
+
+    const staleCandidate = await findBuiltDocsSource({
+      currentRepoRoot: fakeRepoRoot,
+      explicitBuildDir: fakeBuildDir,
+    });
+    assert.equal(staleCandidate, null);
+
+    await writeFile(join(fakeBuildDir, "_static", "fullmag-embed.css"), "/* css */", "utf-8");
+    await writeFile(join(fakeBuildDir, "_static", "fullmag-embed.js"), "// js", "utf-8");
+
+    const validCandidate = await findBuiltDocsSource({
+      currentRepoRoot: fakeRepoRoot,
+      explicitBuildDir: fakeBuildDir,
+    });
+    assert.equal(validCandidate, fakeBuildDir);
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
