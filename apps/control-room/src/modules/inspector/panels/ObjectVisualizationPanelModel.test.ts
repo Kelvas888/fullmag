@@ -2246,6 +2246,19 @@ describe("ObjectVisualizationPanelModel", () => {
       { disabled: true, label: "Demag field (not available yet)", value: "H_demag" },
       { disabled: true, label: "Effective field (not available yet)", value: "H_eff" },
     ]);
+
+    const zeeman = {
+      ...pending("H_ext", "External field", "full_domain"),
+      resolved_capability: { reason_code: "quantity_unsupported" },
+    };
+    expect(
+      visualizationQuantityItems("H_ext", "airbox", null, {
+        ...quantityCatalog,
+        quantities: [zeeman],
+      } as unknown as QuantityCatalogResource),
+    ).toEqual([
+      { disabled: true, label: "External field (not in this study)", value: "H_ext" },
+    ]);
   });
 
   it("keeps a ready target-scoped active quantity selectable without a global catalog entry", () => {

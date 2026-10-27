@@ -2397,7 +2397,13 @@ function pendingAirboxQuantityItems(
     )
     .map((quantity) => ({
       disabled: true,
-      label: `${quantity.label || quantity.id} (not available yet)`,
+      // A term the study does not contain (no external field, say) never
+      // becomes available; anything else is still waiting for the solver.
+      label: `${quantity.label || quantity.id} (${
+        quantity.resolved_capability?.reason_code === "quantity_unsupported"
+          ? "not in this study"
+          : "not available yet"
+      })`,
       value: quantity.id,
     }));
 }
