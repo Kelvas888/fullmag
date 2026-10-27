@@ -33,7 +33,7 @@ disk.m = fm.texture.vortex()
 monitor = jupyter.monitor(("mx", "my", "mz"), x_column="time")
 
 # %% Relax and run; the monitor output above updates while they execute.
-fm.relax(dt=1e-13, tolT=1e-4, max_steps=5_000)
+fm.relax(dt=1e-13, tolT=1e-4, max_steps=1_000)
 fm.b_ext(0.02, 0.0, 0.0)
 fm.run(0.2e-9)
 

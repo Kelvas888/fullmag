@@ -35,7 +35,7 @@ def point(b_y):
     layer.Ms, layer.Aex, layer.alpha = 800e3, 13e-12, 0.5
     layer.m = fm.texture.uniform(1, 0, 0)
     fm.b_ext(0.0, b_y, 0.0)
-    fm.relax(dt=1e-13, tolT=1e-4, max_steps=5_000)
+    fm.relax(dt=1e-13, tolT=1e-4, max_steps=1_000)
     return fm.m.average()
 
 

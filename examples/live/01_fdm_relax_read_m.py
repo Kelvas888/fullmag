@@ -36,7 +36,7 @@ layer.alpha = 0.5  # strong damping: a short relaxation
 layer.m = fm.texture.uniform(1, 1, 0)
 
 # %% Relax: a runtime command; returns when the run has finished.
-result = fm.relax(dt=1e-13, tolT=1e-4, max_steps=5_000)
+result = fm.relax(dt=1e-13, tolT=1e-4, max_steps=1_000)
 print("relax:", result.status, result.completion_status)
 
 # %% Read the magnetisation back as numpy.

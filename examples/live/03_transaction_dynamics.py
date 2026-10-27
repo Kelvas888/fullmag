@@ -35,7 +35,7 @@ strip.alpha = 0.5
 strip.m = fm.texture.uniform(1, 0.05, 0)
 
 # %% Relax the initial state.
-fm.relax(dt=1e-13, tolT=1e-4, max_steps=5_000)
+fm.relax(dt=1e-13, tolT=1e-4, max_steps=1_000)
 print("relaxed <m> =", fm.m.average())
 
 # %% One transaction: reverse field and low damping become one revision.
