@@ -161,3 +161,18 @@ budżetu CPU/pamięci grupy Docker. Decyzja użytkownika: v1 nie tworzy nowego t
 Wymagane dowody v1: przygotowana sesja FEM CPU w Docker DEV pokazuje przed Run `H_eff`,
 `torque` i `eden_total` w viewport; rekord jest osiągalny po GC; zmiana sceny nie adoptuje
 starego pakietu.
+
+### Dowody v1 (27.10.2026, grupa Docker DEV `prepared-fem-verify-20261027`, commit `6d9c238cb`)
+
+- FEM CPU, sesja interaktywna przed Compute: rekord `task_prepared_observation.v1` w stanie
+  `published` (10 obiektów CAS); katalog wielkości: `H_ex`, `H_demag`, `H_ext`, `H_eff`,
+  `torque`, `eden_ex`, `eden_demag`, `eden_ext`, `eden_total` w stanie `complete` (krok 0),
+  `/data/fields/torque/meta` z fizycznymi statystykami (|τ| 0,04–6,56 T dla losowego `m`).
+  Menu Coloring w Control Room oferuje te dziesięć wielkości jako aktywne.
+- FDM CPU po 4 krokach (ścieżka pakietu końcowego przez wspólny rdzeń ewaluatora): 18 wielkości
+  `complete`, w tym `E_*` i `mat_*`.
+- NOT VERIFIED: kolorowanie obiektu w viewport wybraną wielkością (żądanie zakresu `part`
+  zwraca 404 „mesh part not found” także dla `m` — osobny problem viewportu); energie globalne
+  `E_*` przed Compute nie są jeszcze widoczne w katalogu (pakiet je zawiera); bieg FEM CPU w tej
+  grupie kończył się `MPI_ABORT` przy starcie solvera niezależnie od ewaluacji (także gdy
+  ewaluator nie doszedł do MFEM) — do osobnej diagnozy.
