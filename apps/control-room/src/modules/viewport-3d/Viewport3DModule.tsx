@@ -1,4 +1,6 @@
 "use client";
+import { useSavedResultsPlaybackSelection } from "@/kernel/saved-results/useSavedResultsPlayback";
+import SavedResultsPlaybackViewport from "./SavedResultsPlaybackViewport";
 import { hasViewport3DQuantityData } from "./model/viewport3DQuantityData";
 import { Viewport3DFieldLabel } from "./Viewport3DFieldLabel";
 import { artifactRenderedSurfaceRanges } from "./model/artifactFieldOverlayModel";
@@ -1478,7 +1480,12 @@ interface Viewport3DFrameProps
   visualizationDebugSource: Viewport3DVisualizationDebugSource;
 }
 
-export default function Viewport3DModule({
+export default function Viewport3DModule(props: ModuleProps) {
+  const saved = useSavedResultsPlaybackSelection();
+  return saved ? <SavedResultsPlaybackViewport /> : <LiveViewport3DModule {...props} />;
+}
+
+function LiveViewport3DModule({
   kernel,
   moduleId,
   slotId,

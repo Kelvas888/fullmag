@@ -533,6 +533,25 @@ def _validate_mounts(
             raise CodegenError("frontend control namespace differs from the backend environment")
 
 
+def _source_mount_matches_selected(value: object, selected: Path) -> bool:
+    """Keep exact host identity while admitting inode-proven Docker Desktop WSL aliases."""
+    if _path_identity(value) == _path_identity(str(selected)):
+        return True
+    if not isinstance(value, str):
+        return False
+    match = re.fullmatch(
+        r"/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/([A-Za-z0-9][A-Za-z0-9._-]*)/([0-9a-f]{64})",
+        value,
+    )
+    if match is None:
+        return False
+    local_alias = Path("/mnt/wsl/docker-desktop-bind-mounts") / match.group(1) / match.group(2)
+    try:
+        return local_alias.is_dir() and selected.is_dir() and local_alias.samefile(selected)
+    except OSError:
+        return False
+
+
 def _running_service(
     project: str,
     service: str,
@@ -578,7 +597,7 @@ def _running_service(
     if not source_root or _path_identity(source_root) != _path_identity(str(selected)):
         raise CodegenError(f"{service} service environment is mounted from a different source checkout")
     source_mount = _mount_for(document, "/opt/fullmag/source")
-    if _path_identity(source_mount.get("Source")) != _path_identity(str(selected)):
+    if not _source_mount_matches_selected(source_mount.get("Source"), selected):
         raise CodegenError(f"{service} inspected source mount differs from the selected checkout")
     return container, document
 
@@ -953,6 +972,11 @@ def _publish_outputs(source: Path, outputs: Mapping[str, bytes], before: Mapping
         for name, data in outputs.items():
             destination = target_root / name
             handle, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=target_root)
+            # Generated public source must remain readable by the source group
+            # mounted into the unprivileged frontend (mkstemp defaults to 0600).
+            if os.name == "posix":
+                source_mode = stat.S_IMODE(destination.stat().st_mode) if destination.exists() else 0o644
+                os.fchmod(handle, source_mode | stat.S_IRGRP)
             with os.fdopen(handle, "wb", closefd=True) as stream:
                 stream.write(data)
                 stream.flush()
