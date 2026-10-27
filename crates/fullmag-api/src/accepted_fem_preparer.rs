@@ -375,7 +375,8 @@ fn store_prepared_bundle(
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
-            let object_ref = store.cas().put(&bytes).context("store prepared field chunk")?;
+            let object_ref = retry_preparation_store_writer_busy(|| store.cas().put(&bytes))
+                .context("store prepared field chunk")?;
             if !object_refs.contains(&object_ref) {
                 object_refs.push(object_ref.clone());
             }
@@ -417,9 +418,8 @@ fn store_prepared_bundle(
         unavailable_scopes: batch.unavailable_scopes,
         energies: batch.energies,
     };
-    let bundle_object_ref = store
-        .cas()
-        .put(&serde_json::to_vec(&bundle)?)
+    let bundle_bytes = serde_json::to_vec(&bundle)?;
+    let bundle_object_ref = retry_preparation_store_writer_busy(|| store.cas().put(&bundle_bytes))
         .context("store prepared observation bundle")?;
     if !object_refs.contains(&bundle_object_ref) {
         object_refs.push(bundle_object_ref.clone());
