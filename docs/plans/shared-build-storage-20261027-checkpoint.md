@@ -62,3 +62,11 @@ skilla `design-taste-frontend`, dodanego równolegle do mastera w
 `cc91b2550767e73f3b059ff94fdff466a77e46ef`. Zsynchronizowano branch i dodano
 wejście `.github/skills` wskazujące kanoniczną implementację, bez duplikacji
 zasobów lub osłabiania kontroli.
+
+PR #285 scalono jako `bc96b8395cbacdcc148a4ef4b05893ea3e13755b`; master
+zaktualizowano fast-forward. Rzeczywisty cleanup bezpiecznie zatrzymał się
+przed planem/usuwaniem na natywnych ścieżkach Windows obcych kontenerów.
+Poprawka używa istniejącego klasyfikatora ścieżek, nadal odrzuca UNC i aliasy
+POSIX. 14 retirement + 21 adapter + 5 finish tests: PASS. Odczytowy probe
+68 kontenerów, w tym 37 bindów Windows: PASS; niezależny bounded review: PASS.
+Poprawka wymaga osobnego follow-up PR przed końcowym cleanupem worktree.

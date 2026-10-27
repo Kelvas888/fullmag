@@ -476,10 +476,19 @@ def _check_consumers(documents: list[dict[str, Any]], identity: Mapping[str, str
                 if name in mounts:
                     raise CacheRetirementError(f"Container {document['Id']} still mounts private cache volume {name}")
             elif mount.get("Type") == "bind":
+                import docker_backend_volume_cache as cache
                 source = mount.get("Source")
-                if not isinstance(source, str) or "\\" in source:
-                    raise CacheRetirementError("Container bind-source inventory is ambiguous")
-                source = posixpath.normpath(source)
+                # Docker Desktop reports unrelated native Windows binds with
+                # drive letters, including mixed separators. They are not
+                # daemon-local named-volume paths. UNC aliases remain unknown.
+                if isinstance(source, str) and source.startswith(("\\\\", "//")):
+                    raise CacheRetirementError("Container UNC bind-source inventory is ambiguous")
+                try:
+                    source = cache._linux_bind_source(source)
+                except cache.BackendVolumeCacheError as error:
+                    raise CacheRetirementError("Container bind-source inventory is ambiguous") from error
+                if source is None:
+                    continue
                 for item in volumes:
                     root = item["mountpoint"].rstrip("/")
                     if source == root or source.startswith(root + "/") or root.startswith(source.rstrip("/") + "/"):
