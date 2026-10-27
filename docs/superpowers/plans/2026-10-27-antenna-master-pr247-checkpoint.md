@@ -549,3 +549,24 @@ StartedAt obu usług pozostają. Następny krok: kanoniczny preview przez
 
 Kontrola hosta potwierdziła około 69,16 GiB wolnego D:, powyżej dotychczasowej
 bramki 32 GiB. To pomiar pojemności, nie obietnica rozmiaru kolejnego buildu.
+
+
+## Zapis poprawki i utrwalenie regresji CI
+
+Commit `837cc5ce8b5fb23114dd96e9cddebe52104b76b4` zapisuje poprawkę private
+namespace i dokładnego parsera czasu wraz z 32 regresjami oraz raportem.
+Kanoniczny `just docker-dev-reconcile-iteration ... true` zakończył się exit0,
+`state=validated-only` dla dokładnego request-third SHA
+`34dd8aaf384a77e35edc3ab0e18102d4d080a0da7c3fe26da5da3441b9df9967`.
+Zastosowanie recovery jest osobną operacją; ten wynik nie jest dowodem
+wznowienia aplikacji ani nowego Solve.
+
+Do istniejącego kroku Docker contracts w bootstrap CI dopięto trzy istniejące
+entrypointy: `test_docker_volume_prestart_recovery`,
+`test_docker_terminal_prestart_recovery` i `test_docker_volume_reconcile`.
+Nie zmieniono job permissions ani wymaganych bramek. Przegląd dokładnych
+trzech linii i entrypointów bez Blocker/Required. Lokalna próba uruchomienia
+`test_bootstrap_workflow_contract` nie doszła do testów: zachowany obraz
+nie ma PyYAML. Istniejący workflow CI instaluje przypięte PyYAML przed jego
+własnym testem. Nie zmieniono obrazu ani wymagań dla tej korekty; wynik
+walidacji workflow w nowym CI pozostaje wymagany.
