@@ -79,6 +79,8 @@ RUNTIME_IMAGE_CONTEXT_FILES = (
     ("backend_source.py", "docker/all-in-one/backend_source.py"),
     ("backend_shared_store.py", "docker/all-in-one/backend_shared_store.py"),
     ("backend_shared_recovery.py", "docker/all-in-one/backend_shared_recovery.py"),
+    ("backend_compiler_cache.py", "docker/all-in-one/backend_compiler_cache.py"),
+    ("backend_group_retirement.py", "docker/all-in-one/backend_group_retirement.py"),
     ("backend_candidate_retirement.py", "docker/all-in-one/backend_candidate_retirement.py"),
     ("worker_cgroup_gate.py", "docker/all-in-one/worker_cgroup_gate.py"),
     (

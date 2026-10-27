@@ -55,32 +55,39 @@ def maintain(args):
             "config_sha256": args.config_sha256, "backend_container": backend_id},
             minimum_free_bytes=MIN_FREE_CONTROL_BYTES) as operation:
         attest()
-        command = [*docker_argv("exec"), backend_id, "/usr/local/bin/python3", "-B",
-                   "/opt/fullmag/backend_dev.py", "maintain-packages",
-                   "--max-shared-entries", str(args.max_shared_entries),
-                   "--max-shared-bytes", str(args.max_shared_bytes)]
-        # No client timeout: killing Docker exec would not prove the guest
-        # stopped. Interruptions retain the durable unknown-outcome lease.
-        operation["daemon_pending"] = True
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        tail = bytearray()
-        while chunk := process.stdout.read1(65536):
-            tail.extend(chunk)
-            if len(tail) > 256 * 1024:
-                del tail[:-256 * 1024]
-            operation["logger"].stdin.write(chunk)
-            operation["logger"].stdin.flush()
-        code = process.wait()
-        operation["daemon_pending"] = False
-        operation["receipt"]["exit_code"] = code
-        if code:
-            raise BuildControlError("Package maintenance failed; inspect the retained operation log")
-        try:
-            result = json.loads(bytes(tail).splitlines()[-1])
-        except (ValueError, IndexError) as error:
-            raise BuildControlError("Package maintenance returned no result receipt") from error
-        if result.get("schema") != "fullmag.package-maintenance.v1" or result.get("state") != "succeeded":
-            raise BuildControlError("Package maintenance result is invalid")
+        result = run_guest_maintenance(operation, backend_id,
+            max_shared_entries=args.max_shared_entries, max_shared_bytes=args.max_shared_bytes)
         control.write(operation["root"] + "/result.json", result)
         operation["receipt"].update(state="succeeded", result=result)
     return 0
+
+
+def run_guest_maintenance(operation, backend_id, *, max_shared_entries=8, max_shared_bytes=64 * 1024**3):
+    """Run after API readiness under the existing group lease, without stopping it."""
+    command = [*docker_argv("exec"), backend_id, "/usr/local/bin/python3", "-B",
+               "/opt/fullmag/backend_dev.py", "maintain-packages",
+               "--max-shared-entries", str(max_shared_entries),
+               "--max-shared-bytes", str(max_shared_bytes)]
+    # No client timeout: killing Docker exec would not prove the guest
+    # stopped. Interruptions retain the durable unknown-outcome lease.
+    operation["daemon_pending"] = True
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    tail = bytearray()
+    while chunk := process.stdout.read1(65536):
+        tail.extend(chunk)
+        if len(tail) > 256 * 1024:
+            del tail[:-256 * 1024]
+        operation["logger"].stdin.write(chunk)
+        operation["logger"].stdin.flush()
+    code = process.wait()
+    operation["daemon_pending"] = False
+    operation["receipt"]["exit_code"] = code
+    if code:
+        raise BuildControlError("Package maintenance failed; inspect the retained operation log")
+    try:
+        result = json.loads(bytes(tail).splitlines()[-1])
+    except (ValueError, IndexError) as error:
+        raise BuildControlError("Package maintenance returned no result receipt") from error
+    if result.get("schema") != "fullmag.package-maintenance.v1" or result.get("state") != "succeeded":
+        raise BuildControlError("Package maintenance result is invalid")
+    return result

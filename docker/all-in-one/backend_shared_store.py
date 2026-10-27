@@ -28,6 +28,10 @@ class StoreError(RuntimeError):
     pass
 
 
+class StoreBusy(StoreError):
+    """A live claim currently prevents maintenance."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -81,7 +85,7 @@ def locked(path, *, exclusive=True, timeout=3600):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise StoreError("shared cache is busy; lock wait expired")
+                    raise StoreBusy("shared cache is busy; lock wait expired")
                 time.sleep(min(0.2, max(0, deadline - time.monotonic())))
         yield
     finally:

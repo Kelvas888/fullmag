@@ -203,7 +203,7 @@ trasy. Nowa próba przechowuje konfigurację i wynik w wolumenie kontrolnym.
 
 ## 4. Miejsce i retencja
 
-Nowe grupy korzystają z [kontraktu współdzielenia i retencji](../../../../docs/guides/shared-build-storage.md). Po etapie stosuj przypięte `docker-dev-maintain-cache`; cleanup worktree nigdy nie usuwa całego `fullmag-shared-*`.
+Nowe grupy korzystają z [kontraktu współdzielenia i retencji](../../../../docs/guides/shared-build-storage.md). Po udanym zarządzanym starcie retencja pakietów i prywatnego incremental działa automatycznie; `docker-dev-maintain-cache` służy również do jawnego ponowienia. Przed usunięciem worktree `worktree-finish ... completed` wykonuje kwalifikowane sprzątanie jego prywatnych wolumenów/namespace; aktywny konsument blokuje zakończenie. Nigdy nie usuwa całego `fullmag-shared-*`.
 
 
 Stosuj [kontrakt danych builda](artifact-policy.md): mapa writerów, ograniczenie

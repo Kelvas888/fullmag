@@ -3254,7 +3254,9 @@ def _retention_receipt_identity(
     for field in BACKEND_BUILD_IDENTITY_FIELDS:
         if field not in build:
             _fail(f"{name} is missing build identity field {field}")
-    return source_mode, dict(build), dict(toolchain)
+    # Rotation links bind exact full receipts. Cache retention spans source and
+    # CUDA target changes within one stable toolchain/profile cache unit.
+    return source_mode, {field: build[field] for field in BACKEND_BUILD_IDENTITY_FIELDS}, dict(toolchain)
 
 
 def _retention_child_names(value: object, name: str) -> list[str]:
@@ -5859,11 +5861,19 @@ def _maintain_packages(args) -> int:
             try:
                 shared_result = shared.Store(Path(configured)).collect(
                     max_entries=args.max_shared_entries, max_bytes=args.max_shared_bytes)
+            except shared.StoreBusy:
+                shared_result = {"state": "deferred-busy", "reason": "another group holds a package claim"}
             except shared.StoreError as error:
                 _fail(str(error))
+        from backend_compiler_cache import BackendCompilerCacheError, collect as collect_compiler_cache
+        try:
+            compiler_result = collect_compiler_cache(build_root / "workspace")
+        except BackendCompilerCacheError as error:
+            _fail(str(error))
         print(json.dumps({"schema": "fullmag.package-maintenance.v1", "state": "succeeded",
                   "current_receipt_sha256": _sha256_bytes(raw),
-                  "retained": ["current", "direct-rollback"], "shared_cache": shared_result}, sort_keys=True))
+                  "retained": ["current", "direct-rollback"], "shared_cache": shared_result,
+                  "compiler_cache": compiler_result}, sort_keys=True))
     return 0
 
 

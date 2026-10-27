@@ -2338,6 +2338,10 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
             **post_build_start,
             "state": "consumed",
         }
+    if startup_environment.get("FULLMAG_SHARED_BACKEND_STORE"):
+        from docker_volume_cache_maintenance import run_guest_maintenance
+        operation["receipt"]["cache_maintenance"] = run_guest_maintenance(operation, backend_id)
+        control.write(operation["root"] + "/cache-maintenance.json", operation["receipt"]["cache_maintenance"])
     operation["receipt"].update(state="succeeded", backend_container=backend_id,
         frontend_container=frontend_id, url="http://127.0.0.1:" + str(port),
         source_commit=provenance["commit"], source_digest=provenance["source_digest"],

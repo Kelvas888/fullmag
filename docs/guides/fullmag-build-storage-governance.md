@@ -392,7 +392,11 @@ odpowiednie kroki. Nie obejmuje to starych, obcych worktree, cache ani wyników.
    obejmujący untracked files, unikalne zmiany, ownership, procesy, kontenery,
    mounty i linki. Z dostępnego cleanup executora — głównego checkoutu albo
    innego zachowanego checkoutu, którego nie usuwasz — wykonaj
-   `git worktree remove` dla pojedynczej zweryfikowanej ścieżki, bez `--force`.
+   najpierw `worktree-finish ... completed` w jeszcze istniejącym worktree.
+   Polecenie sprawdza ownera, brak kontenerów i usuwa zakwalifikowany prywatny
+   cache oraz namespace pakietów; nie usuwaj ręcznie ich wolumenów przed tym
+   krokiem, bo etykiety są dowodem właściciela namespace. Po receipcie cleanupu
+   wykonaj `git worktree remove` dla pojedynczej zweryfikowanej ścieżki, bez `--force`.
    Zweryfikuj brak wpisu
    w `git worktree list` i brak katalogu. Następnie usuń lokalny branch zadania
    dopiero po potwierdzeniu integracji: dla merge/fast-forward sprawdź ancestry,
@@ -402,8 +406,8 @@ odpowiednie kroki. Nie obejmuje to starych, obcych worktree, cache ani wyników.
    Git odmawia, zachowaj dane i zapisz powód.
 8. Zaktualizuj rekord pierwotnego worktree w `storage/index` (nie rekord
    głównego checkoutu): PR, merge commit, stan cleanupu, zachowane zasoby
-   i następny krok. Istniejący `worktree-finish` jedynie zapisuje stan;
-   nie tworzy PR, nie scala ani nie usuwa worktree. Zachowaj `worktree_id`
+   i następny krok. `worktree-finish ... completed` wykonuje kwalifikowaną
+   retencję Docker, lecz nie tworzy PR, nie scala ani nie usuwa worktree. Zachowaj `worktree_id`
    i ścieżkę rekordu przed usunięciem. Raport końcowy zawiera te dowody.
 
 Zadanie jest zakończone po integracji i cleanupie. Przy oczekiwaniu na CI,

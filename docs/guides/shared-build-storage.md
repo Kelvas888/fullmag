@@ -62,31 +62,52 @@ Blokada pnpm pozostaje zajęta przy niepewnym zakończeniu procesu aż do dowodu
 
 ## Retencja i zakończenie pracy
 
-Po etapie i przed zakończeniem zadania uruchom na zdrowej, przypiętej grupie:
+Po udanym starcie nowej grupy launcher automatycznie wykonuje retencję, już po
+osiągnięciu gotowości API/frontendu. Pod blokadą buildu zachowuje current oraz
+bezpośredni rollback, usuwa starszy zweryfikowany łańcuch i ogranicza prywatny
+Cargo incremental do 8 GiB zaalokowanych bloków plików. Usuwa najstarsze całe
+katalogi cache crate; następny build może odtworzyć brakujący incremental.
+Nie usuwa `deps`, native CMake ani źródeł. Zmiana układu Cargo, symlink lub obcy
+owner zatrzymuje operację zamiast rozszerzać zakres kasowania. Wynik trafia do
+`cache-maintenance.json` w receipcie startu. Zwykły restart kontenera poza
+launcherem nie uruchamia tego kroku.
+
+Wspólny cache gotowych pakietów zachowuje domyślnie do 8 wpisów i 64 GiB
+logicznych payloadów. Aktywna publikacja/użycie przez inną grupę odkłada globalny
+GC (`deferred-busy` w receipcie); kolejny udany zarządzany start ponawia próbę.
+Usunięcie wpisu cache nie usuwa hardlinków current/rollback innych grup. Te
+limity nie są kwotą całego dysku Docker ani całego Cargo target.
+
+Ręczne uruchomienie tej samej retencji na przypiętej zdrowej grupie:
 
 ```sh
 just docker-dev-maintain-cache <attempt> <config_sha256> <source_root>
 ```
 
-To `scripts/docker_dev.py maintain-cache`: waliduje zapisany sukces startu,
-źródło, ID kontenera/obrazu, konfigurację i ownership, a następnie zajmuje control
-lease. Helper backendu utrzymuje blokadę buildu, zachowuje current i bezpośredni
-rollback oraz usuwa wyłącznie starszy zweryfikowany łańcuch. Nie wykonuje skanów
-historycznych pakietów na krytycznej ścieżce startu API.
+Przed usunięciem zakończonego worktree zatrzymaj z drain i usuń dokładnie jego
+kontenery. Następnie, jeszcze z istniejącego worktree, uruchom:
 
-Wspólny cache zachowuje domyślnie do 8 wpisów i do 64 GiB logicznych payloadów.
-Limity można zmienić przez `--max-shared-entries` / `--max-shared-bytes`.
-GC nie działa podczas aktywnego publish/read claim. Usunięcie wpisu cache nie
-usuwa hardlinków current/rollback innych grup; bloki zwalniają się po usunięciu
-ostatniego linku. Limity cache nie są limitem całego dysku Docker.
+```sh
+just worktree-finish <task_id> <owner> <powód_i_dowód_integracji> completed
+```
 
-Przy kończeniu zadania zatrzymaj z drain i usuń dokładnie jego kontenery oraz
-nieużywane prywatne wolumeny build/frontend (i stary prywatny package, jeśli
-istniał). **Nigdy nie usuwaj `fullmag-shared-*` razem z pojedynczym worktree.**
-Katalog `groups/<unit_key>` wymaga osobnej kwalifikacji braku konsumentów,
-pinów i zachowania potrzebnych receiptów; ogólny `volume prune` jej nie zastępuje.
-Nie ma automatycznego kasowania katalogów zakończonych grup ani cache Cargo/pnpm;
-nie wolno deklarować, że ta zmiana ogranicza całe zużycie Dockera.
+`finish` wymaga dokładnego właściciela z rejestru i wykonuje kwalifikowaną
+retencję Docker pod lease grupy. Obejmuje wszystkie zweryfikowane prywatne
+wolumeny backend build/package i frontend tej grupy, także wcześniejszych
+konfiguracji, oraz odpowiadające im `groups/<unit_key>` we wspólnym magazynie.
+Aktywny lub zachowany kontener, obcy konsument, nieznana tożsamość albo błąd
+Dockera blokuje oznaczenie `completed`. Najpierw zapisuje trwały plan i znacznik
+zamykania; blokuje to nowe zarządzane starty tej grupy. Przerwaną operację należy
+wznowić tym samym poleceniem. Kontrolny receipt potwierdza usunięte zasoby.
+Dopiero potem usuń worktree i zintegrowany branch, a wynik zapisz w jego rekordzie.
+
+**Nigdy nie usuwaj całego `fullmag-shared-*` razem z pojedynczym worktree.**
+Wspólne pakiety, Cargo/pnpm, control, ledger, sesje i wyniki pozostają.
+Nie ma automatycznej migracji ani zbiorczego kasowania dawnych, nieznanych grup.
+Cargo registry/git i pnpm store są współdzielone, ale ta zmiana nie ustanawia
+ich wspólnego limitu bajtowego. Prywatny pełny target zostaje usunięty przy
+kwalifikowanym zakończeniu worktree; długotrwały master nadal wymaga obserwacji
+pozostałych części target i BuildKit.
 
 Dalsze migracje starych pakietów lub cleanup nieznanego stagingu wymagają
 inwentarza i jawnej kwalifikacji. Wiek wolumenu lub brak uruchomionego kontenera
@@ -105,3 +126,5 @@ zimnego i ciepłego uruchomienia; nie wynika z liczby przechodzących testów.
 
 Dokumentacja pnpm: [store na różnych filesystemach](https://pnpm.io/faq),
 [metoda importu pakietów](https://pnpm.io/settings#packageimportmethod).
+
+Dokumentacja Cargo: [profile incremental](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental), [target i miejsce na dysku](https://doc.rust-lang.org/cargo/faq.html).

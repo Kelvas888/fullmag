@@ -83,6 +83,22 @@ class SharedBackendIntegrationTests(unittest.TestCase):
             self.assertEqual((package / "backend-build-receipt.json").read_bytes(), before)
             self.assertEqual(len(list((control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir())), 1)
 
+    def test_retention_accepts_cuda_target_changes_in_the_verified_rotation_chain(self):
+        fixture = fixtures.BackendPackageTests()
+        original = fixture._receipt_for_manifest
+        targets = iter(['89-real', '90-real', '89-real', '90-real'])
+        def receipt(*args, **kwargs):
+            value = original(*args, **kwargs)
+            value['build']['cuda_architectures'] = next(targets)
+            return value
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(fixture, '_receipt_for_manifest', receipt):
+                package, control, _ = fixture._rotated_package_fixture(root, versions=3)
+            current, raw, _ = backend._validated_package(package, 'current', exclude_development_control=True)
+            backend._retain_package_backups(package, control, current, raw)
+            self.assertEqual(len(list((control / backend.PACKAGE_BACKUPS_DIRNAME).iterdir())), 1)
+
     def test_shared_cargo_changes_only_package_cache_home(self):
         with tempfile.TemporaryDirectory() as temporary:
             build = Path(temporary)

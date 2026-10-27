@@ -11,6 +11,10 @@
 1. `98cf116532f6e4ab16d32e9ddc673a89b9c0a9cb` — shared pnpm store, prywatne
    node_modules i Next, blokada instalacji powiązana z proofem końca procesów.
    Weryfikacja: 60 interpreted frontend tests; review diffu i lifecycle.
+2. `d63759018d84430c3be971de5ac1d316825f2dc2` — współdzielone pakiety backendu,
+   transport named volumes, Cargo cache, bezpieczna publikacja/recovery i jawna retencja.
+3. Końcowy etap dodaje automatyczną retencję po starcie oraz kwalifikowane
+   sprzątanie przy `worktree-finish completed`; hash zapisywany w raporcie integracji.
 
 ## Dowody przed integracją
 
@@ -26,7 +30,14 @@
   pełnym testem startu aplikacji.
 - Niezależne review wykryło ctime/link races i recovery building/ready/cleanup;
   poprawki i regresje dodane. Sam review nie jest qualification runtime.
-- Docker UID/mount/concurrent helper proof: IN PROGRESS.
+- Docker UID/mount/concurrent helper proof: PASS. Dwóch publisherów tego samego
+  klucza dało publisher + reuse; GC usunął cache, zachowując oba grupowe hardlinki.
+  7 kontenerów i 3 syntetyczne wolumeny zostały usunięte po ponownej kontroli.
+- Końcowe interpreted contracts w izolowanym Docker helperze: 371 tests PASS,
+  2 platform-dependent skips; hashe źródeł przed/po niezmienne.
+- W tym: 14 incremental cache tests, 11 host retirement, 7 guest retirement,
+  5 finish/maintenance tests. Review source: PASS po poprawkach wyścigu plan/lease,
+  Labels:null, błędnej nazwy volume i markerów archive/live.
 - Pełny build/start backend+frontend na finalnym źródle: NOT VERIFIED.
 - FDM/FEM CPU/GPU scientific qualification: poza zakresem tej zmiany.
 
@@ -34,7 +45,9 @@
 
 Zobacz [shared build storage](../guides/shared-build-storage.md). Nowe grupy
 używają współdzielonych cache; zachowane stare grupy nie są samoczynnie migrowane.
-Retencja jest jawną operacją poza startupem. Nie ma globalnego quota Docker ani
-automatycznego usuwania danych nieznanych/starych grup. Zachować cudze dirty
+Retencja pakietów i incremental działa automatycznie po gotowości zarządzanej
+grupy. `finish completed` usuwa zweryfikowany prywatny cache po drain i usunięciu
+kontenerów. Nie ma globalnego quota Docker ani zbiorczego usuwania danych
+nieznanych/starych grup. Limit incremental nie ogranicza całego target. Zachować cudze dirty
 submodules w głównym checkoutcie. PR, merge, fast-forward i cleanup własnego
 worktree pozostają wymaganymi krokami domknięcia.
