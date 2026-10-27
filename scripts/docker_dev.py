@@ -77,6 +77,10 @@ RUNTIME_IMAGE_CONTEXT_FILES = (
     ("Dockerfile.backend", "docker/all-in-one/Dockerfile.backend"),
     ("backend_dev.py", "docker/all-in-one/backend_dev.py"),
     ("backend_source.py", "docker/all-in-one/backend_source.py"),
+    ("backend_shared_store.py", "docker/all-in-one/backend_shared_store.py"),
+    ("backend_shared_recovery.py", "docker/all-in-one/backend_shared_recovery.py"),
+    ("backend_compiler_cache.py", "docker/all-in-one/backend_compiler_cache.py"),
+    ("backend_group_retirement.py", "docker/all-in-one/backend_group_retirement.py"),
     ("backend_candidate_retirement.py", "docker/all-in-one/backend_candidate_retirement.py"),
     ("worker_cgroup_gate.py", "docker/all-in-one/worker_cgroup_gate.py"),
     (
@@ -2563,6 +2567,12 @@ def _parser() -> argparse.ArgumentParser:
         "--timeout-seconds", type=float, default=None,
         help="optional observation deadline; expiration does not cancel or replay the script",
     )
+    maintenance = subparsers.add_parser("maintain-cache", help="retain current/direct rollback and bound shared packages in the pinned healthy group")
+    maintenance.add_argument("--attempt", required=True)
+    maintenance.add_argument("--config-sha256", required=True)
+    maintenance.add_argument("--source-root", type=Path, required=True)
+    maintenance.add_argument("--max-shared-entries", type=int, default=8)
+    maintenance.add_argument("--max-shared-bytes", type=int, default=64 * 1024**3)
     idle_restart = subparsers.add_parser("restart-idle-volume", help="Restart the pinned healthy backend only while no session is active")
     idle_restart.add_argument("--attempt", required=True)
     idle_restart.add_argument("--config-sha256", required=True)
@@ -2912,6 +2922,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.port = selected.port
         if args.action == "build":
             build(args)
+        elif args.action == "maintain-cache":
+            from docker_volume_cache_maintenance import maintain
+            maintain(args)
         elif args.action == "restart-idle-volume":
             from docker_volume_dev import restart_idle
             restart_idle(args)

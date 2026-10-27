@@ -633,9 +633,38 @@ def _backend_cache(control, operation, layout, selected, image, toolchain):
         return result.stdout.decode()
     relative = operation["root"] + "/backend-cache.json"
     layout = {**layout, "compose_project": control.project}
+    import docker_shared_build_storage as shared
+    planned = cache.prepare(layout, selected, image, layout["storage_root"],
+        source_root=selected, toolchain_image=toolchain,
+        control_volume_name=control.volume, control_namespace=control.namespace,
+        shared_packages=True)
+    def shared_docker(*args):
+        try:
+            return volume_docker(*args)
+        except cache.VolumeNotFound as error:
+            raise shared.VolumeNotFound(str(error)) from error
+    shared.ensure_volumes(shared_docker, planned["project_id"])
+    helper = control.helper_args(shared.INITIALIZER_SCRIPT, initialize=True)
+    extra = []
+    for mount in shared.initializer_mount_descriptors(planned["project_id"]):
+        extra += ["--mount", "type=volume,src=" + mount["source"] + ",dst=" + mount["target"] + ",volume-nocopy"]
+    for key, value in shared.initializer_environment(planned["unit_key"]).items():
+        extra += ["--env", key + "=" + value]
+    for key, value in shared.initializer_labels(planned["project_id"], planned["unit_key"]).items():
+        extra += ["--label", key + "=" + value]
+    helper[helper.index("--entrypoint"):helper.index("--entrypoint")] = extra
+    helper[helper.index(control.image)] = image
+    initialized = bounded_capture(helper, data=b"", timeout=180)
+    if initialized.returncode:
+        raise BuildControlError("Shared cache initialization failed: " + initialized.stderr.decode("utf-8", "replace"))
+    proof = shared.validate_initializer_receipt(initialized.stdout.decode(), planned["unit_key"])
+    control.write(operation["root"] + "/shared-storage.json", {
+        "schema": shared.SCHEMA, "project_id": planned["project_id"],
+        "volumes": shared.volume_descriptors(planned["project_id"]), "initialization": proof})
     profile = cache.prepare(layout, selected, image, layout["storage_root"], volume_docker,
         source_root=selected, toolchain_image=toolchain, active_consumers=consumers,
-        control_volume_name=control.volume, control_namespace=control.namespace)
+        control_volume_name=control.volume, control_namespace=control.namespace,
+        shared_packages=True)
     overlay = cache.maintenance_overlay(profile)
     overlay["name"] = control.project
     control.write(operation["root"] + "/cache-maintenance-compose.json", overlay)
@@ -2030,6 +2059,22 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         document["volumes"] = {**document.get("volumes", {}), **cache["overlay"]["volumes"],
             "frontend-build": {"name": frontend_volume, "external": True},
             "build-control": {"name": control.volume, "external": True}}
+        import docker_shared_build_storage as shared
+        shared_volumes = shared.volume_descriptors(cache["project_id"])
+        for service, role, compose_name, subpath, variable in (
+            (backend, shared.CARGO_ROLE, "shared-cargo", "home", "FULLMAG_SHARED_CARGO_HOME"),
+            (frontend, shared.PNPM_ROLE, "shared-pnpm", "store", "FULLMAG_SHARED_PNPM_STORE"),
+        ):
+            descriptor = shared_volumes[role]
+            document["volumes"][compose_name] = {"name": descriptor["name"], "external": True}
+            service["volumes"].append({"type": "volume", "source": compose_name,
+                "target": descriptor["target"], "volume": {"nocopy": True, "subpath": subpath}})
+            service["environment"][variable] = descriptor["target"]
+        operation["receipt"]["shared_storage"] = {
+            "schema": shared.SCHEMA, "project_id": cache["project_id"],
+            "package_group": cache["shared_package_subpath"],
+            "volumes": {role: value["name"] for role, value in shared_volumes.items()},
+        }
         if "x-fullmag-host-ledger-volume" in ledger_backend:
             descriptor = ledger_backend["x-fullmag-host-ledger-volume"]
             backend["x-fullmag-host-ledger-volume"] = descriptor
@@ -2293,6 +2338,10 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
             **post_build_start,
             "state": "consumed",
         }
+    if startup_environment.get("FULLMAG_SHARED_BACKEND_STORE"):
+        from docker_volume_cache_maintenance import run_guest_maintenance
+        operation["receipt"]["cache_maintenance"] = run_guest_maintenance(operation, backend_id)
+        control.write(operation["root"] + "/cache-maintenance.json", operation["receipt"]["cache_maintenance"])
     operation["receipt"].update(state="succeeded", backend_container=backend_id,
         frontend_container=frontend_id, url="http://127.0.0.1:" + str(port),
         source_commit=provenance["commit"], source_digest=provenance["source_digest"],
