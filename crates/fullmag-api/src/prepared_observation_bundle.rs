@@ -49,8 +49,8 @@ pub(crate) struct PreparedObservationField {
     pub(crate) binary: Value,
 }
 
-/// Layout of a prepared FEM magnetization, identical to the live API's
-/// published prepared state so evaluated fields share its carrier.
+/// Layout of the live API's published prepared FEM magnetization.
+#[allow(dead_code)]
 pub(crate) fn prepared_fem_magnetization_layout(node_count: usize) -> Value {
     json!({"backend": "fem", "location": "node", "node_count": node_count})
 }

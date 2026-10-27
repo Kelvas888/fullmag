@@ -332,7 +332,10 @@ fn evaluate_prepared_fem_fields(
     if let BackendPlanIR::Fem(plan) = &mut cpu_plan.backend_plan {
         plan.mfem_device_string = Some("cpu".into());
     }
-    let layout = crate::prepared_observation_bundle::prepared_fem_magnetization_layout(values.len());
+    // The evaluator installs m into its own plan copy and requires the exact
+    // canonical state-space layout of that plan.
+    let layout = fullmag_runner::study_magnetization_layout_for_plan(&cpu_plan)
+        .map_err(|error| error.to_string())?;
     let request = fullmag_runner::PreparedMaterializationRequest {
         plan: &cpu_plan,
         problem,
