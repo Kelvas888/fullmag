@@ -38,6 +38,64 @@ Testy użyły publicznego modelu geometrii i rzeczywistej woksylizacji,
 bez buildu ani instalowania zależności na hoście. Kontrola diffu PASS.
 To dowód geometrii źródłowej, nie kwalifikacja solvera.
 
+## Etap 2 — własność buforów Newell
+
+`newell.rs::split_kernel_plane_regions_mut` rozdziela przez `split_at_mut`
+płaszczyznę zerową, dodatnie płaszczyzny oraz region ujemny z pominięciem
+środkowego zerowego paddingu. `kernel_planes_mut` przekazuje każdemu workerowi
+wyłącznie jego płaszczyzny. Tensor jest liczony raz na komórkę, bez dodatkowych
+alokacji per komórka. Usunięto `UnsafeSyncSlice` i tworzenie nakładających się
+referencji `&mut` z surowych wskaźników.
+
+Dodany test Rust porównuje sześć składowych z bezpośrednią całką par komórek,
+padding i wynik na 1 oraz 4 wątkach. Test pozostaje **NOT VERIFIED** — nie
+był kompilowany ani wykonywany z powodu zakazu kompilacji testów.
+`rustfmt --check`, `git diff --check` i niezależny review źródeł: PASS.
+Review sprawdził też przypadki `nz=0,1,2`, bez twierdzenia o dowodzie runtime.
+
+## Integracja i kontrole
+
+- Etap geometrii: `eafe4811690b2c554ac377954844a1a3d3a374a4`.
+- Połączenie mastera: `4d0590cf56c28f60c6eeeb5aac1148c050d90b3b`, bez konfliktów.
+  Zachowane poprawki mastera dotyczące retirement i pojedynczego komunikatu
+  o błędach pola w viewportcie.
+- 73 testy Python dotyczące retirement i 7 testów readiness: PASS.
+- Walidator zmienionej dokumentacji naukowej: PASS.
+- Hook commita merge wykonał React Doctor, ale jego lint zakończył się błędem
+  narzędzia `Unexpected discriminant 7 for TSTypeName`; wynik jest niepełny.
+  Nie traktować tego skanu jako zielonego dowodu UI.
+
+## Blokada zarządzanego buildu
+
+Grupa: `fullmag-worktree-viz-parity-fixes-20261027-5b749a9673c78c81`.
+Toolchain, obraz development i obraz backendu przygotowane przez launcher
+w Docker BuildKit. Nie zbudowano jeszcze aplikacji backendowej.
+
+Próba startu `7d885a90260f4943bd23de9d3f96b055` zakończyła się
+`outcome-unknown-resources-retained` podczas tworzenia sieci
+`fullmag-net-7fe412b3870c5c8a`:
+
+> all predefined address pools have been fully subnetted
+
+Wolumen kontrolny:
+`fullmag-build-control-fullmag-worktree-viz-parity-fixes-20261027-5b749a9673c78c81-7fe412b3870c5c8a`.
+Szczegóły buildu i receipty pozostają w tym wolumenie, bez kopiowania do
+hostowego storage. Nie ponowiono niejednoznacznego startu ani nie usuwano
+cudzych sieci, kontenerów, cache lub wyników. Istniejący launcher nie oferuje
+konfiguracji jawnego subnetu dla pojedynczej grupy.
+
+## Retencja etapu
+
+Własne obrazy BuildKit i wolumen kontrolny pozostają potrzebne do wznowienia
+oraz zachowania receiptów. Wolumeny build/package nie mają jeszcze
+zweryfikowanego następcy, więc nie kwalifikują się do usunięcia. Rejestr
+worktree pozostaje aktywny do wyjaśnienia blokady. Główny ext4 przy preflight
+miał około 3.4 GiB wolnego; build-data nadal należą do wolumenów Docker,
+nie tego hostowego katalogu. Nie wykonano prune ani usuwania danych.
+
 ## Stan
 
-WIP: poprawka bezpieczeństwa równoległego kernela i bramki integracji w toku.
+**BLOCKED przed merge**: potrzebna zgodna ścieżka uruchomienia grupy po
+rozwiązaniu wyczerpania pul adresowych Docker. Następnie build aplikacji,
+kontrole frontendu, runtime/browser/WebGL, CI i merge PR #264. Poprawki
+źródłowe oraz review nie zastępują tych brakujących dowodów.
