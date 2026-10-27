@@ -626,10 +626,17 @@ fn load_durable_projection(
                 task.lifecycle,
                 fullmag_session::FmsTaskLifecycle::Running
                     | fullmag_session::FmsTaskLifecycle::Stopping
-            )
+            ) || (matches!(task.lifecycle,
+                    fullmag_session::FmsTaskLifecycle::Succeeded
+                    | fullmag_session::FmsTaskLifecycle::Failed
+                    | fullmag_session::FmsTaskLifecycle::Interrupted
+                    | fullmag_session::FmsTaskLifecycle::Cancelled)
+                && task_order.get(&task.task_id).is_some_and(|order| matches!(
+                    accepted.lowered.steps[*order].kind,
+                    fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. })))
         })
         .filter_map(|task| task_order.get(&task.task_id).map(|order| (*order, task)))
-        .max_by_key(|(order, _)| *order);
+        .max_by_key(|(order, task)| observation_priority(task.lifecycle, *order));
     let mut live_observation_identity = None;
     let mut live_observation_sequence = None;
     let mut live_magnetization_sequence = None;
@@ -649,6 +656,7 @@ fn load_durable_projection(
                         && cursor.live_observation_identity.as_deref() == Some(identity.as_str())
                 })
                 .and_then(|cursor| cursor.live_magnetization_sequence);
+            let observation_result = (|| {
             let observation = crate::accepted_study_worker::read_accepted_live_observation(
                 store_root,
                 &context.run_id,
@@ -661,6 +669,44 @@ fn load_durable_projection(
             .map_err(|error| {
                 ApiError::conflict(format!("read accepted live observation: {error:#}"))
             })?;
+            if previous_cursor.filter(|cursor| cursor_matches_context(cursor, context)
+                && cursor.live_observation_identity.as_deref() == Some(identity.as_str()))
+                .and_then(|cursor| cursor.live_observation_sequence)
+                .zip(observation.as_ref().map(|value| value.header.sequence))
+                .is_some_and(|(previous, next)| next < previous)
+            {
+                return Err(ApiError::conflict("accepted live observation sequence regressed"));
+            }
+            if let Some((cursor, next)) = previous_cursor
+                .filter(|cursor| cursor_matches_context(cursor, context)
+                    && cursor.live_observation_identity.as_deref() == Some(identity.as_str()))
+                .zip(observation.as_ref())
+            {
+                if let Some(previous) = cursor.stage_execution.stages.iter()
+                    .find(|stage| stage.stage_id.as_deref() == Some(step_id.as_str()))
+                    .and_then(|stage| stage.antenna_progress.as_ref())
+                {
+                    let Some(progress) = next.header.operation_progress.as_ref() else {
+                        return Err(ApiError::conflict("antenna observation changed its payload kind"));
+                    };
+                    if !crate::accepted_study_worker::accepted_antenna_progress::follows(previous, progress)
+                        || (cursor.live_observation_sequence == Some(next.header.sequence) && previous != progress)
+                    {
+                        return Err(ApiError::conflict("antenna observation progress regressed or changed without a revision"));
+                    }
+                }
+            }
+            if observation.as_ref().is_some_and(|observation| {
+                let is_antenna = matches!(accepted.lowered.steps[order].kind,
+                    fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. });
+                is_antenna != observation.header.operation_progress.is_some()
+            }) {
+                return Err(ApiError::conflict("accepted live observation kind differs from its study step"));
+            }
+                Ok(observation)
+            })();
+            let observation = observation_diagnostic_result(
+                observation_priority(task.lifecycle, order).0, observation_result)?;
             live_observation_identity = Some(identity);
             live_observation_sequence = observation
                 .as_ref()
@@ -1089,21 +1135,7 @@ fn build_stage_execution(
         if let Some((_, observation)) = live_observation.filter(|(_, observation)| {
             observation.header.step_id == step.step_id
         }) {
-            let stats = &observation.header.stats;
-            if stats.time.is_finite()
-                && stats.time >= 0.0
-                && stats.dt.is_finite()
-                && stats.dt >= 0.0
-            {
-                record.applied_step = Some(stats.step);
-                record.applied_time_seconds = Some(stats.time);
-                record.progress_label = Some("Solver update".to_owned());
-                record.progress_detail = Some(format!(
-                    "step {}; time {:.9e} s; dt {:.9e} s",
-                    stats.step, stats.time, stats.dt
-                ));
-                record.last_progress_unix_ms = Some(observation.header.written_at_unix_ms);
-            }
+            apply_observation_stage_progress(&mut record, observation);
         }
         stages.push(record);
     }
@@ -1113,11 +1145,32 @@ fn build_stage_execution(
     ))
 }
 
+fn observation_priority(lifecycle: fullmag_session::FmsTaskLifecycle, order: usize) -> (bool, usize) {
+    (matches!(lifecycle, fullmag_session::FmsTaskLifecycle::Running
+        | fullmag_session::FmsTaskLifecycle::Stopping), order)
+}
+
+fn observation_diagnostic_result(
+    active: bool,
+    result: Result<Option<crate::accepted_study_worker::AcceptedLiveObservation>, ApiError>,
+) -> Result<Option<crate::accepted_study_worker::AcceptedLiveObservation>, ApiError> {
+    // A terminal diagnostic cannot veto the authoritative durable outcome.
+    if active { result } else { Ok(result.unwrap_or(None)) }
+}
+
 fn refresh_live_stage_progress(
     stage_execution: &mut crate::types::StageExecutionState,
     live_observation: Option<&(usize, crate::accepted_study_worker::AcceptedLiveObservation)>,
 ) {
     let Some((_, observation)) = live_observation else {
+        for stage in &mut stage_execution.stages {
+            if stage.antenna_progress.take().is_some() {
+                stage.progress_percent = None;
+                stage.progress_label = None;
+                stage.progress_detail = None;
+                stage.last_progress_unix_ms = None;
+            }
+        }
         return;
     };
     let Some(stage) = stage_execution.stages.iter_mut().find(|stage| {
@@ -1125,20 +1178,38 @@ fn refresh_live_stage_progress(
     }) else {
         return;
     };
-    let stats = &observation.header.stats;
-    if stats.time.is_finite()
-        && stats.time >= 0.0
-        && stats.dt.is_finite()
-        && stats.dt >= 0.0
-    {
-        stage.applied_step = Some(stats.step);
-        stage.applied_time_seconds = Some(stats.time);
-        stage.progress_label = Some("Solver update".to_owned());
-        stage.progress_detail = Some(format!(
-            "step {}; time {:.9e} s; dt {:.9e} s",
-            stats.step, stats.time, stats.dt
-        ));
+    apply_observation_stage_progress(stage, observation);
+}
+
+fn apply_observation_stage_progress(
+    stage: &mut crate::types::StageExecutionRecord,
+    observation: &crate::accepted_study_worker::AcceptedLiveObservation,
+) {
+    if let Some(progress) = observation.header.operation_progress {
+        stage.antenna_progress = Some(progress);
+        stage.applied_step = None;
+        stage.applied_time_seconds = None;
+        // This percentage describes field targets only, never durable completion.
+        stage.progress_percent = (matches!(progress.phase,
+            fullmag_runner::AntennaOperationPhase::EvaluatingField
+            | fullmag_runner::AntennaOperationPhase::ValidatingResult
+            | fullmag_runner::AntennaOperationPhase::PublishingResult))
+            .then_some(100.0 * progress.completed_targets as f64 / progress.total_targets as f64);
+        stage.progress_label = Some(progress.phase.as_str().into());
+        stage.progress_detail = Some(format!("field targets {}/{}; source cells {}; elapsed {:.1} s",
+            progress.completed_targets, progress.total_targets, progress.source_cells, progress.elapsed_seconds));
         stage.last_progress_unix_ms = Some(observation.header.written_at_unix_ms);
+    } else if let Some(stats) = observation.header.stats.as_ref() {
+        if stats.time.is_finite() && stats.time >= 0.0
+            && stats.dt.is_finite() && stats.dt >= 0.0 {
+            stage.antenna_progress = None;
+            stage.applied_step = Some(stats.step);
+            stage.applied_time_seconds = Some(stats.time);
+            stage.progress_label = Some("Solver update".to_owned());
+            stage.progress_detail = Some(format!("step {}; time {:.9e} s; dt {:.9e} s",
+                stats.step, stats.time, stats.dt));
+            stage.last_progress_unix_ms = Some(observation.header.written_at_unix_ms);
+        }
     }
 }
 
@@ -2461,8 +2532,8 @@ async fn apply_projection(
             }
         }
     }
-    if let Some((_, observation)) = projection.live_observation.as_ref() {
-        let stats = &observation.header.stats;
+    if let Some(stats) = projection.live_observation.as_ref()
+        .and_then(|(_, observation)| observation.header.stats.as_ref()) {
         if stats.kind.is_physical_observation() {
             let row = crate::types::ScalarRow {
                 kind: stats.kind.clone(),
@@ -4113,4 +4184,92 @@ mod operation_profile_projection_tests {
         assert!(replace_operation_profile(&mut current, profile).unwrap());
         assert_eq!(execution, serde_json::to_value(&current.operation_samples[0].execution_config).unwrap());
     }
+}
+
+
+#[cfg(test)]
+mod antenna_operation_progress_projection_tests {
+    #[test]
+    fn completed_field_sampling_is_not_a_durable_completed_stage_or_llg_step() {
+        let mut stage = crate::session::accepted_stage_record(
+            "antenna-step", None, crate::types::StageLifecycleState::Failed);
+        stage.applied_step = Some(99);
+        stage.applied_time_seconds = Some(1.0);
+        let progress = fullmag_runner::AntennaOperationProgress {
+            phase: fullmag_runner::AntennaOperationPhase::PublishingResult,
+            completed_targets: 1145, total_targets: 1145, source_cells: 1856,
+            elapsed_seconds: 7985.0,
+        };
+        let observation = crate::accepted_study_worker::AcceptedLiveObservation {
+            header: crate::accepted_study_worker::AcceptedLiveObservationHeader {
+                schema_version: crate::accepted_study_worker::ACCEPTED_LIVE_OBSERVATION_SCHEMA.into(),
+                run_id: "run".into(), task_id: "task".into(), step_id: "antenna-step".into(),
+                attempt_id: "attempt".into(), ownership_epoch: 1, realization: "fem_cpu".into(),
+                sequence: 5, written_at_unix_ms: 1000, stats: None,
+                operation_progress: Some(progress), magnetization: None,
+            },
+            magnetization_values: None, fields: Vec::new(),
+        };
+        super::apply_observation_stage_progress(&mut stage, &observation);
+        assert_eq!(stage.status, crate::types::StageLifecycleState::Failed);
+        assert_eq!(stage.progress_percent, Some(100.0));
+        assert_eq!(stage.applied_step, None);
+        assert_eq!(stage.applied_time_seconds, None);
+        assert_eq!(stage.completed_step, None);
+        assert_eq!(stage.antenna_progress, Some(progress));
+        let published = crate::schemas::runtime::AntennaOperationProgressResource::from(&progress);
+        assert_eq!(published.phase, "publishing_result");
+    }
+    #[test]
+    fn running_task_wins_over_a_later_terminal_antenna_diagnostic() {
+        use fullmag_session::FmsTaskLifecycle as Life;
+        let tasks = [(0, Life::Running), (1, Life::Succeeded)];
+        let chosen = tasks.into_iter().max_by_key(|(order, life)| super::observation_priority(*life, *order)).unwrap();
+        assert_eq!(chosen.0, 0);
+        assert_eq!(super::observation_priority(Life::Stopping, 0), (true, 0));
+        assert_eq!(super::observation_priority(Life::Failed, 1), (false, 1));
+    }
+
+    #[test]
+    fn invalid_terminal_diagnostic_cannot_block_outcome_or_keep_stale_progress() {
+        use crate::types::StageLifecycleState as Stage;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runs/run-a/worker-attempts/task-a/attempt-a/epoch-1");
+        std::fs::create_dir_all(&path).unwrap();
+        let foreign_header = serde_json::json!({
+            "schema_version": crate::accepted_study_worker::ACCEPTED_LIVE_OBSERVATION_SCHEMA,
+            "run_id": "run-a", "task_id": "task-a", "step_id": "step-a",
+            "attempt_id": "foreign-attempt", "ownership_epoch": 1,
+            "realization": "fem_cpu", "sequence": 2, "written_at_unix_ms": 100,
+            "operation_progress": { "phase": "publishing_result", "completed_targets": 20,
+                "total_targets": 20, "source_cells": 1856, "elapsed_seconds": 20.0 }
+        });
+        for bytes in [b"{".to_vec(), serde_json::to_vec(&foreign_header).unwrap()] {
+            std::fs::write(path.join(crate::accepted_study_worker::ACCEPTED_LIVE_OBSERVATION_FILE), bytes).unwrap();
+            let read = || crate::accepted_study_worker::read_accepted_live_observation(
+                root.path(), "run-a", "task-a", "step-a", "attempt-a", 1, None)
+                .map_err(|error| super::ApiError::conflict(format!("{error:#}")));
+            assert!(super::observation_diagnostic_result(true, read()).is_err());
+            for status in [Stage::Failed, Stage::Completed] {
+                let observation = super::observation_diagnostic_result(false, read()).unwrap();
+                assert!(observation.is_none());
+                let mut stage = crate::session::accepted_stage_record("step-a", None, status);
+                stage.antenna_progress = Some(fullmag_runner::AntennaOperationProgress {
+                    phase: fullmag_runner::AntennaOperationPhase::EvaluatingField,
+                    completed_targets: 4, total_targets: 20, source_cells: 1856, elapsed_seconds: 10.0,
+                });
+                stage.progress_percent = Some(20.0);
+                let mut stages = crate::session::accepted_stage_execution_state(
+                    vec![stage], crate::types::RuntimeLifecycleState::Failed);
+                super::refresh_live_stage_progress(&mut stages, None);
+                assert_eq!(stages.stages[0].status, status);
+                assert_eq!(stages.stages[0].antenna_progress, None);
+                assert_eq!(stages.stages[0].progress_percent, None);
+            }
+        }
+        // A sequence/phase validation failure is also diagnostic-only after termination.
+        assert!(super::observation_diagnostic_result(false,
+            Err(super::ApiError::conflict("observation sequence regressed"))).unwrap().is_none());
+    }
+
 }

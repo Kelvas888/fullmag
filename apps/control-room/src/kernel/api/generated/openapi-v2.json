@@ -3681,6 +3681,41 @@
         ],
         "type": "string"
       },
+      "AntennaOperationProgressResource": {
+        "description": "Operation progress is independent of the LLG integration clock.",
+        "properties": {
+          "completed_targets": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "elapsed_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "source_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_targets": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "phase",
+          "completed_targets",
+          "total_targets",
+          "source_cells",
+          "elapsed_seconds"
+        ],
+        "type": "object"
+      },
       "AntennaPortBranchResource": {
         "additionalProperties": false,
         "properties": {
@@ -42455,6 +42490,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "antenna_progress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaOperationProgressResource"
+              }
             ]
           },
           "antenna_solve_stage_id": {

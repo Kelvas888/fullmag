@@ -7225,3 +7225,42 @@ extern "C" {
         profile: *mut fullmag_fem_surface_rt0_profile_result_v1,
     ) -> i32;
 }
+
+/// Optional operation observer; no physical state or field payload.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_antenna_operation_progress_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub phase: u32,
+    pub reserved: u32,
+    pub completed_targets: u64,
+    pub total_targets: u64,
+    pub source_cells: u64,
+    pub elapsed_seconds: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct fullmag_fem_antenna_operation_observer_v1 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub callback: Option<unsafe extern "C" fn(*mut c_void, *const fullmag_fem_antenna_operation_progress_v1)>,
+    pub user_data: *mut c_void,
+}
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<fullmag_fem_antenna_operation_progress_v1>() == 56);
+    assert!(std::mem::size_of::<fullmag_fem_antenna_operation_observer_v1>() == 32);
+};
+extern "C" {
+    pub fn fullmag_fem_solve_prepared_closed_loop_rt0_surface_observed_v1(
+        request: *const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1,
+        result: *mut fullmag_fem_prepared_closed_loop_rt0_surface_result_v1,
+        charge: *mut fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1,
+        source: *mut fullmag_fem_prepared_closed_loop_source_snapshot_result_v2,
+        profile: *mut fullmag_fem_surface_rt0_profile_result_v1,
+        observer: *const fullmag_fem_antenna_operation_observer_v1,
+    ) -> i32;
+}

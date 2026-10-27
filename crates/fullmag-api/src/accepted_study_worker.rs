@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 #[path = "accepted_solver_profile.rs"]
 pub(crate) mod accepted_solver_profile;
+#[path = "accepted_antenna_progress.rs"]
+pub(crate) mod accepted_antenna_progress;
 
 #[path = "accepted_worker_execution_receipt.rs"]
 mod accepted_worker_execution_receipt;
@@ -80,7 +82,10 @@ pub(crate) struct AcceptedLiveObservationHeader {
     pub(crate) sequence: u64,
     pub(crate) written_at_unix_ms: u64,
     /// Bounded scalar runner statistics of the latest accepted step.
-    pub(crate) stats: fullmag_runner::StepStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stats: Option<fullmag_runner::StepStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operation_progress: Option<fullmag_runner::AntennaOperationProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) magnetization: Option<AcceptedLiveMagnetizationRef>,
 }
@@ -452,7 +457,8 @@ impl AcceptedLiveObservationWriter {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0),
-            stats: stats.clone(),
+            stats: Some(stats.clone()),
+            operation_progress: None,
             magnetization: self.current_magnetization.clone(),
         };
         let bytes = serde_json::to_vec(&header).context("serialize live observation header")?;
@@ -705,6 +711,7 @@ pub(crate) fn read_accepted_live_observation(
     {
         bail!("accepted live observation identity differs from its task attempt");
     }
+    accepted_antenna_progress::validate_header_payload(&header)?;
     let mut magnetization_values = None;
     let mut fields = Vec::new();
     if let Some(reference) = header.magnetization.as_ref() {
@@ -2867,23 +2874,22 @@ fn execute_accepted_closed_loop_worker_start(
     };
     write_immutable_attempt_receipt(&attempt,WORKER_EXECUTION_STARTED_RECEIPT,&WorkerExecutionStartedReceipt {identity:identity.clone()})?;
     let mut storage=prepare_accepted_project_storage(&accepted_step.problem,store,accepted,accepted_step,&identity,&attempt)?;
-    let execution:Result<AcceptedRunnerExecution>=(|| {
-        let result = if let Some(config) = crate::accepted_solver_profile::config(&accepted.run.specification.parameters)? {
-            let mut profile = fullmag_runner::SolverProfileState::new(config.clone());
-            let result = fullmag_runner::execute_antenna_closed_loop_inspection_profiled_typed(
-                &input, &requested_execution, &output_id, interrupt_requested, &config, &mut profile);
+    let operation_started = Instant::now();
+    let execution:Result<AcceptedRunnerExecution>=accepted_antenna_progress::with_progress(
+        &attempt, accepted_step, &input, |observer| {
+        let config = crate::accepted_solver_profile::config(&accepted.run.specification.parameters)?;
+        let mut profile = fullmag_runner::SolverProfileState::new(config.clone().unwrap_or_default());
+        let result = fullmag_runner::execute_antenna_closed_loop_inspection_observed_typed(
+            &input, &requested_execution, &output_id, interrupt_requested,
+            config.as_ref(), &mut profile, Some(observer));
+        if config.is_some() {
             if let Err(error) = crate::accepted_solver_profile::persist(&attempt, &identity, &profile) {
-                // Explicit persisted profiling is a diagnostic contract. Refuse
-                // publication on failure, retaining the original native cause.
                 return Err(match result {
                     Ok(_) => error.context("persist accepted operation diagnostics before terminal outcome"),
                     Err(native) => anyhow::Error::new(native).context(format!("operation diagnostics persistence also failed: {error:#}")),
                 });
             }
-            result
-        } else {
-            fullmag_runner::execute_antenna_closed_loop_inspection_typed(&input,&requested_execution,&output_id,interrupt_requested)
-        };
+        }
         let artifacts=match result {
             Ok(artifacts)=>artifacts,
             Err(_error) if interrupt_requested.is_some_and(|flag|flag.load(Ordering::Acquire))=>return Ok(AcceptedRunnerExecution {
@@ -2907,6 +2913,13 @@ fn execute_accepted_closed_loop_worker_start(
             return Ok(AcceptedRunnerExecution {
         terminal_publication: None,status:RunStatus::Cancelled,completed_step_count:0,outputs:vec![],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None});
         }
+        observer(fullmag_runner::AntennaOperationProgress {
+            phase: fullmag_runner::AntennaOperationPhase::PublishingResult,
+            completed_targets: input.field_sampling.positions_xyz_m.len() as u64,
+            total_targets: input.field_sampling.positions_xyz_m.len() as u64,
+            source_cells: input.conductivity_spm_per_element.len() as u64,
+            elapsed_seconds: operation_started.elapsed().as_secs_f64(),
+        });
         let output=StudyOutputPayload {port_id:"inspection".into(),case_id:case_id.into(),codec_id:fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_ID.into(),codec_version:fullmag_application::ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION.into(),bytes};
         let root=storage.as_ref().map(|value|value.data_root()).unwrap_or(&attempt);
         // One owned framing file; no untrusted payload path is extracted to the filesystem.
@@ -2918,7 +2931,7 @@ fn execute_accepted_closed_loop_worker_start(
         persist_completed_worker_execution(store,&attempt,&identity,&study_step.outputs,RunStatus::Completed,1,std::slice::from_ref(&output),None,None)?;
         Ok(AcceptedRunnerExecution {
         terminal_publication: None,status:RunStatus::Completed,completed_step_count:1,outputs:vec![output],attempt_output_dir:attempt.clone(),recovered_from_receipt:false,accepted_state_ref:None,observation_source:None})
-    })();
+    });
     if let Some(storage)=&mut storage {
         match &execution { Ok(result) if result.status==RunStatus::Cancelled=>storage.note_outcome("cancelled",None),Err(error)=>storage.note_outcome("failed",Some(format!("{error:#}"))),_=>{} }
         storage.finish(execution.as_ref().is_ok_and(|result|result.status==RunStatus::Completed),&attempt)?;

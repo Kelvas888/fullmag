@@ -14,6 +14,18 @@ namespace fullmag::fem::oersted {
 inline constexpr char surface_rt0_operator_version[] =
     "fem_oersted_rt0_surface.mpfr128_160_rndn_etoff.inspection.v1";
 
+enum class AntennaProgressPhase : std::uint32_t {
+    preparing_source, solving_potential, reconstructing_current, evaluating_field,
+    validating_result, publishing_result
+};
+struct SurfaceRt0ProgressObserver {
+    void *user_data;
+    void (*callback)(void *, AntennaProgressPhase, std::uint64_t, std::uint64_t, std::uint64_t) noexcept;
+    void emit(AntennaProgressPhase phase, std::uint64_t completed,
+        std::uint64_t total, std::uint64_t source_cells) const noexcept
+    { callback(user_data, phase, completed, total, source_cells); }
+};
+
 // Private FEM CPU kernel; the accepted-source adapter owns ABI, dispatch and policy.
 enum class SurfaceRt0WorkKind : std::size_t {
     source_target_pairs,
@@ -150,6 +162,7 @@ SurfaceRt0Result evaluate_surface_rt0(
     const SurfaceRt0Tolerances &tolerances,
     const SurfaceRt0PeakRss &peak_rss,
     SurfaceRt0WorkReport &report,
-    SurfaceRt0PhaseReport *phase_report = nullptr);
+    SurfaceRt0PhaseReport *phase_report = nullptr,
+    const SurfaceRt0ProgressObserver *observer = nullptr);
 
 } // namespace fullmag::fem::oersted

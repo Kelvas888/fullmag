@@ -5,7 +5,7 @@ mod closed_loop_field_evidence;
 mod closed_loop_public_inspection;
 pub use closed_loop_public_inspection::{load_antenna_closed_loop_inspection_bytes, load_published_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes, LoadedAntennaClosedLoopInspection};
 pub(crate) mod closed_loop_execution;
-pub use closed_loop_execution::{execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, execute_antenna_closed_loop_inspection_profiled_typed, ClosedLoopExecutionError, KnownNativeCallFailure};
+pub use closed_loop_execution::{execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, execute_antenna_closed_loop_inspection_profiled_typed, execute_antenna_closed_loop_inspection_observed_typed, ClosedLoopExecutionError, KnownNativeCallFailure};
 pub(crate) mod direct_quadrature_v2;
 pub(crate) mod surface_rt0_evidence_v1;
 pub(crate) mod closed_loop_identity_v2;

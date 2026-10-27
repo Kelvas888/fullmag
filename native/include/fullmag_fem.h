@@ -1524,6 +1524,42 @@ FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_
     fullmag_fem_surface_rt0_profile_result_v1 *profile);
 
 
+/* Optional thin operation diagnostics. The callback must not block, allocate,
+ * access the session store, throw, or retain the transient progress pointer.
+ * Completed targets count only fully validated field values, never LLG steps. */
+#define FULLMAG_FEM_ANTENNA_OPERATION_PROGRESS_ABI_VERSION 1u
+#define FULLMAG_FEM_ANTENNA_PREPARING_SOURCE 0u
+#define FULLMAG_FEM_ANTENNA_SOLVING_POTENTIAL 1u
+#define FULLMAG_FEM_ANTENNA_RECONSTRUCTING_CURRENT 2u
+#define FULLMAG_FEM_ANTENNA_EVALUATING_FIELD 3u
+#define FULLMAG_FEM_ANTENNA_VALIDATING_RESULT 4u
+#define FULLMAG_FEM_ANTENNA_PUBLISHING_RESULT 5u
+typedef struct {
+    uint32_t abi_version, reserved_flags;
+    uint64_t struct_size;
+    uint32_t phase, reserved;
+    uint64_t completed_targets, total_targets, source_cells;
+    double elapsed_seconds;
+} fullmag_fem_antenna_operation_progress_v1;
+typedef struct {
+    uint32_t abi_version, reserved_flags;
+    uint64_t struct_size;
+    void (*callback)(void *user_data, const fullmag_fem_antenna_operation_progress_v1 *progress);
+    void *user_data;
+} fullmag_fem_antenna_operation_observer_v1;
+#if defined(__cplusplus) && INTPTR_MAX == INT64_MAX
+static_assert(sizeof(fullmag_fem_antenna_operation_progress_v1) == 56, "antenna progress ABI");
+static_assert(sizeof(fullmag_fem_antenna_operation_observer_v1) == 32, "antenna observer ABI");
+#endif
+FULLMAG_FEM_API int fullmag_fem_solve_prepared_closed_loop_rt0_surface_observed_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile,
+    const fullmag_fem_antenna_operation_observer_v1 *observer);
+
+
 
 typedef struct {
     uint32_t abi_version;

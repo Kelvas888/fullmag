@@ -583,6 +583,8 @@ pub async fn get_stage_execution(
                         .clone()
                         .unwrap_or_else(|| stage_id_for_index(index)),
                     antenna_solve_stage_id: record.antenna_solve_stage_id.clone(),
+                    antenna_progress: record.antenna_progress.as_ref()
+                        .map(crate::schemas::runtime::AntennaOperationProgressResource::from),
                     index: index as u32,
                     label: Some(format!("Stage {}", index + 1)),
                     kind,

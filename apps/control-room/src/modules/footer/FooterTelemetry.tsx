@@ -44,6 +44,7 @@ import {
 } from "@/kernel/runtime/runtimeStateDisplay";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
+import { Progress } from "@/shared/ui/Progress";
 import { formatTorqueT } from "@/shared/domain/physics/torqueUnits";
 import { hasEmptyObjectMagneticModel } from "@/shared/domain/physics/objectMagneticModel";
 
@@ -161,7 +162,9 @@ export function FooterTelemetry({
         <span className="text-fm-xs text-fm-secondary whitespace-nowrap truncate">
           {telemetry.onlineTitle}
         </span>
-        {telemetry.frequencyDomainProgress ? (
+        {telemetry.antennaProgress ? (
+          <AntennaFieldProgressStrip progress={telemetry.antennaProgress} />
+        ) : telemetry.frequencyDomainProgress ? (
           <>
             <span className="w-px h-3 bg-fm-subtle flex-shrink-0 mx-fm-1" aria-hidden="true" />
             <FrequencyDomainProgressStrip progress={telemetry.frequencyDomainProgress} />
@@ -377,6 +380,7 @@ export function buildFooterTelemetryModel(
 ) {
   if (!status) return {
     awaitingCompute: false,
+    antennaProgress: null,
     frequencyDomainProgress: null,
     stageProgressNotice: null,
     metrics: [] as FooterTelemetryMetric[],
@@ -516,6 +520,7 @@ export function buildFooterTelemetryModel(
   return {
     awaitingCompute: userSolvePhase === "awaiting_user_solve",
     frequencyDomainProgress,
+    antennaProgress: null,
     stageProgressNotice,
     metrics: ([
       {
@@ -679,6 +684,7 @@ export function buildFooterTelemetryModel(
 }
 
 type FooterAntennaStage = {
+  active: boolean;
   clockKey: string | null;
   record: StageExecutionResource["stages"][number];
 };
@@ -709,7 +715,7 @@ function resolveFooterAntennaStage(
       execution.request_scope_epoch, execution.run_id, record.stage_id,
       record.antenna_solve_stage_id, record.started_at_unix_ms])
     : null;
-  return { clockKey, record };
+  return { active: record.status === "running" && execution.runtime_state === "running", clockKey, record };
 }
 
 function validStageTimestamp(value: unknown): value is number {
@@ -728,37 +734,97 @@ function useAntennaStageClock(identity: string | null): number | null {
   return clock?.identity === identity ? clock.nowMs : null;
 }
 
+const ANTENNA_PHASE_LABELS = {
+  preparing_source: "Preparing source",
+  solving_potential: "Solving electric potential",
+  reconstructing_current: "Reconstructing current density",
+  evaluating_field: "Evaluating Oersted field",
+  validating_result: "Validating numerical result",
+  publishing_result: "Publishing result",
+} as const;
+
+type FooterAntennaProgress = {
+  active: boolean;
+  percent: number | null;
+  samples: string;
+};
+
+function readAntennaProgress(record: FooterAntennaStage["record"]) {
+  const progress = record.antenna_progress;
+  if (!progress || !Object.hasOwn(ANTENNA_PHASE_LABELS, progress.phase) ||
+    !Number.isSafeInteger(progress.completed_targets) || progress.completed_targets < 0 ||
+    !Number.isSafeInteger(progress.total_targets) || progress.total_targets <= 0 ||
+    progress.completed_targets > progress.total_targets ||
+    !Number.isSafeInteger(progress.source_cells) || progress.source_cells <= 0 ||
+    !Number.isFinite(progress.elapsed_seconds) || progress.elapsed_seconds < 0) return null;
+  const phase = progress.phase as keyof typeof ANTENNA_PHASE_LABELS;
+  if ((["preparing_source", "solving_potential", "reconstructing_current"].includes(phase) &&
+      progress.completed_targets !== 0) ||
+    (["validating_result", "publishing_result"].includes(phase) &&
+      progress.completed_targets !== progress.total_targets)) return null;
+  return { ...progress, phase };
+}
+
+function AntennaFieldProgressStrip({ progress }: { progress: FooterAntennaProgress }) {
+  return (
+    <div className="fm-footer-telemetry__antenna-progress" data-active={progress.active}>
+      <span className="fm-footer-telemetry__antenna-progress-label">Field samples</span>
+      <Progress
+        value={progress.percent}
+        aria-label="Antenna field sampling"
+        aria-valuetext={progress.percent === null ? "Progress not reported" : progress.samples}
+      />
+      <span className="fm-footer-telemetry__antenna-progress-count">
+        {progress.percent === null ? "Progress not reported" : progress.samples}
+      </span>
+    </div>
+  );
+}
+
 function buildAntennaSolveTelemetry(stage: FooterAntennaStage, nowMs: number | null) {
   const { record } = stage;
   const state = record.status;
   const label = state.charAt(0).toUpperCase() + state.slice(1);
   const reason = record.state_transition_reason ?? record.reason ?? null;
+  const numerical = readAntennaProgress(record);
   const start = record.started_at_unix_ms;
   const end = state === "running" ? nowMs : record.completed_at_unix_ms;
-  const elapsed = validStageTimestamp(start) && validStageTimestamp(end) && end >= start
-    ? formatDuration((end - start) / 1_000)
-    : "Not reported";
-  const percent = record.progress_percent;
-  const progress = typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 100
-    ? `${COMPACT_DECIMAL_FORMAT.format(percent)}%` : "Not reported";
-  const results = state === "running" ? "Awaiting result"
-    : state === "pending" ? "Awaiting execution"
-      : state === "completed" ? "Check saved results" : "Not completed";
+  const elapsed = numerical ? formatDuration(numerical.elapsed_seconds)
+    : validStageTimestamp(start) && validStageTimestamp(end) && end >= start
+      ? formatDuration((end - start) / 1_000) : "Not reported";
+  const fieldSamplingStarted = numerical &&
+    ["evaluating_field", "validating_result", "publishing_result"].includes(numerical.phase);
+  const percent = fieldSamplingStarted ? 100 * numerical.completed_targets / numerical.total_targets : null;
+  const samples = numerical
+    ? `${INTEGER_FORMAT.format(numerical.completed_targets)} / ${INTEGER_FORMAT.format(numerical.total_targets)}`
+    : "Progress not reported";
+  const phase = numerical ? ANTENNA_PHASE_LABELS[numerical.phase] : "Progress not reported";
+  const publication = state === "failed" ? "Not completed"
+    : state === "cancelled" ? "Cancelled"
+      : state === "completed" ? "Check saved results"
+        : numerical?.phase === "publishing_result" ? "Publishing"
+          : state === "pending" ? "Awaiting execution" : "Awaiting result";
   const metric = (id: string, title: string, value: string, detail: string): FooterTelemetryMetric => ({
     id, label: title, value, detail, subdetail: "Authoritative antenna stage execution",
     icon: <Radio size={14} aria-hidden="true" />,
   });
   return {
+    antennaProgress: { active: stage.active, percent, samples } satisfies FooterAntennaProgress,
     awaitingCompute: false,
     frequencyDomainProgress: null,
     stageProgressNotice: null,
     metrics: [
       metric("antenna-state", "Solve state", label, reason ? String(reason) : "Antenna field solve lifecycle"),
-      metric("antenna-elapsed", "Stage elapsed", elapsed, "Wall-clock stage duration; not CPU time or LLG simulation time"),
-      metric("antenna-progress", "Progress", progress, record.progress_detail ?? record.progress_label ?? "No numerical progress estimate is asserted"),
-      metric("antenna-results", "Results", results, "Completion does not establish saved-result availability or verification"),
+      metric("antenna-phase", "Phase", phase, "Source preparation, electric solve, current reconstruction, field evaluation and publication"),
+      metric("antenna-targets", "Field samples", samples, "Completed observation points; this is not overall stage completion"),
+      metric("antenna-source", "Source cells", numerical ? INTEGER_FORMAT.format(numerical.source_cells) : "Not reported", "Conductor cells contributing to the field integral"),
+      metric("antenna-elapsed", numerical ? "Operation elapsed" : "Stage elapsed", elapsed,
+        numerical
+          ? "Wall-clock elapsed since the antenna operation runner started; stage preparation may begin earlier"
+          : "Wall-clock duration from the published stage timestamps; not CPU time or LLG simulation time"),
+      metric("antenna-results", "Publication", publication, "100% field sampling does not establish publication or saved-result verification"),
     ],
-    onlineDetail: "Live session channel",
+    onlineDetail: "Session state",
     onlineTitle: state === "running" ? "Online / Active" : "Online / Antenna solve",
     statusDetail: reason ? String(reason) : "Antenna field solve lifecycle",
     statusState: state,

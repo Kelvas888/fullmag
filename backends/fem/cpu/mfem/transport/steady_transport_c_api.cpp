@@ -7,6 +7,7 @@
  */
 
 #include "fullmag_fem.h"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -2164,7 +2165,8 @@ int solve_rt0(
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *prepared_snapshot = nullptr,
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *surface_request = nullptr,
     fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *surface_result = nullptr,
-    fullmag::fem::oersted::SurfaceRt0PhaseReport *phase_report = nullptr)
+    fullmag::fem::oersted::SurfaceRt0PhaseReport *phase_report = nullptr,
+    const fullmag::fem::oersted::SurfaceRt0ProgressObserver *observer = nullptr)
 {
     validate_rt0_header(request, result);
     const bool coincident = request.closure_kind == FULLMAG_FEM_STEADY_TRANSPORT_RT0_CLOSURE_CLOSED_GEOMETRY &&
@@ -2330,6 +2332,8 @@ int solve_rt0(
             rt0_require(digest_bytes(periodic.prepared_execution_digest) == digest_bytes(text(prepared_request->binding.expected_prepared_execution_digest)),
                 "prepared execution digest differs from independently computed caller binding");
         }
+        if (observer) observer->emit(fullmag::fem::oersted::AntennaProgressPhase::solving_potential,
+            0, surface_request->target_points_xyz_len / 3, device_mesh_view.n_elements);
         periodic_snapshot =
             fullmag::fem::transport::PeriodicChargePotentialSolver::Solve(periodic);
         if (prepared_request) {
@@ -2352,6 +2356,8 @@ int solve_rt0(
         build.periodic_charge_potential.reset();
     }
 
+    if (observer) observer->emit(fullmag::fem::oersted::AntennaProgressPhase::reconstructing_current,
+        0, surface_request->target_points_xyz_len / 3, device_mesh_view.n_elements);
     const auto view = fullmag::fem::transport::ConservativeCurrentView::Build(build);
     if (prepared_snapshot) {
         rt0_require(view->canonical_balance_certificate_bytes().size() <= prepared_snapshot->canonical_balance_certificate_capacity,
@@ -2672,7 +2678,7 @@ int solve_rt0(
     if (surface_request && surface_result) {
         rt0_require(prepared_snapshot != nullptr,"surface RT0 requires the accepted prepared source snapshot");
         fullmag::fem::antenna_field_solve::evaluate_accepted_surface_rt0(*view,
-            prepared_snapshot->accepted_source_state_digest,*surface_request,*surface_result,phase_report);
+            prepared_snapshot->accepted_source_state_digest,*surface_request,*surface_result,phase_report,observer);
     }
     if (charge_snapshot != nullptr) {
         const auto &potential = *view->charge_potential_vertex_values_v();
@@ -3328,7 +3334,8 @@ bool surface_ranges_are_disjoint(
     fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
     fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
-    fullmag_fem_surface_rt0_profile_result_v1 *profile)
+    fullmag_fem_surface_rt0_profile_result_v1 *profile,
+    const fullmag_fem_antenna_operation_observer_v1 *observer)
 {
     if(!request || request->abi_version!=FULLMAG_FEM_SURFACE_RT0_ABI_VERSION ||
         request->reserved_flags!=0 || request->struct_size!=sizeof(*request))return false;
@@ -3385,7 +3392,7 @@ bool surface_ranges_are_disjoint(
             if(!input(c,1,1))return false;if(*c=='\0')return true;
         }return false;
     };
-    if(!input(request,1,sizeof(*request)))return false;
+    if(!input(request,1,sizeof(*request)) || (observer && !input(observer,1,sizeof(*observer))))return false;
     const auto &r=request->rt0;const auto &m=r.base.mesh;const auto &b=r.binding;
     if(!input(request->target_points_xyz,request->target_points_xyz_len,sizeof(double)) ||
         !text(request->options.policy_version))return false;
@@ -3517,11 +3524,15 @@ static int solve_prepared_closed_loop_rt0_surface(
     fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
     fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
     fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
-    fullmag_fem_surface_rt0_profile_result_v1 *profile)
+    fullmag_fem_surface_rt0_profile_result_v1 *profile,
+    const fullmag_fem_antenna_operation_observer_v1 *observer = nullptr)
 {
+    if (observer && (observer->abi_version != FULLMAG_FEM_ANTENNA_OPERATION_PROGRESS_ABI_VERSION ||
+        observer->reserved_flags != 0 || observer->struct_size != sizeof(*observer) || !observer->callback))
+        return FULLMAG_FEM_ERR_INVALID;
     // Alias refusal is deliberately mutation-free, including error strings.
     try {
-        if(!surface_ranges_are_disjoint(request,result,charge,source,profile))return FULLMAG_FEM_ERR_INVALID;
+        if(!surface_ranges_are_disjoint(request,result,charge,source,profile,observer))return FULLMAG_FEM_ERR_INVALID;
     } catch (...) { return FULLMAG_FEM_ERR_INTERNAL; }
     if(profile) {
         profile->available=0;profile->accounting_issue=0;profile->operator_wall_time_ns=0;
@@ -3530,6 +3541,26 @@ static int solve_prepared_closed_loop_rt0_surface(
 #if FULLMAG_HAS_MFEM_STACK
     std::optional<fullmag::fem::oersted::SurfaceRt0PhaseReport> phases;
     if(profile)phases.emplace();
+    struct Observation {
+        const fullmag_fem_antenna_operation_observer_v1 *target;
+        std::chrono::steady_clock::time_point started;
+    } observation{observer, {}};
+    std::optional<fullmag::fem::oersted::SurfaceRt0ProgressObserver> progress;
+    if (observer) {
+        observation.started = std::chrono::steady_clock::now();
+        progress.emplace(fullmag::fem::oersted::SurfaceRt0ProgressObserver{&observation,
+            [](void *context, fullmag::fem::oersted::AntennaProgressPhase phase,
+                std::uint64_t completed, std::uint64_t total, std::uint64_t source_cells) noexcept {
+                const auto &state = *static_cast<Observation *>(context);
+                const fullmag_fem_antenna_operation_progress_v1 value{
+                    FULLMAG_FEM_ANTENNA_OPERATION_PROGRESS_ABI_VERSION, 0, sizeof(value),
+                    static_cast<std::uint32_t>(phase), 0, completed, total, source_cells,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now()-state.started).count()};
+                try { state.target->callback(state.target->user_data, &value); } catch (...) {}
+            }});
+        progress->emit(fullmag::fem::oersted::AntennaProgressPhase::preparing_source, 0,
+            request->target_points_xyz_len / 3, request->rt0.base.mesh.cell_types_len);
+    }
     struct ProfileExport {
         fullmag_fem_surface_rt0_profile_result_v1 *target;
         fullmag::fem::oersted::SurfaceRt0PhaseReport *report;
@@ -3569,7 +3600,7 @@ static int solve_prepared_closed_loop_rt0_surface(
         fullmag::fem::antenna_field_solve::validate_surface_rt0_request(*request);
         const auto adapter=prepared_rt0_adapter(request->rt0);
         return solve_rt0(adapter,result->rt0,nullptr,nullptr,nullptr,nullptr,charge,nullptr,
-            &source->source,&request->rt0,source,request,result,phases?&*phases:nullptr);
+            &source->source,&request->rt0,source,request,result,phases?&*phases:nullptr,progress?&*progress:nullptr);
 #else
         set_error(result,"surface RT0 requires FULLMAG_USE_MFEM_STACK=ON");
         return FULLMAG_FEM_ERR_UNAVAILABLE;
@@ -3577,6 +3608,17 @@ static int solve_prepared_closed_loop_rt0_surface(
     });
 }
 
+
+extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_observed_v1(
+    const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,
+    fullmag_fem_prepared_closed_loop_rt0_surface_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge,
+    fullmag_fem_prepared_closed_loop_source_snapshot_result_v2 *source,
+    fullmag_fem_surface_rt0_profile_result_v1 *profile,
+    const fullmag_fem_antenna_operation_observer_v1 *observer)
+{
+    return solve_prepared_closed_loop_rt0_surface(request,result,charge,source,profile,observer);
+}
 
 extern "C" int fullmag_fem_solve_prepared_closed_loop_rt0_surface_v1(
     const fullmag_fem_prepared_closed_loop_rt0_surface_request_v1 *request,

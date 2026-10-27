@@ -128,7 +128,10 @@ std::uint64_t product(std::uint64_t a, std::uint64_t b)
 class Work {
 public:
     Work(const SurfaceRt0WorkLimits &limits, const SurfaceRt0PeakRss &rss,
-        SurfaceRt0WorkReport &report) : limits_(limits), rss_(rss), report_(report),
+        SurfaceRt0WorkReport &report, const SurfaceRt0ProgressObserver *observer = nullptr,
+        std::uint64_t total_targets = 0, std::uint64_t source_cells = 0) :
+        limits_(limits), rss_(rss), report_(report), observer_(observer),
+        total_targets_(total_targets), source_cells_(source_cells),
         started_(Clock::now()), target_started_(started_)
     {
         for (std::size_t i = 0; i < surface_rt0_work_kind_count; ++i)
@@ -178,6 +181,17 @@ public:
             throw std::runtime_error("surface RT0 wall-time exhausted");
         if (report_.last_sampled_lifetime_peak_rss_bytes > limits_.maximum_lifetime_peak_rss_bytes)
             throw std::runtime_error("surface RT0 sampled process peak RSS exhausted");
+        if (observer_ && now - last_progress_ >= std::chrono::milliseconds(500)) {
+            last_progress_ = now;
+            observer_->emit(AntennaProgressPhase::evaluating_field, completed_targets_, total_targets_, source_cells_);
+        }
+    }
+    void complete_target()
+    {
+        if (!observer_) return;
+        ++completed_targets_;
+        last_progress_ = Clock::now();
+        observer_->emit(AntennaProgressPhase::evaluating_field, completed_targets_, total_targets_, source_cells_);
     }
     void reserve_output(std::uint64_t count, std::uint64_t size)
     {
@@ -216,6 +230,9 @@ private:
     const SurfaceRt0WorkLimits &limits_;
     const SurfaceRt0PeakRss &rss_;
     SurfaceRt0WorkReport &report_;
+    const SurfaceRt0ProgressObserver *observer_ = nullptr;
+    std::uint64_t total_targets_ = 0, source_cells_ = 0, completed_targets_ = 0;
+    Clock::time_point last_progress_{};
     Clock::time_point started_, target_started_;
     bool active_ = false;
     std::uint64_t events_ = 0;
@@ -816,12 +833,14 @@ SurfaceRt0Result evaluate_surface_rt0(
     const SurfaceRt0Tolerances &tolerances,
     const SurfaceRt0PeakRss &peak_rss,
     SurfaceRt0WorkReport &report,
-    SurfaceRt0PhaseReport *phase_report)
+    SurfaceRt0PhaseReport *phase_report,
+    const SurfaceRt0ProgressObserver *observer)
 {
     PhaseProfiler phases(phase_report);
     report = {};
     tolerances_valid(tolerances);
-    Work work(limits,peak_rss,report);
+    Work work(limits,peak_rss,report,observer,ordered_targets_m.size(),source.size());
+    if (observer) observer->emit(AntennaProgressPhase::evaluating_field, 0, ordered_targets_m.size(), source.size());
     preflight(source,ordered_targets_m,limits,work);
     SurfaceRt0Result result;
     work.charge(Kind::copied_input_bytes,caller_source_digest.size());
@@ -984,6 +1003,7 @@ SurfaceRt0Result evaluate_surface_rt0(
         output.work = work.target_counts();
         result.targets.push_back(std::move(output));
         work.guard();
+        work.complete_target();
     }
     phases.phase(SurfaceRt0Phase::unattributed);
     work.guard();

@@ -36,10 +36,12 @@ pub use antenna_external_lead_solution::{
     ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA,
 };
 mod antenna_field_solution;
+mod antenna_operation_progress;
+pub use antenna_operation_progress::{AntennaOperationPhase, AntennaOperationProgress, AntennaOperationProgressObserver};
 mod antenna_spectrum;
 mod antenna_stage;
 pub use antenna_field_solution::{
-    execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, execute_antenna_closed_loop_inspection_profiled_typed, ClosedLoopExecutionError, KnownNativeCallFailure, verify_antenna_closed_loop_inspection_bytes,
+    execute_antenna_closed_loop_inspection, execute_antenna_closed_loop_inspection_typed, execute_antenna_closed_loop_inspection_profiled_typed, execute_antenna_closed_loop_inspection_observed_typed, ClosedLoopExecutionError, KnownNativeCallFailure, verify_antenna_closed_loop_inspection_bytes,
     load_antenna_closed_loop_inspection_bytes,
     load_published_antenna_closed_loop_inspection, LoadedAntennaClosedLoopInspection,
     load_antenna_field_solution_samples, load_antenna_field_solution_samples_for_spectrum,

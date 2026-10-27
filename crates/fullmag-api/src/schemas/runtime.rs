@@ -163,12 +163,31 @@ impl From<&fullmag_runner::LiveParallelExecutionTelemetry> for ParallelExecution
     }
 }
 
+/// Operation progress is independent of the LLG integration clock.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AntennaOperationProgressResource {
+    pub phase: String,
+    pub completed_targets: u64,
+    pub total_targets: u64,
+    pub source_cells: u64,
+    pub elapsed_seconds: f64,
+}
+impl From<&fullmag_runner::AntennaOperationProgress> for AntennaOperationProgressResource {
+    fn from(value: &fullmag_runner::AntennaOperationProgress) -> Self {
+        Self { phase: value.phase.as_str().into(), completed_targets: value.completed_targets,
+            total_targets: value.total_targets, source_cells: value.source_cells,
+            elapsed_seconds: value.elapsed_seconds }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StageExecutionRecordResource {
     pub stage_id: String,
     /// Exact authored antenna definition ID, not the study node or runtime ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub antenna_solve_stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antenna_progress: Option<AntennaOperationProgressResource>,
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,

@@ -1599,6 +1599,8 @@ pub(crate) struct StageExecutionRecord {
     pub stage_id: Option<String>,
     #[serde(default)]
     pub antenna_solve_stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antenna_progress: Option<fullmag_runner::AntennaOperationProgress>,
     #[serde(default)]
     pub kind: Option<String>,
     pub status: StageLifecycleState,

@@ -5864,6 +5864,18 @@ export interface components {
         };
         /** @enum {string} */
         AntennaOerstedRealizationResource: "direct_tetra_quadrature" | "vector_potential_solver";
+        /** @description Operation progress is independent of the LLG integration clock. */
+        AntennaOperationProgressResource: {
+            /** Format: int64 */
+            completed_targets: number;
+            /** Format: double */
+            elapsed_seconds: number;
+            phase: string;
+            /** Format: int64 */
+            source_cells: number;
+            /** Format: int64 */
+            total_targets: number;
+        };
         AntennaPortBranchResource: {
             id: string;
             inlet_terminal_ref: string;
@@ -15747,6 +15759,7 @@ export interface components {
         };
         StageExecutionRecordResource: {
             action?: string | null;
+            antenna_progress?: null | components["schemas"]["AntennaOperationProgressResource"];
             /** @description Exact authored antenna definition ID, not the study node or runtime ID. */
             antenna_solve_stage_id?: string | null;
             artifact_refs?: string[];

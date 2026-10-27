@@ -876,3 +876,83 @@ Raport Vitest: /state/development/verification/master-integration-20261027-final
 w wolumenie frontendu. Native build scalonego mastera i poprawki Auto/null
 pozostaje do wykonania przez managed just po przygotowaniu recovery.
 Nie restartowano backendu ani nie zmieniano producenta zachowanego wyniku.
+
+### Bieżący zakres: rzeczywisty postęp etapu anteny — 27.10.2026
+
+Zlecenie: telemetria ma automatycznie przechodzić w tryb jawnego etapu anteny,
+z fazą, licznikiem ukończonych punktów, paskiem postępu i czasem. Nie pokazujemy
+kroków/czasu LLG ani magnetyzacji jako postępu statycznego operatora anteny.
+
+Pytania, na które odpowiada kanał obserwacji:
+1. Jaka faza rzeczywiście trwa: przygotowanie źródła, potencjał, prąd, pole,
+   walidacja czy publikacja?
+2. Ile punktów pola zostało w pełni obliczonych i ile ich żądano?
+3. Czy obserwacja pochodzi z bieżącego run/task/step/attempt/epoch?
+4. Czy ukończyło się próbkowanie pola, czy również trwała publikacja wyniku?
+
+Kryteria odbioru:
+- Próbkowanie H ma completed_targets/total_targets; procent nie jest estymatą
+  pozostałego czasu ani procentem całego etapu. Licznik rośnie po walidacji
+  punktu i udanym guardzie, nie po rozpoczęciu obliczeń punktu.
+- Brak lub błędne dane pozostają jawnie nieokreślone, bez sztucznego zera.
+  Nie wyliczamy ETA z jednego historycznego przebiegu ani upływu czasu.
+- Faza walidacji/publikacji może mieć wszystkie punkty ukończone, podczas gdy
+  lifecycle nadal jest running albo przechodzi w failed. Obserwacja diagnostyczna
+  nie stanowi authority do przyjęcia/publikacji wyników naukowych.
+- Telemetria ma stały rozmiar, callback native tylko kopiuje POD, a writer
+  korzysta z dotychczasowego sidecar bez transakcji SessionStore. Profil pozostaje
+  niezależnie opt-in; stare wywołania ABI działają bez observera.
+- UI korzysta z istniejącego StageExecutionResource, jednego resource ownera,
+  jawnego antenna_solve_stage_id oraz pełnego session/run/epoch fence.
+  Brak zależności fizyki od nazwy lub presentation type obiektu.
+- Build i kontrola typów przez własną grupę Docker. Rust unit tests nie są
+  kompilowane. Odbiór źródłowy/SSR nie zastępuje runtime i przeglądarki.
+
+Stan niniejszego zapisu: zmiany native/runner i UI przygotowane, API w trakcie
+łączenia i walidacji; wspólny managed build, codegen oraz próba postępu jeszcze
+NOT RUN. Oryginalny wynik1145 zachowany, bez nowego pełnego Solve. Recovery
+publikacji poprzedniego wyniku pozostaje osobnym otwartym krokiem.
+
+
+### Weryfikacja wdrożenia telemetrii — 27.10.2026
+
+Zarządzany build `just docker-dev-restart-idle` zakończył się poprawnie:
+operacja `b648720bd16d43d689f4b7aed22f0a39`, commit bazowy
+`4ebf457f49d58aa138bcdece6a41f6cc2a9a57a5`, snapshot
+`52e0ca9cc9ecf69977a485468631efaa6650e51c128d0373b3bae67f1037681e`.
+Wszystkie 27 przejrzanych źródeł odpowiadają buildowi. Scena JSON pozostała
+identyczna; historyczny run `run-live-62d110763485b10e2512922267a1aed284996710852d4fd27cb3f4ad71a1e496`
+i jego status Failed zostały zachowane. Pełny wynik 1145 punktów pozostaje
+w niezmienionym CAS `39f795b2178f12c47f7622157f298d43e65aac39582467018abe058bf6b37c7e`;
+nie ponawiano pełnego Solve ani nie naprawiano jego nieudanej publikacji.
+
+`just docker-dev-codegen` opublikował kanoniczny kontrakt z nowego backendu;
+receipt `backend/codegen/openapi-v2/ec8d092262a0e54c331078a9a67b2f4c1d089280bf6728b7a43b415f1325a90c.json`.
+Frontend: 51/51 testów, 9/9 grup SSR, lint, kontrola architektury oraz
+kontrola typów po generowaniu kontraktu — PASS. Nie kompilowano testów Rust.
+
+Jedna odrębna próba czteropunktowa, z dotychczasowym źródłem 1856 Tet4,
+została wykonana przez publiczny accepted flow w nowym pakiecie Docker WSL:
+`run-9f339490d1437d4de1612957d3ada5bd18a994b3e825203251cff2000c031c71`.
+Task `task-868873174d264a4ec0e1ee1a7b7ccf17a156170ba6e5513aeb4ce9f40610acfe`
+osiągnął Succeeded, worker exit 0, lease
+`lease-3a9c7e0b3b5244eabe46e78d63068e8c` — Released.
+Zachowano 103 próbki rzeczywistego postępu: wszystkie sześć faz, 19 próbek
+z częściowym licznikiem i końcowe 4/4. Publiczny odczyt V/J/H przeszedł;
+sześć payloadów źródła i cztery wspólne H są bitowo identyczne z zapisaną
+referencją 20 punktów. Jest to kontrola reprodukowalności, nie niezależna
+kwalifikacja fizyczna. Pierwszy wrapper kontrolny zakończył się błędem,
+ponieważ terminal task wyprzedził zamknięcie procesu; bez ponowienia Solve
+potwierdzono późniejszy exit 0, zwolnienie lease i brak workera.
+
+Dowody: wolumen kontrolny, `verification/antenna-progress-20261027/`:
+`postbuild-verification.json`, `review-final.json` i
+`runtime-smoke-4target-01/{progress-report,result-parity,runtime-final}.json`.
+Dowody frontendu: jego wolumen, `development/verification/antenna-progress-20261027/`.
+
+Pozostaje NIEZWERYFIKOWANE: rzeczywisty transport live StageExecution dla
+nowej próby oraz panel w przeglądarce. Próba działała w tle, a aktualna
+sesja pozostała przypisana do historycznego runu 62d…; nie wolno podmienić
+jego danych postępem innego runu. Wcześniejsza blokada odczytu przeglądarki
+nadal obowiązuje. Żaden z powyższych wyników nie potwierdza wizualnej
+kwalifikacji UI, odzyskania publikacji pełnej mapy ani ukończenia E0–E12.

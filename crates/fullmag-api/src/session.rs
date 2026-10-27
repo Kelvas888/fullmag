@@ -296,6 +296,7 @@ pub(crate) fn accepted_stage_record(
     StageExecutionRecord {
         stage_id: Some(stage_id.to_string()),
         antenna_solve_stage_id: None,
+        antenna_progress: None,
         kind,
         status,
         // Accepted stages are not linked to a journal command: the whole-run
@@ -5504,6 +5505,7 @@ mod tests {
             stages: vec![StageExecutionRecord {
                 stage_id: None,
                 antenna_solve_stage_id: None,
+                antenna_progress: None,
                 kind: None,
                 status: StageLifecycleState::Completed,
                 command_id: Some("cmd-stage-0".into()),
@@ -6396,6 +6398,7 @@ mod tests {
             stages: vec![StageExecutionRecord {
                 stage_id: None,
                 antenna_solve_stage_id: None,
+                antenna_progress: None,
                 kind: None,
                 status: StageLifecycleState::Paused,
                 command_id: Some("cmd-stage-0".into()),
@@ -6454,6 +6457,7 @@ mod tests {
                     stages: vec![StageExecutionRecord {
                         stage_id: None,
                         antenna_solve_stage_id: None,
+                        antenna_progress: None,
                         kind: None,
                         status: StageLifecycleState::Completed,
                         command_id: Some("cmd-stage-0".into()),
@@ -7773,6 +7777,7 @@ mod tests {
             stages: vec![StageExecutionRecord {
                 stage_id: None,
                 antenna_solve_stage_id: None,
+                antenna_progress: None,
                 kind: None,
                 status: stage_status,
                 command_id: None,
