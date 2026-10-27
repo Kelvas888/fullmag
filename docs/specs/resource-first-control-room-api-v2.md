@@ -34,6 +34,52 @@ Błąd zadania zachowuje terminalny wynik i diagnostykę zadania; nie oznacza
 zatrzymania API. Po zakończeniu pracy DEV pozostaje dostępny dla kolejnego
 skryptu. Zakończony model i wyniki mogą pozostać widoczne do następnej aktywacji.
 
+Zakończenie zadania (`completed`, `failed`, `cancelled`) zachowuje zasób
+bieżącej sesji jako `active` oraz stabilny `session_epoch`. Dopiero jawne
+`closed` tworzy tombstone. Nie wolno wyprowadzać zamknięcia sesji ani nowej
+epoki z samego końca solvera lub jego `finished_at`. Import/wymiana sesji
+nadal zmienia inkarnację i unieważnia stary request scope. Dopuszczenie
+komend pozostaje osobną decyzją admission; zachowany workspace nie oznacza
+automatycznego wznowienia ani uruchomienia solvera. Decyzja: ADR 0039.
+
+Terminalna projekcja accepted run kończy zarówno komendę zapisaną w jego
+RunIntent, jak i aktywną komendę Run/Relax/Solve/Resume zwalniającą dokładnie
+ten run przez jawny target. Późniejsze Solve nie przepisuje niezmiennego
+RunIntent. Komendy obserwacji i komendy innego runu nie są kończone przez
+takie dopasowanie. Zasób readiness Solve używa tego samego warunku
+gotowości przygotowania co admission; oczekiwanie na natywny receipt
+nie może być jednocześnie prezentowane jako dostępne Compute.
+
+Przejściowy, typowany `StoreWriterBusy` w pętli odświeżania próbki zasobów lub
+odczytu admission odracza tę operację; liczba kolizji ani czas samego konfliktu
+nie kończą właściciela runtime. Żywy serwis nadal sprawdza pule i publikuje
+heartbeat. Nowe rezerwacje niezależnie wymagają świeżej, zgodnej próbki i
+transakcji ledgera; brak odczytu nie jest zgodą na przydział. Pozostałe błędy
+oraz rzeczywiście odczytana utrata świeżości/tożsamości zachowują własne bramki.
+
+Terminalny błąd komendy accepted Study przekazuje istniejący szczegół
+nieudanego etapu tej samej, zweryfikowanej projekcji runu: identyfikator etapu,
+przyczynę, stan failed i wskazówkę sprawdzenia diagnostyki przed kolejnym runem.
+Receipt błędu procesu zachowuje status zakończenia, także sygnał Unix, dla którego
+sam liczbowy exit code jest pusty. Utrata odpowiedzi Submit nie dowodzi odrzucenia:
+klient uzgadnia stan odczytami journalu po dokładnym `client_intent_id`, rodzaju
+i zakresie sesji, bez ponownego POST. Do czasu uzgodnienia pokazuje oczekiwanie,
+zamiast zgłaszać niepotwierdzone niepowodzenie lub sukces.
+
+Obserwacje procesu `GET/HEAD /v2/platform/health`, `/runtime-service`,
+`/openapi.json` oraz odczyt katalogu `/compute/profiles` nie podlegają
+zwykłemu workspace freeze. Supervisor używa ich do sprawdzania tożsamości;
+przejściowe zamknięcie mutacji sesji nie może udawać awarii API ani zmiany
+kontraktu liveness. Tworzenie profili i wszystkie polecenia wykonania nadal
+podlegają admission.
+
+Po runtime failure diagnostyczne odczyty obejmują listę sesji, zapisane pola
+(z typowanymi parametrami komponentu/scope/generacji), layout/maskę FDM,
+stan etapu, wizualizacji i komunikacji oraz read-only WebSocket z `after_seq`.
+Cached scene/universe mogą być odczytane bez ponownego wykonania Pythona;
+brak zachowanej sceny zwraca `retained_scene_unavailable`. Odczyty te nie
+otwierają mutacji ani nie uprawniają do rekonstrukcji brakujących wyników.
+
 Gdy inicjalizacja lub nadzór wykonania zawiodą, `GET /v2/platform/health`
 zwraca `degraded`. Istniejący `GET /v2/platform/runtime-service` uwzględnia
 blokadę bieżącej instancji API: obserwowane `ready` zastępuje stanem
@@ -1377,6 +1423,29 @@ the unsupported request at the same mesh revision.
 | `/v2/sessions/current/meshing/meshes/objects/{object_id}/quality` | `GET` | Read object mesh quality diagnostics; when the object marker is known, `quality.global` is the object's mesh-quality scope. |
 | `/v2/sessions/current/meshing/meshes/objects/{object_id}/size-field` | `GET` | Read object realized size-field projection. |
 
+Zasób `universe/quality` opisuje marker `0`, a nie całą domenę. Pole
+`quality.airbox_quality_gates` zawiera `status` (`pass`, `fail`, `unknown`),
+`reason`, zakres `airbox`, źródło, liczbę elementów i listę `checks`
+(`id`, `status`, `value`, `threshold`, `comparison`, `unit`). Bramka wymaga
+zgodności liczby elementów z opublikowaną siatką oraz pochodzenia Gmsh;
+brak miary lub niezgodne pokrycie nie oznaczają akceptacji. Gamma nie
+kwalifikuje piramid ani heksaedrów. Ten wynik nie zastępuje pełnej kwalifikacji
+naukowej ani dowodów certyfikatu mixed-P1.
+
+`universe/report` publikuje `report.shared_interface_node_count`: liczbę
+unikalnych węzłów należących jednocześnie do komórek markera `0` oraz
+co najmniej jednego markera materiałowego. Źródłem jest kanoniczna
+konektywność, nie przybliżone zakresy segmentów. Niepełne członkostwo lub
+nieprawidłowe indeksy dają `null`. Parametry efektywne są odczytywane także
+z raportu opublikowanej siatki; `null` na wyższym poziomie nie przesłania
+istniejącego raportu. Parametry efektywne opisują ustawienia generatora,
+a nie osiągnięty rozmiar każdego elementu.
+
+Inspector może wyświetlać zgodny artefakt FEM przy nierozstrzygniętym
+wykonaniu solvera. Samo istnienie artefaktu nie rozstrzyga aktywnego backendu
+i nie odblokowuje poleceń wykonawczych. Zasoby zachowują kontrolę aktualności
+rewizji, a stan nieopublikowany, ładowanie i błąd są prezentowane oddzielnie.
+
 Certyfikat rozłącznych ciał mixed-P1 v2 jest addytywnym, opcjonalnym polem
 `mixed_layer_topology_certificate_v2` w raporcie i manifeście shared-domain.
 Podsumowanie zawiera wersję, status, fingerprint, wersję Gmsh oraz
@@ -1655,6 +1724,11 @@ frozen-spin constraints i nie jest wywodzony z nazw ani markerów materiałów.
 Query wymaga `expected_dataset_manifest_object_ref`,
 `expected_geometry_manifest_object_ref`, `expected_geometry_object_ref`
 (bare lowercase SHA-256) oraz `max_response_bytes` (canonical decimal u64).
+Zapisany payload JSON geometrii w CAS ma osobny limit 256 MiB, a jego
+manifest 1 MiB. Limit ten dotyczy obiektu archiwalnego wskazanego przez hash;
+nie jest limitem body FMMT ani rozmiarem przesyłanym do przeglądarki.
+Liczniki kształtu nadal zachowują dotychczasowe granice wyprowadzone z 64 MiB.
+
 Limit pełnego body wynosi 64 MiB dla FMMT i 1 MiB dla FMSP. API wspiera
 single byte Range i immutable ETag, bez zmiany ownership source.
 Klient domyślnie odbiera pełne bounded body i kontroluje jego SHA-256,
@@ -1772,3 +1846,18 @@ Podgląd capabilities odpowiada wybranemu urządzeniu i precyzji; nie jest
 dowodem dostępności ani wykonania runtime. Pierwsze przygotowanie obliczeń
 nadal sprawdza dostępność GPU, bez cichego fallbacku CPU. Runtime odczytuje
 urządzenie i precyzję z kanonicznego skryptu sesji.
+
+### Zachowanie realizacji FDM przy ponownym wykonaniu sceny
+
+Konwersja Python → typowany SceneDocument → kanoniczny skrypt wykonawczy
+zachowuje pełną politykę `fdm.demag`: `strategy`, `mode`, `fft_backend`,
+`common_cells`, `common_cells_xy`, `common_cell_size` i `explain`, włącznie
+z jawnym `False` oraz rozróżnieniem braku wartości i `auto`. Pominięcie hintu
+nie może zmienić klasy transferu warstw ani uruchamiać domyślnej realizacji
+zamiast zadanej. W szczególności nie naprawia się takiego rozjazdu przez
+tolerancyjne uznawanie dwóch różnych siatek za identyczne lub fallback CPU.
+
+Po publikacji zaakceptowanego stanu kompletna tożsamość `resolved` obejmuje
+backend, device, precision i mode z tego samego zweryfikowanego planu.
+Dostępność pól oraz planera nie zastępuje tej tożsamości. Ukończenie zadania
+nie usuwa jej ze statusu sesji ani nie blokuje odczytu wyników.

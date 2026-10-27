@@ -598,6 +598,16 @@ Artifact creation alone writes `qualification.json` with status
 `not_evaluated`. Only the dedicated scientific qualification gate may replace
 that state with pass/fail evidence.
 
+Fixed-step FDM CUDA relaxation must compute its due `CONTROL` statistics
+from the accepted endpoint, including the torque in A/m used by the stop
+criterion. This applies to RK23 in both storage precisions as well as other
+fixed-step integrators. A metadata-only sample with zero-initialized torque
+is not evidence of equilibrium and must not satisfy torque confirmation.
+The statistics stride remains explicit; this requirement does not enable
+full energy reductions or alter adaptive integration. The October 24, 2026
+repair is a correction to observation and stopping, not a new scientific
+qualification of RK23.
+
 Attempt trace is not a coalesced table-autosave observable. Output samples do
 not redefine internal steps and may be interpolated only under an explicitly
 documented dense-output contract.

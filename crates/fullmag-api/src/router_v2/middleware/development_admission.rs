@@ -53,13 +53,22 @@ pub(crate) struct DevelopmentAdmission(Arc<AdmissionState>);
 /// evaluation. Keep this explicit when adding resources to diagnostic mode.
 fn retained_result_observation(path: &str) -> bool {
     if matches!(path,
-        "/v2/sessions/current/data/domain/meta"
+        "/v2/sessions"
+        | "/v2/sessions/current/data/domain/meta"
         | "/v2/sessions/current/data/domain/topology"
+        | "/v2/sessions/current/data/domain/fdm-multilayer-layout"
         | "/v2/sessions/current/data/fields"
         | "/v2/sessions/current/data/scalars"
         | "/v2/sessions/current/meshing/meshes/shared-domain/manifest"
         | "/v2/sessions/current/meshing/meshes/shared-domain/topology"
         | "/v2/sessions/current/diagnostics/engine-log"
+        | "/v2/sessions/current/simulation/stages/execution"
+        | "/v2/sessions/current/visualization/state"
+        | "/v2/sessions/current/events/communication-policy"
+        // The shared scene loader returns only its retained snapshot under
+        // the runtime-failure fence; a cache miss cannot invoke Python.
+        | "/v2/sessions/current/model/scene"
+        | "/v2/sessions/current/model/universe"
     ) {
         return true;
     }
@@ -70,6 +79,32 @@ fn retained_result_observation(path: &str) -> bool {
         return false;
     };
     !quantity.is_empty() && matches!(resource, "availability" | "meta" | "samples/vector")
+}
+
+/// Published vector reads take typed query parameters for component, scope,
+/// and generation pins. Their handler reads the accepted snapshot/CAS result;
+/// it does not enqueue field materialization or invoke the solver.
+fn retained_field_vector_observation(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/v2/sessions/current/data/fields/") else {
+        return false;
+    };
+    let Some((quantity, resource)) = relative.split_once('/') else {
+        return false;
+    };
+    !quantity.is_empty() && resource == "samples/vector"
+}
+
+/// A single native-layer ID followed by the exact active-mask resource.
+fn retained_fdm_active_mask_observation(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix(
+        "/v2/sessions/current/data/domain/fdm-multilayer-layers/",
+    ) else {
+        return false;
+    };
+    let Some((layer_id, resource)) = relative.split_once('/') else {
+        return false;
+    };
+    !layer_id.is_empty() && resource == "active-mask"
 }
 
 /// Current accepted-run status and preparation are immutable/read-model
@@ -278,7 +313,13 @@ pub(crate) async fn mutation_admission_middleware(
             request.uri().path(),
             "/v2/platform/health" | "/v2/platform/runtime-service"
         ) || (request.uri().query().is_none()
-            && retained_result_observation(request.uri().path())))
+            && (retained_result_observation(request.uri().path())
+                || retained_fdm_active_mask_observation(request.uri().path())))
+            || (*request.method() == Method::GET
+                && (retained_field_vector_observation(request.uri().path())
+                    // Read-only replay/heartbeat stream; inbound messages
+                    // cannot submit commands. Keep after_seq reconnects live.
+                    || request.uri().path() == "/v2/sessions/current/events/ws")))
         || (request.method() == Method::GET
             && request.uri().query().is_none()
             && runtime_failure_snapshot_observation(request.uri().path()));
@@ -287,6 +328,12 @@ pub(crate) async fn mutation_admission_middleware(
             request.uri().path(),
             "/healthz"
                 | "/v2/platform/openapi.json"
+                // These bounded read-only process/catalog observations are
+                // also used by the supervisor during a normal workspace
+                // freeze. A temporary mutation fence is not a failed API.
+                | "/v2/platform/health"
+                | "/v2/platform/runtime-service"
+                | "/v2/platform/compute/profiles"
                 | "/v1/internal/live/current/control/wait"
         ))
         || (runtime_failure && read_only_diagnostic);

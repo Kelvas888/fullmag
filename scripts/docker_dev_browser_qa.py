@@ -8,6 +8,8 @@ volume.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 from collections.abc import Mapping
 from copy import deepcopy
@@ -48,13 +50,39 @@ BROWSER_IMAGE_DIGESTS = frozenset({
     "941cc91e5022880ac1d14ae90b476b624deb6399dbbc28d612d5d5bd7928fcbd",
 })
 RESULT_SCHEMA = "fullmag.docker-dev-browser-qa-result.v1"
+AIRBOX_INSPECTOR_RESULT_SCHEMA = "fullmag.docker-dev-airbox-inspector-result.v1"
 OPERATION_SCHEMA = "fullmag.docker-dev-browser-qa.v1"
 BROWSER_IMAGE_RE = re.compile(
     r"^mcr\.microsoft\.com/playwright:v1\.62\.1-noble@sha256:([0-9a-f]{64})$"
 )
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 2 * 1024 * 1024
+MAX_CANVAS_SCREENSHOT_BYTES = 512 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CANVAS_ONLY_SKIPPED_AREAS = [
+    "viewport appearance and color-profile checks",
+    "camera interaction checks",
+    "viewport export checks at DPR 1 and DPR 2",
+    "layout and DPR 1/2 checks",
+    "20-cycle viewport lifecycle checks",
+    "viewport QA fixture preparation",
+    "scene/model adoption readiness endpoint",
+    "viewport performance instrumentation",
+]
+VIEWPORT_DOM_OBSERVATIONS_NOTE = (
+    "Viewport dataset and quantity label attributes are DOM observations only; "
+    "they do not prove field payload presence or values."
+)
+LIVE_FIELD_OBSERVATION_NOTE = (
+    "Quantity label data-ready and viewport datasets are DOM readiness observations only; "
+    "they do not prove field payload presence or values."
+)
+
+DESKTOP_WSL_BIND_ALIAS_RE = re.compile(
+    r"^/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)/([0-9a-f]{64})$"
+)
+LOCAL_WSL_BIND_MOUNT_ROOT = Path("/mnt/wsl/docker-desktop-bind-mounts")
 
 
 def _text(value: bytes, limit: int = 4096) -> str:
@@ -112,6 +140,51 @@ def _mount_path(value: object) -> str | None:
         return None
     from docker_volume_activate import _canonical_host_path
     return _canonical_host_path(value) or None
+
+
+def _source_mount_matches_selected(value: object, expected: Path) -> bool:
+    """Match the selected source path, proving Desktop WSL aliases by inode."""
+    observed = _mount_path(value)
+    expected_key = _mount_path(expected)
+    if not observed or not expected_key:
+        return False
+    if observed == expected_key:
+        return True
+
+    # Docker Desktop exposes WSL bind mounts through an opaque daemon path. Only
+    # accept its exact alias form, then prove it names the selected local dir.
+    # Match the raw source so normpath cannot erase traversal or extra segments.
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str):
+        return False
+    match = DESKTOP_WSL_BIND_ALIAS_RE.fullmatch(value)
+    if match is None:
+        return False
+    distro, token = match.groups()
+    local_alias = LOCAL_WSL_BIND_MOUNT_ROOT / distro / token
+    expected_path = Path(expected_key)
+    try:
+        return (
+            local_alias.is_dir()
+            and expected_path.is_dir()
+            and local_alias.samefile(expected_path)
+        )
+    except OSError:
+        return False
+
+def _selected_script_bind_matches(actual: object, selected: Path) -> bool:
+    return _source_mount_matches_selected(
+        actual, selected / "apps/control-room/scripts"
+    )
+
+def _script_bind_groups(selected: Path) -> list[str]:
+    # Checkout files may be group-readable (0660) on ext4. The browser stays
+    # unprivileged and only gains the source group's read access on RO mounts.
+    if os.name != "posix":
+        return []
+    gid = (selected / "apps/control-room/scripts").stat().st_gid
+    return [str(gid)] if gid not in (0, 65532) else []
 
 
 def _validate_frontend_volume(
@@ -588,7 +661,28 @@ def _compose_document(
     port: int,
     timeout: int,
     prepare_viewport_fixture: bool = False,
+    canvas_only: bool | None = None,
+    expect_live_field: str | None = None,
+    expect_airbox_vectors: bool | None = None,
+    expect_ambiguous_compute_fields: bool | None = None,
+    airbox_inspector: bool = False,
 ) -> dict[str, object]:
+    if canvas_only is True and prepare_viewport_fixture:
+        raise BuildControlError("Canvas-only browser QA cannot prepare a viewport fixture")
+    if (expect_live_field is not None or expect_airbox_vectors is True) and canvas_only is not True:
+        raise BuildControlError("Live-field expectations require --canvas-only")
+    if expect_airbox_vectors is True and not expect_live_field:
+        raise BuildControlError("Airbox-vector expectation requires an expected live field")
+    if expect_ambiguous_compute_fields is True and canvas_only is not True:
+        raise BuildControlError("Ambiguous Compute Fields QA requires --canvas-only")
+    if airbox_inspector and (
+        prepare_viewport_fixture
+        or canvas_only is not None
+        or expect_live_field is not None
+        or expect_airbox_vectors is not None
+        or expect_ambiguous_compute_fields is not None
+    ):
+        raise BuildControlError("Airbox Inspector QA is a separate live-resource scenario")
     labels = {
         **source_labels(identity),
         "org.fullmag.browser-qa.schema": OPERATION_SCHEMA,
@@ -608,8 +702,19 @@ def _compose_document(
         "CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS": str(timeout * 1000),
         "NVIDIA_VISIBLE_DEVICES": "void",
     }
+    if airbox_inspector:
+        environment["CONTROL_ROOM_BROWSER_QA_SCENARIO"] = "airbox-inspector"
     if prepare_viewport_fixture:
         environment["CONTROL_ROOM_PREPARE_VIEWPORT_FIXTURE"] = "1"
+    if canvas_only is not None:
+        environment["CONTROL_ROOM_BROWSER_QA_CANVAS_ONLY"] = "1" if canvas_only else "0"
+    if expect_airbox_vectors is not None:
+        environment["CONTROL_ROOM_BROWSER_QA_EXPECT_LIVE_FIELD"] = expect_live_field or ""
+        environment["CONTROL_ROOM_BROWSER_QA_EXPECT_AIRBOX_VECTORS"] = "1" if expect_airbox_vectors else "0"
+    if expect_ambiguous_compute_fields is not None:
+        environment["CONTROL_ROOM_BROWSER_QA_EXPECT_AMBIGUOUS_COMPUTE_FIELDS"] = (
+            "1" if expect_ambiguous_compute_fields else "0"
+        )
     return {
         "name": identity["project_name"],
         "services": {
@@ -629,10 +734,12 @@ def _compose_document(
                 "logging": {"driver": "none"},
                 "environment": environment,
                 "user": "65532:65532",
+                "group_add": _script_bind_groups(selected),
                 "working_dir": "/state/development/workspace/apps/control-room",
                 "command": [
                     "node",
-                    "/state/development/workspace/apps/control-room/scripts/docker-dev-browser-qa.mjs",
+                    "/state/development/workspace/apps/control-room/scripts/"
+                    + ("verify-airbox-inspector.mjs" if airbox_inspector else "docker-dev-browser-qa.mjs"),
                 ],
                 "volumes": [
                     {
@@ -671,6 +778,11 @@ def _validate_browser_helper(
     browser_image_id: str,
     exit_code: int,
     selected: Path,
+    canvas_only: bool | None = None,
+    expect_live_field: str | None = None,
+    expect_airbox_vectors: bool | None = None,
+    expect_ambiguous_compute_fields: bool | None = None,
+    airbox_inspector: bool = False,
 ) -> None:
     try:
         validate_source_labels(document, identity)
@@ -691,6 +803,8 @@ def _validate_browser_helper(
         raise ControlOutcomeUnknown("Browser helper image identity differs")
     if config.get("User") != "65532:65532":
         raise ControlOutcomeUnknown("Browser helper user does not match the owned frontend volume")
+    if (host.get("GroupAdd") or []) != _script_bind_groups(selected):
+        raise ControlOutcomeUnknown("Browser helper source read group differs")
     environment = set(config.get("Env") or [])
     if {
         "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright",
@@ -698,6 +812,45 @@ def _validate_browser_helper(
         "NVIDIA_VISIBLE_DEVICES=void",
     } - environment:
         raise ControlOutcomeUnknown("Browser helper runtime environment differs")
+    if airbox_inspector:
+        if "CONTROL_ROOM_BROWSER_QA_SCENARIO=airbox-inspector" not in environment:
+            raise ControlOutcomeUnknown("Browser helper Airbox Inspector scenario differs")
+        if config.get("Cmd") != [
+            "node",
+            "/state/development/workspace/apps/control-room/scripts/verify-airbox-inspector.mjs",
+        ]:
+            raise ControlOutcomeUnknown("Browser helper did not run the selected Airbox Inspector harness")
+    if canvas_only is not None:
+        mode_environment = [
+            entry for entry in environment
+            if entry.startswith("CONTROL_ROOM_BROWSER_QA_CANVAS_ONLY=")
+        ]
+        expected_mode = "1" if canvas_only else "0"
+        if mode_environment != [f"CONTROL_ROOM_BROWSER_QA_CANVAS_ONLY={expected_mode}"]:
+            raise ControlOutcomeUnknown("Browser helper QA scope differs")
+    if expect_airbox_vectors is not None:
+        expected_field = expect_live_field or ""
+        expected_vectors = "1" if expect_airbox_vectors else "0"
+        focused_environment = [
+            entry for entry in environment
+            if entry.startswith("CONTROL_ROOM_BROWSER_QA_EXPECT_LIVE_FIELD=")
+            or entry.startswith("CONTROL_ROOM_BROWSER_QA_EXPECT_AIRBOX_VECTORS=")
+        ]
+        if set(focused_environment) != {
+            f"CONTROL_ROOM_BROWSER_QA_EXPECT_LIVE_FIELD={expected_field}",
+            f"CONTROL_ROOM_BROWSER_QA_EXPECT_AIRBOX_VECTORS={expected_vectors}",
+        }:
+            raise ControlOutcomeUnknown("Browser helper live-field expectation differs")
+    if expect_ambiguous_compute_fields is not None:
+        expected_ambiguous = "1" if expect_ambiguous_compute_fields else "0"
+        ambiguous_environment = [
+            entry for entry in environment
+            if entry.startswith("CONTROL_ROOM_BROWSER_QA_EXPECT_AMBIGUOUS_COMPUTE_FIELDS=")
+        ]
+        if ambiguous_environment != [
+            f"CONTROL_ROOM_BROWSER_QA_EXPECT_AMBIGUOUS_COMPUTE_FIELDS={expected_ambiguous}"
+        ]:
+            raise ControlOutcomeUnknown("Browser helper ambiguous-command expectation differs")
     if state.get("Running") is not False or state.get("ExitCode") != exit_code:
         raise ControlOutcomeUnknown("Browser helper exit outcome differs from Compose observation")
     if (host.get("ReadonlyRootfs") is not True or host.get("NetworkMode") in {"host", "none"}
@@ -729,10 +882,11 @@ def _validate_browser_helper(
     if state_mount.get("Type") != "volume" or state_mount.get("Name") != frontend_volume:
         raise ControlOutcomeUnknown("Browser helper state volume differs")
     script_mount = next(m for m in mounts if m.get("Destination") == "/state/development/workspace/apps/control-room/scripts")
-    expected_script_source = _mount_path(selected / "apps/control-room/scripts")
     if (
         script_mount.get("Type") != "bind"
-        or _mount_path(script_mount.get("Source")) != expected_script_source
+        or not _source_mount_matches_selected(
+            script_mount.get("Source"), selected / "apps/control-room/scripts"
+        )
     ):
         raise ControlOutcomeUnknown("Browser helper script is not a readonly selected-source bind")
 
@@ -792,7 +946,595 @@ def _validate_session_result(value: object) -> None:
             raise BuildControlError(f"Browser helper session identity field is invalid: {key}")
 
 
-def _parse_result(output: bytes, public_url: str, browser_url: str) -> dict[str, object]:
+def _validate_viewport_dom_observations(value: object) -> None:
+    if (not isinstance(value, Mapping) or value.get("field_data_proven") is not False
+            or value.get("note") != VIEWPORT_DOM_OBSERVATIONS_NOTE):
+        raise BuildControlError("Browser helper omitted bounded viewport DOM observations")
+    for key in ("before_home", "after_home"):
+        sample = value.get(key)
+        if not isinstance(sample, Mapping):
+            raise BuildControlError(f"Browser helper omitted viewport DOM observation: {key}")
+        dataset = sample.get("dataset")
+        labels = sample.get("quantity_labels")
+        dataset_count = sample.get("dataset_entry_count")
+        label_count = sample.get("quantity_label_count")
+        if (not isinstance(dataset, Mapping) or not isinstance(labels, list)
+                or type(dataset_count) is not int or not 0 <= dataset_count <= 10000
+                or type(label_count) is not int or not 0 <= label_count <= 10000
+                or type(sample.get("dataset_truncated")) is not bool
+                or type(sample.get("quantity_labels_truncated")) is not bool
+                or len(dataset) > 64 or len(labels) > 32
+                or dataset_count < len(dataset) or label_count < len(labels)):
+            raise BuildControlError(f"Browser helper viewport DOM observation is malformed: {key}")
+        if dataset_count > len(dataset) and not sample["dataset_truncated"]:
+            raise BuildControlError(f"Browser helper viewport dataset truncation is not reported: {key}")
+        if label_count > len(labels) and not sample["quantity_labels_truncated"]:
+            raise BuildControlError(f"Browser helper quantity label truncation is not reported: {key}")
+        if any(not isinstance(name, str) or len(name) > 128
+               or not isinstance(item, str) or len(item) > 1024
+               for name, item in dataset.items()):
+            raise BuildControlError(f"Browser helper viewport dataset is malformed: {key}")
+        for label in labels:
+            if not isinstance(label, Mapping):
+                raise BuildControlError(f"Browser helper quantity label is malformed: {key}")
+            for field in ("tag_name", "quantity_id", "field_state"):
+                item = label.get(field)
+                limit = 512 if field == "quantity_id" else 128
+                if item is not None and (not isinstance(item, str) or len(item) > limit):
+                    raise BuildControlError(f"Browser helper quantity label field is malformed: {field}")
+
+
+def _validate_live_field_observation(
+    value: object,
+    quantity_id: str,
+    expect_airbox_vectors: bool,
+) -> None:
+    if (not isinstance(value, Mapping) or value.get("field_data_proven") is not False
+            or value.get("note") != LIVE_FIELD_OBSERVATION_NOTE
+            or value.get("expected_quantity_id") != quantity_id
+            or value.get("airbox_vectors_expected") is not expect_airbox_vectors):
+        raise BuildControlError("Browser helper omitted the pinned live-field DOM observation")
+    for key in ("before_home", "after_home"):
+        sample = value.get(key)
+        if (not isinstance(sample, Mapping)
+                or sample.get("quantity_id") != quantity_id
+                or sample.get("label_visible") is not True
+                or sample.get("field_state") != "data-ready"
+                or sample.get("readiness_signal") != "visible quantity label data-field-state=data-ready"
+                or sample.get("solver_family") not in {"fdm", "fem"}):
+            raise BuildControlError(f"Browser helper did not observe live field readiness: {key}")
+        dataset = sample.get("dataset")
+        if not isinstance(dataset, Mapping):
+            raise BuildControlError(f"Browser helper live-field dataset is malformed: {key}")
+        bounds = dataset.get("fdm_domain_bounds")
+        if not isinstance(bounds, str) or len(bounds) > 1024:
+            raise BuildControlError(f"Browser helper live-field FDM domain bounds are malformed: {key}")
+        count_fields = (
+            "fdm_model_count", "fdm_vector_segment_count", "fdm_airbox_model_count",
+            "fdm_airbox_vector_segment_count",
+        )
+        for field in count_fields:
+            if type(dataset.get(field)) is not int or dataset[field] < 0:
+                raise BuildControlError(f"Browser helper live-field dataset is malformed: {field}")
+        if type(dataset.get("fdm_airbox_vectors_visible")) is not bool:
+            raise BuildControlError(f"Browser helper live-field dataset is malformed: {key}")
+        if sample["solver_family"] == "fdm":
+            if dataset["fdm_model_count"] <= 0:
+                raise BuildControlError(f"Browser helper FDM field has no live model: {key}")
+        elif bounds or dataset["fdm_model_count"] != 0:
+            raise BuildControlError(f"Browser helper FEM field observation conflicts with FDM dataset: {key}")
+        if expect_airbox_vectors:
+            if sample["solver_family"] != "fdm":
+                raise BuildControlError("FDM-only airbox-vector gate is unavailable for a FEM viewport")
+            if (dataset["fdm_airbox_vectors_visible"] is not True
+                    or dataset["fdm_airbox_vector_segment_count"] <= 0):
+                raise BuildControlError(f"Browser helper did not observe visible FDM airbox vectors: {key}")
+
+
+def _validate_canvas_screenshot(value: object) -> None:
+    if not isinstance(value, Mapping) or value.get("media_type") != "image/png":
+        raise BuildControlError("Browser helper canvas screenshot observation is malformed")
+    width, height = value.get("width"), value.get("height")
+    if type(width) is not int or width <= 0 or type(height) is not int or height <= 0:
+        raise BuildControlError("Browser helper canvas screenshot dimensions are invalid")
+    state = value.get("state")
+    data = value.get("png_base64")
+    if state == "captured":
+        if (value.get("image_proof") is not True or not isinstance(data, str)
+                or len(data) > ((MAX_CANVAS_SCREENSHOT_BYTES + 2) // 3) * 4):
+            raise BuildControlError("Browser helper canvas screenshot exceeds its encoded size bound")
+        try:
+            png = base64.b64decode(data, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise BuildControlError("Browser helper canvas screenshot is not valid base64") from error
+        if (not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > MAX_CANVAS_SCREENSHOT_BYTES
+                or value.get("byte_length") != len(png) or len(png) < 24
+                or int.from_bytes(png[16:20], "big") != width
+                or int.from_bytes(png[20:24], "big") != height):
+            raise BuildControlError("Browser helper canvas screenshot PNG metadata differs")
+    elif state == "omitted-size-limit":
+        if (value.get("image_proof") is not False or data is not None
+                or type(value.get("byte_length")) is not int
+                or value["byte_length"] <= MAX_CANVAS_SCREENSHOT_BYTES):
+            raise BuildControlError("Browser helper oversized screenshot omission is malformed")
+    elif state == "omitted-capture-failed":
+        reason = value.get("reason")
+        if (value.get("image_proof") is not False or data is not None
+                or value.get("byte_length") is not None
+                or not isinstance(reason, str) or not reason or len(reason) > 512):
+            raise BuildControlError("Browser helper screenshot capture omission is malformed")
+    else:
+        raise BuildControlError("Browser helper canvas screenshot state is unknown")
+
+
+def _validate_ambiguous_command_submission(value: object, session: object) -> None:
+    if not isinstance(value, Mapping) or value.get("state") != "passed":
+        raise BuildControlError("Browser helper omitted accepted Compute Fields response-loss evidence")
+    session_scope = value.get("session_scope")
+    if not isinstance(session, Mapping) or not isinstance(session_scope, Mapping):
+        raise BuildControlError("Browser helper ambiguous-command session scope is missing")
+    for field in ("session_id", "session_epoch", "request_scope_epoch"):
+        if session_scope.get(field) != session.get(field):
+            raise BuildControlError("Browser helper ambiguous-command session scope changed")
+
+    command_posts = value.get("command_posts")
+    if (not isinstance(command_posts, Mapping)
+            or type(command_posts.get("count")) is not int
+            or command_posts.get("count") != 1
+            or command_posts.get("kinds") != ["compute_fields"]
+            or type(command_posts.get("solve_count")) is not int
+            or command_posts.get("solve_count") != 0
+            or type(command_posts.get("forwarded_count")) is not int
+            or command_posts.get("forwarded_count") != 1
+            or type(command_posts.get("expected_abort_count")) is not int
+            or command_posts.get("expected_abort_count") != 1
+            or type(command_posts.get("expected_request_failure_count")) is not int
+            or command_posts.get("expected_request_failure_count") != 1):
+        raise BuildControlError("Browser helper did not prove one forwarded Compute Fields POST and one response drop")
+
+    intent_id = value.get("client_intent_id")
+    if (not isinstance(intent_id, str) or not intent_id or intent_id != intent_id.strip()
+            or len(intent_id) > 512
+            or any(ord(character) < 32 or ord(character) == 127 for character in intent_id)):
+        raise BuildControlError("Browser helper Compute Fields client intent is malformed")
+    upstream = value.get("upstream_response")
+    if not isinstance(upstream, Mapping):
+        raise BuildControlError("Browser helper omitted the actual Compute Fields response")
+    status = upstream.get("status")
+    command_id = upstream.get("command_id")
+    api_instance = upstream.get("api_instance")
+    if (type(status) is not int or not 200 <= status < 300
+            or upstream.get("accepted") is not True
+            or not isinstance(command_id, str) or not command_id or len(command_id) > 512
+            or not isinstance(api_instance, str)
+            or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", api_instance)):
+        raise BuildControlError("Browser helper did not receive one accepted, API-instance-pinned backend response")
+    if upstream.get("request_api_instance") not in (None, api_instance):
+        raise BuildControlError("Browser helper POST API-instance request/response pin differs")
+
+    dropped_request = value.get("expected_response_drop")
+    if not isinstance(dropped_request, Mapping):
+        raise BuildControlError("Browser helper omitted the exact deliberately dropped browser request")
+    dropped_url = dropped_request.get("url")
+    dropped_error = dropped_request.get("error")
+    if (dropped_request.get("method") != "POST"
+            or not isinstance(dropped_url, str) or len(dropped_url) > 4096
+            or urlsplit(dropped_url).path != "/v2/sessions/current/simulation/commands"
+            or urlsplit(dropped_url).scheme not in {"http", "https"}
+            or not isinstance(dropped_error, str) or not dropped_error or len(dropped_error) > 2048):
+        raise BuildControlError("Browser helper deliberate response drop was not the exact Compute Fields POST")
+
+    journal = value.get("journal")
+    if not isinstance(journal, Mapping):
+        raise BuildControlError("Browser helper omitted command journal reconciliation")
+    if (type(journal.get("queue_status")) is not int or journal.get("queue_status") != 200
+            or type(journal.get("detail_status")) is not int
+            or journal.get("detail_status") != 200
+            or type(journal.get("matching_intent_count")) is not int
+            or journal.get("matching_intent_count") != 1
+            or journal.get("client_intent_id") != intent_id
+            or journal.get("kind") != "compute_fields"
+            or journal.get("command_id") != command_id
+            or journal.get("detail_command_id") != command_id
+            or journal.get("detail_client_intent_id") != intent_id
+            or journal.get("detail_kind") != "compute_fields"
+            or journal.get("effective_status") != "completed"):
+        raise BuildControlError("Browser helper journal does not prove the unique completed command")
+
+    feedback = value.get("ui_feedback")
+    statuses = feedback.get("statuses") if isinstance(feedback, Mapping) else None
+    if (not isinstance(statuses, list) or len(statuses) > 32
+            or any(item not in {"pending", "completed", "failed", "cancelled"} for item in statuses)
+            or "failed" in statuses or "cancelled" in statuses
+            or "pending" not in statuses or "completed" not in statuses
+            or statuses.index("completed") <= statuses.index("pending")):
+        raise BuildControlError("Browser helper UI feedback did not show pending then completed")
+    messages = feedback.get("messages") if isinstance(feedback, Mapping) else None
+    if (not isinstance(messages, list) or len(messages) > 32
+            or any(not isinstance(item, str) or len(item) > 512 for item in messages)):
+        raise BuildControlError("Browser helper UI feedback messages are malformed")
+
+
+def _validate_resource_responses(value: object) -> None:
+    if not isinstance(value, list) or len(value) > 32:
+        raise BuildControlError("Browser helper omitted bounded API resource responses")
+    for response in value:
+        if not isinstance(response, Mapping):
+            raise BuildControlError("Browser helper API resource response is malformed")
+        url = response.get("url")
+        status = response.get("status")
+        if (not isinstance(url, str) or not url.startswith(("http://", "https://"))
+                or len(url) > 4096 or type(status) is not int or not 100 <= status < 400):
+            raise BuildControlError("Browser helper API resource response is invalid")
+        for field in ("content_type", "contract_version"):
+            item = response.get(field)
+            if item is not None and (not isinstance(item, str) or len(item) > 512):
+                raise BuildControlError(f"Browser helper API resource response is malformed: {field}")
+
+
+def _validate_startup_unmount_cancellation_probes(events_value: object, probes_value: object) -> None:
+    allowed_paths = {
+        "/v2/sessions/current/diagnostics/cpu",
+        "/v2/sessions/current/diagnostics/gpu",
+        "/v2/platform/compute/nodes",
+        "/v2/platform/health",
+        "/v2/sessions/current/model/planar-monitors",
+        "/v2/sessions/current/simulation/preparation",
+    }
+    if not isinstance(events_value, list) or len(events_value) > 32:
+        raise BuildControlError("Airbox Inspector startup request audit is malformed or over budget")
+    if not isinstance(probes_value, list) or len(probes_value) > len(allowed_paths):
+        raise BuildControlError("Airbox Inspector startup cancellation probes are malformed or over budget")
+
+    events: dict[int, Mapping[str, object]] = {}
+    failed_events: dict[int, Mapping[str, object]] = {}
+    for event in events_value:
+        if not isinstance(event, Mapping):
+            raise BuildControlError("Airbox Inspector startup request audit entry is malformed")
+        request_id = event.get("request_id")
+        path = event.get("path")
+        method = event.get("method")
+        if (type(request_id) is not int or request_id <= 0 or request_id in events
+                or not isinstance(path, str) or path not in allowed_paths
+                or method != "GET"
+                or event.get("same_origin") is not True
+                or not isinstance(event.get("resource_type"), str)
+                or not isinstance(event.get("started_phase"), str)
+                or type(event.get("started_elapsed_ms")) is not int
+                or event["started_elapsed_ms"] < 0):
+            raise BuildControlError("Airbox Inspector startup request audit identity is invalid")
+        events[request_id] = event
+        outcome = event.get("outcome")
+        if outcome == "finished":
+            if (event.get("finished") is not True
+                    or type(event.get("response_status")) is not int
+                    or not 100 <= event["response_status"] < 600
+                    or type(event.get("finished_elapsed_ms")) is not int
+                    or event["finished_elapsed_ms"] < event["started_elapsed_ms"]):
+                raise BuildControlError("Airbox Inspector startup request completion is malformed")
+        elif outcome == "request-failed":
+            failure_elapsed = event.get("failure_elapsed_ms")
+            if (not isinstance(event.get("error"), str) or not event["error"]
+                    or not isinstance(event.get("failure_phase"), str)
+                    or type(failure_elapsed) is not int
+                    or failure_elapsed < event["started_elapsed_ms"]):
+                raise BuildControlError("Airbox Inspector startup request failure evidence is malformed")
+            failed_events[request_id] = event
+        elif outcome == "browser-context-shutdown":
+            if (event.get("failure_phase") != "browser-context-shutdown"
+                    or event.get("finished") is not False):
+                raise BuildControlError("Airbox Inspector shutdown cancellation evidence is malformed")
+        else:
+            raise BuildControlError("Airbox Inspector retained an unsettled startup diagnostic request")
+
+    probes_by_cancelled_id: dict[int, Mapping[str, object]] = {}
+    probe_paths: set[str] = set()
+    for probe in probes_value:
+        if not isinstance(probe, Mapping):
+            raise BuildControlError("Airbox Inspector startup cancellation probe is malformed")
+        cancelled_id = probe.get("cancelled_request_id")
+        probe_id = probe.get("probe_request_id")
+        path = probe.get("path")
+        if (probe.get("classification") != "startup-unmount-cancellation-followed-by-read-probe"
+                or type(cancelled_id) is not int or type(probe_id) is not int
+                or cancelled_id == probe_id
+                or cancelled_id in probes_by_cancelled_id
+                or not isinstance(path, str) or path not in allowed_paths or path in probe_paths
+                or probe.get("method") != "GET"
+                or probe.get("cancellation_error") != "net::ERR_ABORTED"
+                or probe.get("cancellation_phase") != "workspace-navigation"
+                or probe.get("workspace_ready") is not True
+                or probe.get("home_overlay_visible") is not False
+                or probe.get("probe_resource_type") != "fetch"
+                or type(probe.get("probe_response_status")) is not int
+                or not 200 <= probe["probe_response_status"] < 300
+                or type(probe.get("probe_body_bytes")) is not int
+                or not 0 <= probe["probe_body_bytes"] <= 262_144):
+            raise BuildControlError("Airbox Inspector startup cancellation probe is not an exact bounded read")
+        cancelled = failed_events.get(cancelled_id)
+        replacement = events.get(probe_id)
+        started = probe.get("probe_started_elapsed_ms")
+        finished = probe.get("probe_finished_elapsed_ms")
+        if (cancelled is None or replacement is None
+                or cancelled.get("path") != path
+                or cancelled.get("method") != "GET"
+                or cancelled.get("error") != "net::ERR_ABORTED"
+                or cancelled.get("started_phase") != "workspace-navigation"
+                or cancelled.get("failure_phase") != "workspace-navigation"
+                or replacement.get("path") != path
+                or replacement.get("method") != "GET"
+                or replacement.get("resource_type") != "fetch"
+                or replacement.get("same_origin") is not True
+                or replacement.get("outcome") != "finished"
+                or replacement.get("response_status") != probe.get("probe_response_status")
+                or type(started) is not int or type(finished) is not int
+                or started <= cancelled.get("failure_elapsed_ms", -1)
+                or started != replacement.get("started_elapsed_ms")
+                or finished != replacement.get("finished_elapsed_ms")):
+            raise BuildControlError("Airbox Inspector startup cancellation lacks its later successful same-origin read")
+        probes_by_cancelled_id[cancelled_id] = probe
+        probe_paths.add(path)
+
+    if set(failed_events) != set(probes_by_cancelled_id):
+        raise BuildControlError("Airbox Inspector startup request failure was not resolved by an exact follow-up probe")
+
+
+def _parse_airbox_inspector_result(
+    output: bytes,
+    public_url: str,
+    browser_url: str,
+    expected_script_sha256: str,
+) -> dict[str, object]:
+    text = output.decode("utf-8", "replace")
+    payload = None
+    for line in reversed(text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+    if not isinstance(payload, dict):
+        raise BuildControlError("Airbox Inspector helper did not emit one JSON result")
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_BYTES:
+        raise BuildControlError("Airbox Inspector result exceeds its bounded evidence budget")
+    if (payload.get("schema") != AIRBOX_INSPECTOR_RESULT_SCHEMA
+            or payload.get("state") != "passed"
+            or payload.get("scenario") != "airbox-inspector"):
+        raise BuildControlError("Airbox Inspector helper reported a failed or unknown scenario")
+    if payload.get("public_url") != public_url or payload.get("probe_url") != browser_url:
+        raise BuildControlError("Airbox Inspector helper URL differs from the selected frontend")
+    if payload.get("playwright_version") != PLAYWRIGHT_VERSION:
+        raise BuildControlError("Airbox Inspector Playwright version differs from the lock pin")
+    if payload.get("browser_gpu_mode") != "swiftshader-webgl-requested":
+        raise BuildControlError("Airbox Inspector helper browser mode differs")
+    for key in ("page_errors", "console_errors", "request_failures"):
+        if type(payload.get(key)) is not int or payload[key] != 0:
+            raise BuildControlError(f"Airbox Inspector helper reported {key}")
+    if payload.get("http_errors") != []:
+        raise BuildControlError("Airbox Inspector helper reported HTTP errors")
+    _validate_startup_unmount_cancellation_probes(
+        payload.get("startup_request_events"),
+        payload.get("startup_unmount_cancellation_probes"),
+    )
+    synthetic_http_errors = payload.get("synthetic_http_errors")
+    if (not isinstance(synthetic_http_errors, list)
+            or len(synthetic_http_errors) > 6
+            or any(
+                not isinstance(item, str)
+                or item != "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
+                for item in synthetic_http_errors
+            )
+            or not any(
+                isinstance(item, str)
+                and item == "503 GET /v2/sessions/current/meshing/meshes/universe/quality"
+                for item in synthetic_http_errors
+            )):
+        raise BuildControlError("Airbox Inspector helper omitted its isolated synthetic quality error evidence")
+    synthetic_console_errors = payload.get("synthetic_console_errors", [])
+    if not isinstance(synthetic_console_errors, list) or len(synthetic_console_errors) > 6:
+        raise BuildControlError("Airbox Inspector synthetic console evidence is malformed")
+    for item in synthetic_console_errors:
+        if not isinstance(item, str) or len(item) > 2048:
+            raise BuildControlError("Airbox Inspector synthetic console evidence is malformed")
+        location_url = item.split(": ", 1)[0]
+        if urlsplit(location_url).path != "/v2/sessions/current/meshing/meshes/universe/quality":
+            raise BuildControlError("Airbox Inspector suppressed a console error outside the exact quality endpoint")
+    proof = payload.get("inspector_proof")
+    if not isinstance(proof, Mapping):
+        raise BuildControlError("Airbox Inspector helper omitted its route and API proof")
+    if (proof.get("schema") != "fullmag.airbox-inspector-browser-proof.v1"
+            or proof.get("script_sha256") != expected_script_sha256
+            or proof.get("authored_method") != "fem"
+            or proof.get("published_fem_with_unresolved_runtime") is not True
+            or proof.get("generic_unknown_header_rejected") is not True
+            or proof.get("no_authoring_mutations") is not True
+            or proof.get("no_solve_commands") is not True):
+        raise BuildControlError("Airbox Inspector helper did not prove the published FEM inspection case")
+    acknowledgements = proof.get("visualization_client_acknowledgements")
+    if not isinstance(acknowledgements, list) or len(acknowledgements) > 16:
+        raise BuildControlError("Airbox Inspector visualization acknowledgements are malformed")
+    for acknowledgement in acknowledgements:
+        if not isinstance(acknowledgement, Mapping):
+            raise BuildControlError("Airbox Inspector visualization acknowledgement is malformed")
+        metadata = acknowledgement.get("payload")
+        status = acknowledgement.get("response_status")
+        if (acknowledgement.get("method") != "POST"
+                or acknowledgement.get("path") != "/v2/sessions/current/visualization/client-acks"
+                or acknowledgement.get("outcome") != "recorded"
+                or type(status) is not int or not 200 <= status < 300
+                or not isinstance(metadata, Mapping)
+                or metadata.get("body_valid_json") is not True
+                or metadata.get("client_id_present") is not True
+                or metadata.get("viewport_id_present") is not True
+                or metadata.get("status") not in {"applied", "rendered"}
+                or metadata.get("error_present") is not False
+                or type(metadata.get("revision")) is not int
+                or metadata["revision"] < 0):
+            raise BuildControlError("Airbox Inspector recorded an invalid or failed visualization acknowledgement")
+    unresolved = proof.get("unresolved_status_probe")
+    if (not isinstance(unresolved, Mapping)
+            or unresolved.get("only_active_lane_resolved_changed") is not True
+            or unresolved.get("domain_discretization") != "fem"
+            or not isinstance(unresolved.get("domain_generation_id"), str)
+            or not unresolved["domain_generation_id"]
+            or type(unresolved.get("mesh_revision")) is not int
+            or unresolved["mesh_revision"] <= 0
+            or type(unresolved.get("topology_revision")) is not int
+            or unresolved["topology_revision"] <= 0):
+        raise BuildControlError("Airbox Inspector helper did not isolate the unresolved FEM runtime case")
+    canvas = proof.get("canvas")
+    if (not isinstance(canvas, Mapping)
+            or canvas.get("visible") is not True
+            or canvas.get("context_lost") is not False
+            or type(canvas.get("drawing_buffer_width")) is not int
+            or canvas["drawing_buffer_width"] <= 0
+            or type(canvas.get("drawing_buffer_height")) is not int
+            or canvas["drawing_buffer_height"] <= 0):
+        raise BuildControlError("Airbox Inspector helper did not retain a live visible WebGL canvas")
+
+    expected_panels = [
+        ("root", "model:airbox", "airbox.root", "Airbox Overview", "Domain policy"),
+        ("mesh", "model:airbox:mesh", "airbox.mesh", "Airbox Mesh Overview", "Airbox Mesh Overview"),
+        ("parameters", "model:airbox:mesh:parameters", "airbox.mesh.parameters", "Airbox Mesh Parameters", "Canonical Authored Parameters"),
+        ("quality-gates", "model:airbox:mesh:quality-gates", "airbox.mesh.quality-gates", "Airbox Mesh Quality Gates", "Airbox Quality Gates"),
+        ("statistics", "model:airbox:mesh:statistics", "airbox.mesh.statistics", "Airbox Mesh Statistics", "Airbox Mesh Statistics"),
+        ("topology", "model:airbox:mesh:topology", "airbox.mesh.topology", "Airbox Mesh Topology", "Airbox Mesh Topology"),
+        ("build", "model:airbox:mesh:build", "airbox.mesh.build", "Airbox Mesh Build", "Airbox Mesh Build"),
+    ]
+    panels = proof.get("panels")
+    if not isinstance(panels, list) or len(panels) != len(expected_panels):
+        raise BuildControlError("Airbox Inspector helper did not visit all seven required panels")
+    for panel, expected in zip(panels, expected_panels):
+        if not isinstance(panel, Mapping):
+            raise BuildControlError("Airbox Inspector panel evidence is malformed")
+        panel_id, node_id, selection_kind, header, group = expected
+        if (panel.get("id") != panel_id or panel.get("node_id") != node_id
+                or panel.get("selection_kind") != selection_kind
+                or panel.get("header") != header
+                or panel.get("required_group") != group
+                or panel.get("verified") is not True):
+            raise BuildControlError(f"Airbox Inspector panel route was not verified: {panel_id}")
+        for field in ("header", "group"):
+            item = panel.get(field)
+            if not isinstance(item, str) or not item.strip() or len(item) > 256:
+                raise BuildControlError(f"Airbox Inspector panel {panel_id} omitted {field}")
+        if panel["header"].strip().lower() in {"unknown", "inspector", "airbox inspector", "details"}:
+            raise BuildControlError(f"Airbox Inspector panel {panel_id} used a generic header")
+
+    comparisons = proof.get("api_comparisons")
+    if not isinstance(comparisons, Mapping):
+        raise BuildControlError("Airbox Inspector helper omitted API count/unit comparisons")
+    for field in ("airbox_carrier_count", "node_count", "element_count", "boundary_face_count", "surface_face_count"):
+        value = comparisons.get(field)
+        if type(value) is not int or value < 0:
+            raise BuildControlError(f"Airbox Inspector API count is invalid: {field}")
+    families = comparisons.get("mixed_element_families")
+    if (not isinstance(families, list) or len(families) < 2
+            or any(not isinstance(item, str) or not item or len(item) > 128 for item in families)):
+        raise BuildControlError("Airbox Inspector proof does not contain mixed element families")
+    if (comparisons.get("counts_verified") is not True
+            or comparisons.get("length_units_verified") is not True
+            or comparisons.get("quality_scope") != "airbox"
+            or comparisons.get("quality_marker") != 0
+            or comparisons.get("quality_source_verified") is not True):
+        raise BuildControlError("Airbox Inspector API counts, SI units, or quality scope differ")
+    units = comparisons.get("length_units")
+    if not isinstance(units, list) or "m" not in units or any(not isinstance(item, str) for item in units):
+        raise BuildControlError("Airbox Inspector helper did not verify SI length units")
+
+    initial_loading = proof.get("initial_quality_loading")
+    if (not isinstance(initial_loading, Mapping)
+            or initial_loading.get("resource_status") != "loading"
+            or initial_loading.get("panel_status") != "loading"
+            or initial_loading.get("gate_result") != "unknown"
+            or initial_loading.get("live_response_preserved") is not True
+            or initial_loading.get("recovered_to_ready") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid gate result during the initial quality load")
+
+    quality_states = proof.get("synthetic_quality_fault_injection")
+    baseline = quality_states.get("live_baseline") if isinstance(quality_states, Mapping) else None
+    injection = quality_states
+    delayed = injection.get("delayed_live_get") if isinstance(injection, Mapping) else None
+    failed = injection.get("synthetic_error_get") if isinstance(injection, Mapping) else None
+    if (not isinstance(baseline, Mapping)
+            or baseline.get("resource_status") != "ready"
+            or baseline.get("gate_result") != "unknown"
+            or type(baseline.get("revision")) is not int
+            or baseline["revision"] <= 0):
+        raise BuildControlError("Airbox Inspector helper omitted the live quality baseline")
+    if (not isinstance(injection, Mapping)
+            or injection.get("evidence_kind") != "fault-injected-ui-only-not-scientific"):
+        raise BuildControlError("Airbox Inspector synthetic quality controls are not labeled as UI-only fault injection")
+    for control_name in ("synthetic_pass_control", "synthetic_pass_control_for_error"):
+        pass_control = injection.get(control_name)
+        if (not isinstance(pass_control, Mapping)
+                or type(pass_control.get("revision")) is not int
+                or pass_control["revision"] != baseline["revision"]
+                or pass_control.get("rendered_pass") is not True
+                or pass_control.get("revision_matches_live") is not True
+                or type(pass_control.get("requests")) is not int
+                or not 1 <= pass_control["requests"] <= 4):
+            raise BuildControlError("Airbox Inspector omitted the matching-revision synthetic pass control")
+    if (not isinstance(delayed, Mapping)
+            or delayed.get("cached_synthetic_gate_status") != "pass"
+            or delayed.get("resource_status") not in {"stale", "loading", "pending"}
+            or delayed.get("panel_status") not in {"stale", "loading", "pending"}
+            or delayed.get("gate_result") != "unknown"
+            or delayed.get("live_response_preserved") is not True
+            or type(delayed.get("live_response_status")) is not int
+            or not 200 <= delayed["live_response_status"] < 300
+            or delayed.get("restored_to_live_unknown") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid quality result during a delayed live GET")
+    if (not isinstance(failed, Mapping)
+            or failed.get("cached_synthetic_gate_status") != "pass"
+            or failed.get("http_status") != 503
+            or failed.get("resource_status") != "error"
+            or failed.get("resource_error_observed") is not True
+            or failed.get("panel_resource_status") not in {"error", "refresh error"}
+            or failed.get("panel_reason_reports_failed_load") is not True
+            or failed.get("cached_quality_withheld") is not True
+            or failed.get("refresh_error_visible_in_statistics") is not True
+            or type(failed.get("requests")) is not int
+            or not 1 <= failed["requests"] <= 6
+            or failed.get("gate_result") != "unknown"
+            or failed.get("restored_to_live_unknown") is not True):
+        raise BuildControlError("Airbox Inspector showed an invalid quality result after a synthetic resource failure")
+    final_live_state = injection.get("final_live_state")
+    if (not isinstance(final_live_state, Mapping)
+            or final_live_state.get("resource_status") != "ready"
+            or final_live_state.get("gate_result") != "unknown"
+            or final_live_state.get("revision_matches_live") is not True):
+        raise BuildControlError("Airbox Inspector did not restore the live unknown quality state after fault injection")
+
+    refresh = proof.get("resource_refresh")
+    if (not isinstance(refresh, Mapping)
+            or refresh.get("resource_path") != "/v2/sessions/current/meshing/meshes/shared-domain/manifest"
+            or refresh.get("same_root") is not True
+            or refresh.get("live_response_preserved") is not True
+            or type(refresh.get("status")) is not int
+            or not 200 <= refresh["status"] < 300
+            or type(refresh.get("request_count")) is not int
+            or not 1 <= refresh["request_count"] <= 4
+            or type(refresh.get("delay_ms")) is not int
+            or not 250 <= refresh["delay_ms"] <= 2000):
+        raise BuildControlError("Airbox Inspector root identity did not survive a bounded live resource refresh")
+    _validate_resource_responses(payload.get("resource_responses"))
+    return payload
+
+
+def _parse_result(
+    output: bytes,
+    public_url: str,
+    browser_url: str,
+    canvas_only: bool = False,
+    expect_live_field: str | None = None,
+    expect_airbox_vectors: bool = False,
+    expect_ambiguous_compute_fields: bool = False,
+) -> dict[str, object]:
     text = output.decode("utf-8", "replace")
     payload = None
     for line in reversed(text.splitlines()):
@@ -819,6 +1561,36 @@ def _parse_result(output: bytes, public_url: str, browser_url: str) -> dict[str,
         raise BuildControlError("Browser helper Playwright version differs from the lock pin")
     if payload.get("browser_gpu_mode") != "swiftshader-webgl-requested":
         raise BuildControlError("Browser helper did not report the pinned SwiftShader browser mode")
+    if type(payload.get("canvas_only")) is not bool or payload["canvas_only"] is not canvas_only:
+        raise BuildControlError("Browser helper canvas-only mode differs from the admitted operation")
+    if (payload.get("expect_live_field") != expect_live_field
+            or type(payload.get("expect_airbox_vectors")) is not bool
+            or payload["expect_airbox_vectors"] is not expect_airbox_vectors):
+        raise BuildControlError("Browser helper live-field expectation differs from the admitted operation")
+    if "expect_ambiguous_compute_fields" not in payload:
+        if expect_ambiguous_compute_fields:
+            raise BuildControlError("Browser helper omitted the enabled ambiguous-command expectation")
+    elif (type(payload["expect_ambiguous_compute_fields"]) is not bool
+            or payload["expect_ambiguous_compute_fields"] is not expect_ambiguous_compute_fields):
+        raise BuildControlError("Browser helper ambiguous-command expectation differs from the admitted operation")
+    if expect_live_field is not None and not canvas_only:
+        raise BuildControlError("Live-field result is outside the canvas-only QA scope")
+    if expect_airbox_vectors and expect_live_field is None:
+        raise BuildControlError("Airbox-vector result omitted its expected live field")
+    if expect_ambiguous_compute_fields and not canvas_only:
+        raise BuildControlError("Ambiguous Compute Fields result is outside canvas-only QA scope")
+    expected_scope = (
+        "canvas-home-ambiguous-compute-fields" if expect_ambiguous_compute_fields else
+        "canvas-home-live-field-airbox" if expect_airbox_vectors else
+        "canvas-home-live-field" if expect_live_field is not None else
+        "canvas-home-only" if canvas_only else
+        "full-browser-qa"
+    )
+    if payload.get("qa_scope") != expected_scope:
+        raise BuildControlError("Browser helper QA scope differs from the admitted operation")
+    expected_skipped = CANVAS_ONLY_SKIPPED_AREAS if canvas_only else []
+    if payload.get("skipped_areas") != expected_skipped:
+        raise BuildControlError("Browser helper skipped-area declaration differs from its QA scope")
     if payload.get("home_round_trip") is not True:
         raise BuildControlError("Browser helper did not prove the Home round trip")
     _validate_session_result(payload.get("session"))
@@ -828,9 +1600,59 @@ def _parse_result(output: bytes, public_url: str, browser_url: str) -> dict[str,
         raise BuildControlError("Browser helper did not prove a visible, stable workspace canvas")
     _validate_canvas_result(payload.get("canvas_before"), "before Home")
     _validate_canvas_result(payload.get("canvas_after"), "after Home")
+    _validate_viewport_dom_observations(payload.get("viewport_dom_observations"))
+    if expect_live_field is not None:
+        _validate_live_field_observation(
+            payload.get("live_field_observation"), expect_live_field, expect_airbox_vectors
+        )
+        _validate_canvas_screenshot(payload.get("canvas_screenshot"))
+    elif payload.get("live_field_observation") is not None or payload.get("canvas_screenshot") is not None:
+        raise BuildControlError("Browser helper reported an unrequested live-field observation")
+    ambiguous_submission = payload.get("ambiguous_command_submission")
+    if expect_ambiguous_compute_fields:
+        _validate_ambiguous_command_submission(ambiguous_submission, payload.get("session"))
+        _validate_canvas_result(payload.get("canvas_after_compute_fields"), "after Compute Fields")
+    elif ambiguous_submission is not None:
+        raise BuildControlError("Browser helper reported an unrequested ambiguous command submission")
+    elif payload.get("canvas_after_compute_fields") is not None:
+        raise BuildControlError("Browser helper reported an unrequested post-command canvas check")
     for key in ("page_errors", "console_errors", "request_failures"):
         if type(payload.get(key)) is not int or payload[key] != 0:
             raise BuildControlError(f"Browser helper reported {key}; result is not valid evidence")
+    if payload.get("http_errors") != []:
+        raise BuildControlError("Browser helper reported HTTP errors; result is not valid evidence")
+    if "expected_console_errors" not in payload:
+        if expect_ambiguous_compute_fields:
+            raise BuildControlError("Browser helper omitted enabled response-loss console evidence")
+        expected_console_errors = []
+    else:
+        expected_console_errors = payload["expected_console_errors"]
+    if not isinstance(expected_console_errors, list) or len(expected_console_errors) > 1:
+        raise BuildControlError("Browser helper expected-console-error evidence is malformed")
+    if expected_console_errors:
+        if not expect_ambiguous_compute_fields:
+            raise BuildControlError("Browser helper suppressed a console error outside response-loss QA")
+        dropped = ambiguous_submission.get("expected_response_drop")
+        console_error = expected_console_errors[0]
+        if (not isinstance(dropped, Mapping) or not isinstance(console_error, Mapping)
+                or console_error.get("url") != dropped.get("url")
+                or console_error.get("message") != "Failed to load resource: net::ERR_CONNECTION_RESET"):
+            raise BuildControlError("Browser helper expected console error does not match the exact dropped POST")
+    if "expected_response_drops" not in payload:
+        if expect_ambiguous_compute_fields:
+            raise BuildControlError("Browser helper omitted enabled response-drop evidence")
+        expected_drops = []
+    else:
+        expected_drops = payload["expected_response_drops"]
+    if not isinstance(expected_drops, list):
+        raise BuildControlError("Browser helper response-drop evidence is malformed")
+    if not expect_ambiguous_compute_fields and expected_drops:
+        raise BuildControlError("Browser helper reported an unrequested response drop")
+    if expect_ambiguous_compute_fields:
+        proof_drop = ambiguous_submission.get("expected_response_drop")
+        if not isinstance(expected_drops, list) or expected_drops != [proof_drop]:
+            raise BuildControlError("Browser helper response-drop list differs from the exact command proof")
+    _validate_resource_responses(payload.get("resource_responses"))
     return payload
 
 
@@ -847,7 +1669,24 @@ def _remove_helper(operation: dict[str, object], identifier: object) -> None:
     operation["daemon_pending"] = False
 
 
-def _run(operation: dict[str, object], control: BuildControl, document: dict[str, object], identity: Mapping[str, str], selected: Path, frontend_volume: str, browser_image_id: str, public_url: str, browser_url: str, timeout: int) -> None:
+def _run(
+    operation: dict[str, object],
+    control: BuildControl,
+    document: dict[str, object],
+    identity: Mapping[str, str],
+    selected: Path,
+    frontend_volume: str,
+    browser_image_id: str,
+    public_url: str,
+    browser_url: str,
+    timeout: int,
+    canvas_only: bool | None = False,
+    expect_live_field: str | None = None,
+    expect_airbox_vectors: bool = False,
+    expect_ambiguous_compute_fields: bool = False,
+    airbox_inspector: bool = False,
+    airbox_inspector_script_sha256: str | None = None,
+) -> None:
     root = operation["root"]
     helper_name = "fullmag-browser-qa-" + operation["receipt"]["attempt"][:12]
     control.write(root + "/compose.json", document)
@@ -883,7 +1722,9 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
             helper_name,
             "browser-qa",
             data=canonical(document),
-            timeout=timeout,
+            # The Node helper owns its own bounded timeout. Leave it a minute
+            # to flush the result and stop before the outer Docker capture ends.
+            timeout=timeout + 60,
             allow_failure=True,
         )
     except ControlOutcomeUnknown:
@@ -891,19 +1732,33 @@ def _run(operation: dict[str, object], control: BuildControl, document: dict[str
     # Keep resources quarantined until the helper identity, result, durable
     # control-volume evidence, and explicit removal have all been observed.
     observed = _inspect(helper_name)
-    _validate_browser_helper(observed, control, identity, frontend_volume, browser_image_id, result.returncode, selected)
+    _validate_browser_helper(observed, control, identity, frontend_volume, browser_image_id, result.returncode, selected,
+        canvas_only=canvas_only,
+        expect_live_field=expect_live_field if expect_live_field is not None else None,
+        expect_airbox_vectors=expect_airbox_vectors if expect_live_field is not None else None,
+        expect_ambiguous_compute_fields=(expect_ambiguous_compute_fields if not airbox_inspector else None),
+        airbox_inspector=airbox_inspector)
     operation["receipt"]["browser_container_id"] = observed["Id"]
     control.write(root + "/receipt.json", operation["receipt"])
     raw = result.stdout
     control.write(root + "/runner-output.json", {
         "schema": "fullmag.docker-dev-browser-qa-runner-output.v1",
         "exit_code": result.returncode,
-        "stdout": _text(result.stdout, MAX_RESULT_BYTES // 2),
+        "stdout": _text(result.stdout, MAX_RESULT_BYTES),
         "stderr_tail": _text(result.stderr),
     })
     operation["daemon_pending"] = True
     try:
-        payload = _parse_result(raw, public_url, browser_url)
+        if airbox_inspector:
+            if not airbox_inspector_script_sha256:
+                raise BuildControlError("Airbox Inspector helper source hash is missing")
+            payload = _parse_airbox_inspector_result(
+                raw, public_url, browser_url, airbox_inspector_script_sha256
+            )
+        else:
+            payload = _parse_result(raw, public_url, browser_url, canvas_only=canvas_only,
+                expect_live_field=expect_live_field, expect_airbox_vectors=expect_airbox_vectors,
+                expect_ambiguous_compute_fields=expect_ambiguous_compute_fields)
     except BuildControlError as error:
         control.write(root + "/result.json", {
             "schema": RESULT_SCHEMA,
@@ -968,9 +1823,64 @@ def reconcile_browser_qa(control, selected, identity, args):
     prepare_viewport_fixture = inputs.get("prepare_viewport_fixture", False)
     if type(prepare_viewport_fixture) is not bool:
         raise BuildControlError("QA reconciliation viewport fixture input must be boolean")
+    canvas_only_input = inputs.get("canvas_only", False)
+    if type(canvas_only_input) is not bool:
+        raise BuildControlError("QA reconciliation canvas-only input must be boolean")
+    # Older receipts did not pin this option in Compose. Preserve their exact
+    # recipe while interpreting the missing input as the legacy full flow.
+    canvas_only_compose_pin = canvas_only_input if "canvas_only" in inputs else None
+    has_live_field_input = "expect_live_field" in inputs
+    has_airbox_input = "expect_airbox_vectors" in inputs
+    if has_live_field_input != has_airbox_input:
+        raise BuildControlError("QA reconciliation live-field expectation inputs are incomplete")
+    if has_live_field_input:
+        expect_live_field_input = inputs["expect_live_field"]
+        expect_airbox_vectors_input = inputs["expect_airbox_vectors"]
+        if (expect_live_field_input is not None
+                and (not isinstance(expect_live_field_input, str)
+                     or not expect_live_field_input
+                     or expect_live_field_input != expect_live_field_input.strip()
+                     or len(expect_live_field_input) > 512
+                     or any(ord(character) < 32 or ord(character) == 127
+                            for character in expect_live_field_input))):
+            raise BuildControlError("QA reconciliation expected quantity id is malformed")
+        if type(expect_airbox_vectors_input) is not bool:
+            raise BuildControlError("QA reconciliation airbox-vector expectation must be boolean")
+        if expect_live_field_input is None and expect_airbox_vectors_input:
+            raise BuildControlError("QA reconciliation airbox expectation has no live-field quantity")
+        if (expect_live_field_input is not None or expect_airbox_vectors_input) and not canvas_only_input:
+            raise BuildControlError("QA reconciliation live-field expectation requires canvas-only scope")
+        expect_live_field_compose_pin = expect_live_field_input
+        expect_airbox_compose_pin = (
+            expect_airbox_vectors_input if expect_live_field_input is not None else None
+        )
+    else:
+        # Receipts predating live-field expectations retain their exact Compose recipe.
+        expect_live_field_input = None
+        expect_airbox_vectors_input = False
+        expect_live_field_compose_pin = None
+        expect_airbox_compose_pin = None
+    has_ambiguous_command_input = "expect_ambiguous_compute_fields" in inputs
+    if has_ambiguous_command_input:
+        expect_ambiguous_command_input = inputs["expect_ambiguous_compute_fields"]
+        if type(expect_ambiguous_command_input) is not bool:
+            raise BuildControlError("QA reconciliation ambiguous-command expectation must be boolean")
+        if expect_ambiguous_command_input and not canvas_only_input:
+            raise BuildControlError("QA reconciliation ambiguous-command expectation requires canvas-only scope")
+        expect_ambiguous_command_compose_pin = expect_ambiguous_command_input
+    else:
+        # Older receipts did not pin the optional response-loss scenario.
+        expect_ambiguous_command_input = False
+        expect_ambiguous_command_compose_pin = None
+    if canvas_only_input and prepare_viewport_fixture:
+        raise BuildControlError("Canvas-only browser QA receipt cannot prepare a viewport fixture")
     expected_document = _compose_document(selected, identity, inputs["browser_image"],
         inputs["frontend_volume"], args.port, inputs["browser_runtime_timeout"],
-        prepare_viewport_fixture=prepare_viewport_fixture)
+        prepare_viewport_fixture=prepare_viewport_fixture,
+        canvas_only=canvas_only_compose_pin,
+        expect_live_field=expect_live_field_compose_pin,
+        expect_airbox_vectors=expect_airbox_compose_pin,
+        expect_ambiguous_compute_fields=expect_ambiguous_command_compose_pin)
     if canonical(document) != canonical(expected_document):
         raise BuildControlError("QA reconciliation Compose recipe differs")
     helper_name = "fullmag-control-" + attempt
@@ -1018,7 +1928,11 @@ def reconcile_browser_qa(control, selected, identity, args):
     if receipt.get("browser_image_id") != image_id:
         raise BuildControlError("QA reconciliation browser image pin differs")
     _validate_browser_helper(observed, control, identity, inputs["frontend_volume"],
-        image_id, state["ExitCode"], selected)
+        image_id, state["ExitCode"], selected,
+        canvas_only=canvas_only_compose_pin,
+        expect_live_field=expect_live_field_compose_pin,
+        expect_airbox_vectors=expect_airbox_compose_pin,
+        expect_ambiguous_compute_fields=expect_ambiguous_command_compose_pin)
     service = document["services"]["browser-qa"]
     if (observed["Config"].get("Cmd") != service["command"]
             or observed["Config"].get("Entrypoint") != image["Config"].get("Entrypoint")):
@@ -1092,6 +2006,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Opt in to preparing a disposable viewport fixture in this QA session",
     )
+    parser.add_argument(
+        "--canvas-only",
+        action="store_true",
+        help="Run only the visible canvas, session, Home round trip, and browser transport proof",
+    )
+    parser.add_argument(
+        "--expect-live-field",
+        help="Require the named live quantity to be visibly data-ready (canvas-only scope)",
+    )
+    parser.add_argument(
+        "--expect-airbox-vectors",
+        action="store_true",
+        help="Also require visible FDM airbox vectors (requires --expect-live-field)",
+    )
+    parser.add_argument(
+        "--expect-ambiguous-compute-fields",
+        action="store_true",
+        help="Exercise one real Compute Fields command with its accepted response dropped (canvas-only)",
+    )
+    parser.add_argument(
+        "--airbox-inspector",
+        action="store_true",
+        help="Run the read-only live Airbox mesh Inspector proof in the managed browser service",
+    )
     parser.add_argument("--reconcile-attempt")
     parser.add_argument("--expected-receipt-sha256")
     parser.add_argument("--expected-compose-sha256")
@@ -1111,6 +2049,27 @@ def main(argv: list[str] | None = None) -> int:
         or not 60 <= args.pull_timeout <= 1800
     ):
         raise BuildControlError("Browser QA port/timeout/pull-timeout is outside its bounded range")
+    if args.canvas_only and args.prepare_viewport_fixture:
+        raise BuildControlError("--canvas-only cannot be combined with --prepare-viewport-fixture")
+    if args.expect_live_field is not None:
+        if (not args.expect_live_field or args.expect_live_field != args.expect_live_field.strip()
+                or len(args.expect_live_field) > 512
+                or any(ord(character) < 32 or ord(character) == 127 for character in args.expect_live_field)):
+            raise BuildControlError("--expect-live-field requires a bounded, non-empty quantity id")
+    if (args.expect_live_field is not None or args.expect_airbox_vectors) and not args.canvas_only:
+        raise BuildControlError("--expect-live-field and --expect-airbox-vectors require --canvas-only")
+    if args.expect_airbox_vectors and args.expect_live_field is None:
+        raise BuildControlError("--expect-airbox-vectors requires --expect-live-field")
+    if args.expect_ambiguous_compute_fields and not args.canvas_only:
+        raise BuildControlError("--expect-ambiguous-compute-fields requires --canvas-only")
+    if args.airbox_inspector and (
+        args.prepare_viewport_fixture
+        or args.canvas_only
+        or args.expect_live_field is not None
+        or args.expect_airbox_vectors
+        or args.expect_ambiguous_compute_fields
+    ):
+        raise BuildControlError("--airbox-inspector cannot be combined with other browser QA scenarios")
     if not isinstance(args.browser_image, str) or not args.browser_image:
         raise BuildControlError("Browser QA requires a pinned Playwright image reference")
     _validate_browser_image_reference(args.browser_image)
@@ -1134,6 +2093,12 @@ def main(argv: list[str] | None = None) -> int:
         raise BuildControlError(f"Live development group validation failed: {error}") from error
     public_url = f"http://127.0.0.1:{args.port}"
     browser_url = "http://frontend:8080"
+    airbox_inspector_script_sha256 = None
+    if args.airbox_inspector:
+        harness = selected / "apps/control-room/scripts/verify-airbox-inspector.mjs"
+        if not harness.is_file():
+            raise BuildControlError("Selected checkout is missing the Airbox Inspector browser harness")
+        airbox_inspector_script_sha256 = hashlib.sha256(harness.read_bytes()).hexdigest()
     document = _compose_document(
         selected,
         identity,
@@ -1142,6 +2107,11 @@ def main(argv: list[str] | None = None) -> int:
         args.port,
         args.timeout,
         prepare_viewport_fixture=args.prepare_viewport_fixture,
+        canvas_only=(None if args.airbox_inspector else args.canvas_only),
+        expect_live_field=args.expect_live_field,
+        expect_airbox_vectors=(args.expect_airbox_vectors if args.expect_live_field is not None else None),
+        expect_ambiguous_compute_fields=(None if args.airbox_inspector else args.expect_ambiguous_compute_fields),
+        airbox_inspector=args.airbox_inspector,
     )
     source_commit = (current.get("source_commit") or (current.get("inputs") or {}).get("source_commit"))
     inputs = {
@@ -1167,6 +2137,12 @@ def main(argv: list[str] | None = None) -> int:
         "browser_runtime_timeout": args.timeout,
         "browser_image_pull_timeout": args.pull_timeout,
         "prepare_viewport_fixture": args.prepare_viewport_fixture,
+        "canvas_only": args.canvas_only,
+        "expect_live_field": args.expect_live_field,
+        "expect_airbox_vectors": args.expect_airbox_vectors,
+        "expect_ambiguous_compute_fields": args.expect_ambiguous_compute_fields,
+        "scenario": "airbox-inspector" if args.airbox_inspector else "standard",
+        "airbox_inspector_script_sha256": airbox_inspector_script_sha256,
     }
     with control.operation("browser-qa", inputs) as operation:
         live_fence = control.read("development/current.json")
@@ -1186,6 +2162,12 @@ def main(argv: list[str] | None = None) -> int:
             public_url,
             browser_url,
             args.timeout,
+            (None if args.airbox_inspector else args.canvas_only),
+            args.expect_live_field,
+            args.expect_airbox_vectors,
+            args.expect_ambiguous_compute_fields,
+            args.airbox_inspector,
+            airbox_inspector_script_sha256,
         )
     return 0
 

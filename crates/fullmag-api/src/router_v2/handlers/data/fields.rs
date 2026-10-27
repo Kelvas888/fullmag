@@ -257,6 +257,40 @@ fn read_required_string<'a>(
         .ok_or_else(|| format!("{context} {field} is missing or malformed"))
 }
 
+/// Decoded Airbox field values keyed by their validated `field_artifact_sha256`.
+/// A multilayer Airbox field is millions of JSON triplets in the store; one
+/// vector request used to re-read, hash and parse all of them (~8 s on a
+/// Windows-folder store) to return a few thousand samples. The key is the
+/// content digest the manifest already verifies, so a hit is the same data.
+const AIRBOX_VALUES_CACHE_ENTRIES: usize = 2;
+
+static AIRBOX_VALUES_CACHE: std::sync::Mutex<
+    std::collections::VecDeque<(String, std::sync::Arc<Vec<f64>>)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn cached_airbox_values(field_hash: &str) -> Option<Vec<f64>> {
+    let cache = AIRBOX_VALUES_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .iter()
+        .find(|(hash, _)| hash == field_hash)
+        .map(|(_, values)| values.as_ref().clone())
+}
+
+fn remember_airbox_values(field_hash: &str, values: &[f64]) {
+    let mut cache = AIRBOX_VALUES_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.iter().any(|(hash, _)| hash == field_hash) {
+        return;
+    }
+    if cache.len() == AIRBOX_VALUES_CACHE_ENTRIES {
+        cache.pop_front();
+    }
+    cache.push_back((field_hash.to_string(), std::sync::Arc::new(values.to_vec())));
+}
+
 /// Reads the runner-origin Airbox carrier without ever projecting it onto the
 /// common FFT layout.  A malformed carrier is deliberately indistinguishable
 /// from an unavailable field to browser callers, but is retained here as a
@@ -495,7 +529,15 @@ fn load_fdm_multilayer_airbox_carrier_values(
             return Err("Airbox binary values lack their exact validated JSON artifact binding".into());
         }
     }
-    let values = if include_values && binary_reference.is_some() {
+    let cached_values = if include_values {
+        cached_airbox_values(expected_field_hash)
+    } else {
+        None
+    };
+    let cache_hit = cached_values.is_some();
+    let values = if let Some(values) = cached_values {
+        values
+    } else if include_values && binary_reference.is_some() {
         let reader = snapshot.latest_fields.binary_reader(requested_quantity)
             .ok_or_else(|| "Airbox binary field has no trusted runtime owner".to_string())?;
         reader.read_referenced_values(binary_reference.as_ref().unwrap()).map_err(|error| error.to_string())?
@@ -579,6 +621,9 @@ fn load_fdm_multilayer_airbox_carrier_values(
     }
     values
     } else { Vec::new() };
+    if include_values && !cache_hit {
+        remember_airbox_values(expected_field_hash, &values);
+    }
     let expected_carrier_fingerprint = if schema == FDM_MULTILAYER_AIRBOX_SCHEMA {
         fdm_multilayer_airbox_carrier_fingerprint(
         quantity_id,
@@ -3862,7 +3907,7 @@ fn resolve_field_scope(
             topology, mapping, ..
         }) => (*topology, Some(mapping)),
         _ => (
-            snapshot.fem_mesh.as_ref().ok_or_else(|| {
+            snapshot.fem_mesh.as_deref().ok_or_else(|| {
                 ApiError::bad_request(format!(
                     "field scope '{scope_kind}' requires FEM mesh topology"
                 ))
@@ -5235,7 +5280,7 @@ async fn get_field_vector_unfenced(
         snapshot
             .fem_mesh
             .as_ref()
-            .map(fullmag_runner::fem_mesh_topology_fingerprint)
+            .map(|mesh| mesh.topology_fingerprint().to_owned())
     };
     let topology_hash_bytes = topology_hash
         .as_deref()
@@ -5896,7 +5941,7 @@ fn serialize_analysis_field_vector_binary(
         (node_indices, FieldVectorIndexing::ExplicitNodeIndices)
     };
 
-    let topology_hash = fullmag_runner::fem_mesh_topology_fingerprint(mesh);
+    let topology_hash = mesh.topology_fingerprint().to_owned();
     let topology_hash_bytes = mesh_topology_hash_bytes(&topology_hash)?;
     let (scope_kind, scope_id) = match scope {
         Some(scope) => (scope.kind.as_str(), scope.id.as_deref().unwrap_or("")),
@@ -6397,7 +6442,7 @@ fn validate_eigen_mode_source_mesh_identity(
             relative_path, source.indexing
         )));
     }
-    let current_topology_fingerprint = fullmag_runner::fem_mesh_topology_fingerprint(mesh);
+    let current_topology_fingerprint = mesh.topology_fingerprint().to_owned();
     if source.topology_fingerprint.is_empty()
         || source.topology_fingerprint != current_topology_fingerprint
     {
@@ -9441,7 +9486,7 @@ mod tests {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot
             .field_quantity_revisions
             .insert("H_demag".to_string(), 7);
@@ -9516,7 +9561,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(
             serde_json::from_value(serde_json::json!({
                 "status": "running",
@@ -9636,7 +9681,7 @@ mod tests {
                 "backend": "fdm_multilayer",
                 "grid_cells": [2, 1, 1]
             }
-        }));
+        }).into());
         add_physical_field_source(&mut snapshot, 2, None);
         snapshot.preview_cache.insert(LivePreviewField {
             config_revision: 1,
@@ -9717,7 +9762,7 @@ mod tests {
             generation_id: Some("mesh-generation-1".to_string()),
             per_domain_quality: std::collections::HashMap::new(),
             build_report: None,
-        });
+        }.into());
         snapshot.field_quantity_revisions.insert("m".to_string(), 9);
         add_physical_field_source(&mut snapshot, 2, None);
         snapshot.preview_cache.insert(LivePreviewField {
@@ -9781,7 +9826,7 @@ mod tests {
                 "backend": "fdm",
                 "grid_cells": [1, 1, 1]
             }
-        }));
+        }).into());
         snapshot.live_state = Some(
             serde_json::from_value(serde_json::json!({
                 "status": "running",
@@ -9894,7 +9939,7 @@ mod tests {
                 "origin_m": [0.0, 0.0, 0.0],
                 "cell_size": [1.0, 1.0, 1.0]
             }
-        }));
+        }).into());
         snapshot.field_samples_revision = 91;
         snapshot
             .field_quantity_revisions
@@ -10090,7 +10135,7 @@ mod tests {
         let mut snapshot = default_current_live_state(&request);
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "fdm" } }
-        }));
+        }).into());
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
             "H_demag": {
                 "source_step": 12,
@@ -10260,7 +10305,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "session_id": "scope-test" }))
                 .expect("minimal live snapshot request should deserialize");
         let mut snapshot = default_current_live_state(&request);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
 
         let aggregate_scope = resolve_field_scope(
             &FieldVectorQuery {
@@ -10436,7 +10481,7 @@ mod tests {
         }))
         .expect("minimal live snapshot request should deserialize");
         let mut snapshot = default_current_live_state(&request);
-        snapshot.fem_mesh = Some(mesh);
+        snapshot.fem_mesh = Some(mesh.into());
 
         let scope = resolve_field_scope(
             &FieldVectorQuery {
@@ -10756,7 +10801,7 @@ mod tests {
             periodic_boundary_pairs: Vec::new(),
             periodic_node_pairs: Vec::new(),
             build_report: None,
-        });
+        }.into());
         let values = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
 
         let serialized = serialize_analysis_field_vector_binary(

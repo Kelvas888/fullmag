@@ -314,6 +314,42 @@ kodem 2; nie oznacza wykonania symulacji. Raport zachowuje osobno identyfikator
 operacji oraz `development_attempt`. Długi komunikat błędu pozostaje ograniczony
 do 2048 znaków, lecz zachowuje początek i końcową przyczynę tracebacku.
 
+Wyjątek zgłoszony przez sam skrypt podczas ładowania (np. `ValueError` z walidacji
+DSL) helper SceneDocument zgłasza kopertą `fullmag.script-load-rejection.v1`
+(kod wyjścia 2). Trasa startupowa API zamienia wyłącznie tę kopertę na HTTP 422
+`validation_error`, zanim powstanie stan live, RunIntent lub wpis katalogu. Jest to
+więc terminalne odrzucenie: grupa pozostaje wolna dla kolejnego skryptu, a wynik
+`run-script` zawiera pole `rejection` z kodem i komunikatem API (wraz z numerem
+linii skryptu). Inne niepowodzenie helpera pozostaje HTTP 500 i nieznanym wynikiem.
+
+Grupa zablokowana tym błędem przed poprawką (receipt aktywacji
+`outcome-unknown-resources-retained` z `HTTP 500 ... python SceneDocument helper
+failed`) nie jest przeklasyfikowywana automatycznie i nie ma trasy zwalniającej
+tę kwarantannę: pozostaje zablokowana do wycofania grupy przez jej właściciela
+w cyklu sprzątania worktree (**NOT VERIFIED** jako trasa odzyskania). Nie usuwaj
+ręcznie `active`, markera ani lease.
+
+Przekroczenie 30-sekundowego limitu helpera Pythona podczas ładowania skryptu
+(proces helpera zabity i zebrany) API zwraca teraz również jako HTTP 422
+`validation_error`. Aktywację, która przed tą zmianą zapisała nieznany wynik z
+dokładnie tym HTTP 500 (`Python helper exceeded the 30 second deadline`),
+zwalnia trasa:
+
+```bash
+just docker-dev-release-unknown-activation "<checkout>" <activation-attempt>
+just docker-dev-recreate-volume <attempt> <config-sha256> "<checkout>" <port> true
+```
+
+Pierwsze polecenie wymaga zatrzymanego backendu (`Exited (0)`, bez OOM, ten sam
+kontener, który zapisał wynik, zatrzymany po jego zapisie), drzewa procesów
+`drained` z tego uruchomienia, pustego magazynu zaakceptowanych runów i
+działającego oryginalnego helpera lease. Zapisuje dowód
+`pre-mutation-release-proof.json` i terminal `failed-confirmed`
+(`activation_state: not-admitted`); marker aktywacji pozostaje `started`.
+Nie ponawia skryptu i nie zmienia danych sesji. Inny błąd, uruchomiony backend
+lub zaakceptowany run pozostawiają kwarantannę. Trasa na żywej grupie:
+**NOT VERIFIED**.
+
 Każde jawne wywołanie otrzymuje nowy domyślny `request_id` w postaci
 `docker-volume-<uuid>`, zapisany w receipcie przed wysłaniem żądania. Dzięki temu
 ten sam plik może posłużyć do kolejnej symulacji. Jawny `request_id` pozostaje
@@ -531,3 +567,28 @@ legacy błąd loopback z zakończonym API, niezmienionym bootstrapem i ownerem.
 Archiwa, request i natywna walidacja runu nadal są obowiązkowe. Ten wyjątek
 nie powtarza Solve, nie resetuje ownera i nie zastępuje recovery. Inny błąd,
 zmiana ownera lub brak dowodów nadal blokują start; nie usuwaj ręcznie receiptów.
+
+## Kwarantanna pustej sesji po nagłym zatrzymaniu Docker
+
+Gdy helper aktywacji zniknął, a owner zachował stan ready, zwykłe resume
+pozostaje zablokowane. Jawne odzyskanie jest dostępne wyłącznie dla store
+bez RunIntent, runów i wyników oraz grupowego ledgera bez rezerwacji:
+
+```sh
+python3 -B scripts/docker_dev.py --repo-root "$source" quarantine-empty-stopped \
+  --source-root "$source" --activation "$activation" --recovery-id "$recovery"
+# Po kontroli planu: identyczne piny i dodatkowe --apply.
+```
+
+Recovery ID jest nowym UUID bez myślników, zachowywanym przy kontynuacji.
+Polecenie dowodzi zatrzymania dokładnej pary, nieobecności helpera i braku
+innych konsumentów; pod blokadami ponownie sprawdza piny i publikuje trwały
+intent przed usunięciem wyłącznie zatrzymanych kontenerów. Nie używa force.
+Po częściowym usunięciu wolno kontynuować tylko ten sam intent z dowodem
+nieobecności dokładnych ID. Stare control/state/ledger pozostają bez zmian,
+a niezmienny receipt otwiera świeży namespace z nowym ledgerem. Stary
+request_id pozostaje zakazany; nie potwierdzamy wyniku starej aktywacji,
+drainu ani wykonania fizyki. Następnie obowiązuje zwykły docker-dev up
+wybranego checkoutu i nowe jawne żądanie skryptu. Implementacja i kontrola
+interpretowana nie zastępują dowodu runtime tej trasy: NOT VERIFIED do
+zakończenia rzeczywistego preflight→apply→API→browser.

@@ -20,6 +20,9 @@ mod owned_worker_process;
 mod compute_operator_env;
 use owned_worker_process::OwnedWorkerProcess;
 
+/// How long the read-only Stop poll, or a heartbeat failing on transient store
+/// I/O, may keep failing before the attempt ends.
+const STOP_POLL_FAILURE_GRACE: Duration = Duration::from_secs(15);
 const SUPERVISOR_DIRECTORY: &str = "supervisor-slots";
 const LEGACY_SINGLE_WORKER_SLOT: &str = "slot-0";
 const SLOT_OWNER_FILE: &str = "owner.v2.json";
@@ -1475,6 +1478,8 @@ where
     let mut last_heartbeat = Instant::now();
     let mut heartbeat_enabled = heartbeat_interval.is_some();
     let mut stop_observed = false;
+    let mut stop_poll_failing_since: Option<Instant> = None;
+    let mut heartbeat_failing_since: Option<Instant> = None;
 
     loop {
         if let Some(status) = child.try_wait().context("observe accepted worker exit")? {
@@ -1520,7 +1525,24 @@ where
             );
         }
         let stop_requested_now = match stop_requested() {
-            Ok(stop_requested) => stop_requested,
+            Ok(stop_requested) => {
+                stop_poll_failing_since = None;
+                stop_requested
+            }
+            // The Stop poll only reads the store. A read that fails briefly
+            // (a busy writer, or a Windows-folder store returning ENOMEM under
+            // load) observes nothing this tick; a later tick sees the Stop.
+            // Only a poll that keeps failing ends the attempt.
+            Err(error)
+                if stop_poll_failing_since
+                    .get_or_insert_with(Instant::now)
+                    .elapsed()
+                    < STOP_POLL_FAILURE_GRACE =>
+            {
+                tracing::warn!(error = %format!("{error:#}"), "durable worker Stop poll failed; retrying");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             Err(error) => {
                 let reason = format!("poll durable worker Stop request: {error:#}");
                 let _ = child.kill();
@@ -1548,13 +1570,30 @@ where
             && heartbeat_interval.is_some_and(|interval| last_heartbeat.elapsed() >= interval)
         {
             match heartbeat() {
-                Ok(keep_renewing) => heartbeat_enabled = keep_renewing,
+                Ok(keep_renewing) => {
+                    heartbeat_failing_since = None;
+                    heartbeat_enabled = keep_renewing;
+                }
                 Err(error) => {
                     if error
                         .chain()
                         .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
                     {
                         std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    // A Windows-folder store returns ENOMEM under load. The
+                    // heartbeat recovers the coordinator before it renews, so
+                    // a later tick repeats it safely; only a heartbeat that
+                    // keeps failing ends the attempt.
+                    if fullmag_runtime_control::is_transient_store_io(&error)
+                        && heartbeat_failing_since
+                            .get_or_insert_with(Instant::now)
+                            .elapsed()
+                            < STOP_POLL_FAILURE_GRACE
+                    {
+                        tracing::warn!(error = %format!("{error:#}"), "accepted-worker heartbeat failed on transient store I/O; retrying");
+                        std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     let reason = format!("renew accepted-worker heartbeat: {error:#}");
@@ -2320,7 +2359,7 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
         .unwrap_or(stderr.as_ref());
     let normalized = failure.split_whitespace().collect::<Vec<_>>().join(" ");
     let detail = if normalized.is_empty() {
-        format!("exit code {:?}", output.status.code())
+        "no worker error output".to_string()
     } else {
         // Prefer the worker's own error report; diagnostic progress lines
         // printed around it must not hide the failure. Otherwise keep the tail.
@@ -2335,7 +2374,9 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
             if start > 0 { format!("...{tail}") } else { tail }
         }
     };
-    format!("accepted worker process failed: {detail}")
+    // ExitStatus also preserves a Unix signal (where code() is None).
+    // Stderr can contain only successful startup diagnostics after a crash.
+    format!("accepted worker process failed ({}): {detail}", output.status)
 }
 
 fn commit_worker_command(
@@ -3243,7 +3284,7 @@ mod tests {
         let started = Instant::now();
         let outcome = observe_child(
             OwnedWorkerProcess::unowned_test_fixture(child),
-            Some(Duration::from_secs(5)),
+            Some(STOP_POLL_FAILURE_GRACE * 4),
             Some(Duration::from_millis(20)),
             || Ok(true),
             || bail!("controlled Stop polling failure"),
@@ -3256,7 +3297,75 @@ mod tests {
             .control_failure_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("controlled Stop polling failure")));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() >= STOP_POLL_FAILURE_GRACE);
+        assert!(started.elapsed() < STOP_POLL_FAILURE_GRACE * 4);
+    }
+
+    #[test]
+    fn transient_stop_poll_failures_do_not_end_the_worker() {
+        let current_test_process = std::env::current_exe().unwrap();
+        let child = Command::new(current_test_process)
+            .arg("--exact")
+            .arg("accepted_study_supervisor::tests::timeout_child_fixture")
+            .arg("--nocapture")
+            .env("FULLMAG_ACCEPTED_SUPERVISOR_TIMEOUT_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut polls = 0;
+        let outcome = observe_child(
+            OwnedWorkerProcess::unowned_test_fixture(child),
+            Some(Duration::from_secs(2)),
+            None,
+            || Ok(true),
+            || {
+                polls += 1;
+                if polls <= 3 {
+                    bail!("Cannot allocate memory (os error 12)")
+                }
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert!(polls > 3);
+        assert!(outcome.timed_out);
+        assert!(outcome.control_failure_reason.is_none());
+    }
+
+    #[test]
+    fn transient_heartbeat_store_io_failures_do_not_end_the_worker() {
+        let current_test_process = std::env::current_exe().unwrap();
+        let child = Command::new(current_test_process)
+            .arg("--exact")
+            .arg("accepted_study_supervisor::tests::timeout_child_fixture")
+            .arg("--nocapture")
+            .env("FULLMAG_ACCEPTED_SUPERVISOR_TIMEOUT_CHILD", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut heartbeats = 0;
+        let outcome = observe_child(
+            OwnedWorkerProcess::unowned_test_fixture(child),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(20)),
+            || {
+                heartbeats += 1;
+                if heartbeats <= 3 {
+                    return Err(anyhow::Error::new(std::io::Error::from_raw_os_error(12))
+                        .context("reading coordinator journal entry"));
+                }
+                Ok(true)
+            },
+            || Ok(false),
+        )
+        .unwrap();
+        assert!(heartbeats > 3);
+        assert!(outcome.timed_out);
+        assert!(outcome.control_failure_reason.is_none());
     }
 
     #[test]

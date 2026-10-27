@@ -1398,8 +1398,12 @@ def _prepare_backend_cache(layout: Mapping[str, object], repo: Path, image_id: s
             if not isinstance(document, Mapping):
                 raise _fail("running Docker cache-consumer inventory is malformed")
             state = document.get("State")
-            if not isinstance(state, Mapping) or state.get("Running") is not True:
-                raise _fail("Docker cache-consumer inventory changed during inspection")
+            if not isinstance(state, Mapping):
+                raise _fail("running Docker cache-consumer inventory is malformed")
+            # A helper of another DEV group that exited after `docker ps` is
+            # no longer a consumer, exactly as if it had exited before it.
+            if state.get("Running") is not True:
+                continue
             consumers.append(document)
         return tuple(consumers)
 
@@ -2504,6 +2508,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=_repo_default(),
                         help="main Fullmag checkout used for storage and Compose definitions")
     subparsers = parser.add_subparsers(dest="action", required=True)
+    empty_quarantine = subparsers.add_parser(
+        "quarantine-empty-stopped",
+        help="quarantine one empty session after an abrupt stop; preserve old evidence and never replay activation",
+    )
+    empty_quarantine.add_argument("--source-root", type=Path, required=True)
+    empty_quarantine.add_argument("--activation", required=True)
+    empty_quarantine.add_argument("--recovery-id", required=True)
+    empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
@@ -2630,6 +2642,40 @@ def _parser() -> argparse.ArgumentParser:
         "--pending-activation",
         help="close one exact unreleased preparation after native owner failure; permits only subsequent fresh-state archival",
     )
+    stop_held = subparsers.add_parser(
+        "stop-held-retirement-volume",
+        help="preview a pinned diagnostic backend drain; apply requires an explicit UI-reset acknowledgement and plan digest",
+    )
+    stop_held.add_argument("--attempt", required=True)
+    stop_held.add_argument("--iteration-attempt", required=True)
+    stop_held.add_argument("--activation-attempt", required=True)
+    stop_held.add_argument("--config-sha256", required=True)
+    stop_held.add_argument("--source-root", type=Path, required=True)
+    stop_held.add_argument("--port", type=int, required=True)
+    stop_held.add_argument("--apply", action="store_true")
+    stop_held.add_argument("--allow-ui-reset", action="store_true")
+    stop_held.add_argument("--expected-plan-sha256")
+    cancelled_activation = subparsers.add_parser(
+        "recover-cancelled-activation",
+        help="preview archival recovery of one cancelled preparation and its retained activation lease",
+    )
+    cancelled_activation.add_argument("--attempt", required=True)
+    cancelled_activation.add_argument("--iteration-attempt", required=True)
+    cancelled_activation.add_argument("--activation-attempt", required=True)
+    cancelled_activation.add_argument("--config-sha256", required=True)
+    cancelled_activation.add_argument("--source-root", type=Path, required=True)
+    cancelled_activation.add_argument("--port", type=int, required=True)
+    cancelled_activation.add_argument("--apply", action="store_true")
+    cancelled_activation.add_argument("--expected-plan-sha256")
+    stop_bootstrap = subparsers.add_parser(
+        "stop-bootstrap-volume",
+        help="stop one pinned backend retaining only its exact pre-owner startup-fenced diagnostic API",
+    )
+    stop_bootstrap.add_argument("--attempt", required=True)
+    stop_bootstrap.add_argument("--config-sha256", required=True)
+    stop_bootstrap.add_argument("--resume-attempt", required=True)
+    stop_bootstrap.add_argument("--source-root", type=Path, required=True)
+    stop_bootstrap.add_argument("--port", type=int, required=True)
     recreate_volume = subparsers.add_parser("recreate-volume", help="Replace exact stopped-backend DEV services while retaining Docker caches")
     recreate_volume.add_argument("--attempt", required=True)
     recreate_volume.add_argument("--config-sha256", required=True)
@@ -2886,6 +2932,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             from docker_volume_stop_diagnostic import stop_diagnostic
             result = stop_diagnostic(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "stop-held-retirement-volume":
+            from docker_volume_stop_held_retirement import apply, plan
+            from docker_volume_retirement_probe import inspect_retirement
+            if args.apply:
+                result = apply(args)
+            else:
+                if args.allow_ui_reset or args.expected_plan_sha256 is not None:
+                    raise _fail("Apply acknowledgement and plan digest require --apply")
+                result = plan(inspect_retirement(args))
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "recover-cancelled-activation":
+            from docker_volume_cancelled_activation import run as recover_cancelled_activation
+            result = recover_cancelled_activation(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "stop-bootstrap-volume":
+            from docker_volume_stop_bootstrap import stop_bootstrap
+            result = stop_bootstrap(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
             if args.resume_recreation is not None:
                 from docker_volume_dev import resume_recreation
@@ -2906,6 +2970,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "recover-cancelled-volume":
             from docker_volume_cancelled_recovery import recover_cancelled
             recover_cancelled(args)
+        elif args.action == "quarantine-empty-stopped":
+            from docker_volume_empty_quarantine import quarantine
+            quarantine(args)
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)

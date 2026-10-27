@@ -91,6 +91,8 @@ mod script;
 mod script_check;
 mod session;
 mod session_persistence;
+mod shared_json;
+mod shared_mesh;
 mod types;
 
 use artifacts::*;
@@ -3917,7 +3919,7 @@ mod authoring_grid_heartbeat_tests {
         req.session_status = Some("running".into());
         assert!(!is_authoring_grid_snapshot(&req));
         let mut req = grid();
-        req.metadata = Some(json!({"publisher": "runtime"}));
+        req.metadata = Some(json!({"publisher": "runtime"}).into());
         assert!(!is_authoring_grid_snapshot(&req));
         let mut req = grid();
         req.coupled_checkpoint = Some(json!({}));
@@ -5500,6 +5502,15 @@ async fn get_or_load_current_live_scene_document_with_context(
         if let Some(scene_document) = snapshot.scene_document.clone() {
             return Ok(scene_document);
         }
+        // Diagnostic reads may expose the retained model after a runtime
+        // failure, but must never re-execute Python to reconstruct a scene.
+        if state.development_admission.observe_runtime_failure_fence() {
+            return Err(ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "retained_scene_unavailable",
+                "No retained scene is available. Script loading is disabled after a runtime failure; inspect diagnostics before a managed restart.",
+            ));
+        }
         let script_path = snapshot.session.script_path.trim();
         if script_path.is_empty() {
             return Err(ApiError::not_found(
@@ -5532,6 +5543,13 @@ async fn get_or_load_current_live_scene_document_with_context(
         )?;
     }
     if snapshot.scene_document.is_none() {
+        if state.development_admission.observe_runtime_failure_fence() {
+            return Err(ApiError::with_status_and_code(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "retained_scene_unavailable",
+                "Runtime failed while the scene was loading; the retained workspace was not changed. Inspect diagnostics before a managed restart.",
+            ));
+        }
         snapshot.builder_adapter = builder_adapter;
         snapshot.scene_document = Some(current_scene);
     }
@@ -6691,7 +6709,7 @@ fn build_spatial_preview_state(
             auto_downscaled: false,
             auto_downscale_message: None,
             preview_grid: [vectors.len(), 1, 1],
-            fem_mesh: Some(mesh.clone()),
+            fem_mesh: Some(fullmag_runner::FemMeshPayload::clone(mesh)),
             original_node_count: Some(mesh.nodes.len()),
             original_face_count: Some(mesh.facet_count()),
             active_mask,
@@ -6983,7 +7001,7 @@ fn build_preview_state_from_live_field(
             auto_downscaled: field.auto_downscaled,
             auto_downscale_message: field.auto_downscale_message.clone(),
             preview_grid,
-            fem_mesh: Some(mesh.clone()),
+            fem_mesh: Some(fullmag_runner::FemMeshPayload::clone(&mesh)),
             original_node_count: Some(mesh.nodes.len()),
             original_face_count: Some(mesh.facet_count()),
             active_mask,
@@ -7190,12 +7208,9 @@ fn current_global_scalar_value(current: &SessionStateResponse, quantity: &str) -
             // Only the component fallback needs plan provenance. Do not clone
             // mesh/material arrays on live reads or unrelated scalar requests.
             let plan = (metric_key == "e_rotated_dmi")
-                .then(|| current.metadata.as_ref()?.get("execution_plan"))
-                .flatten()
-                .and_then(|value| {
-                    serde_json::from_value::<fullmag_ir::ExecutionPlanIR>(value.clone()).ok()
-                });
-            run_manifest_scalar_value(current.run.as_ref(), metric_key, plan.as_ref())
+                .then(|| current.metadata.as_ref()?.execution_plan())
+                .flatten();
+            run_manifest_scalar_value(current.run.as_ref(), metric_key, plan.as_deref())
         })
 }
 

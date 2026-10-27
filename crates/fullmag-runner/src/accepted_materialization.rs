@@ -11,7 +11,7 @@ use fullmag_quantities::{AcceptedStateRef, ObservationClock, QuantityId, Quantit
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{quantities::QuantitySpec, types::LivePreviewField};
+use crate::{quantities::QuantitySpec, types::LivePreviewField, RuntimeEngineId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -647,8 +647,69 @@ fn select_active_quantities(
     Ok(requested.to_vec())
 }
 
-fn validate_provenance(input: &AcceptedMagnetizationInput, expected_engine: &str) -> Result<(), String> {
-    let actual = input.provenance.get("execution_engine").and_then(Value::as_str).unwrap_or_default();
+fn validate_provenance(
+    input: &AcceptedMagnetizationInput,
+    expected_engine: &str,
+) -> Result<(), String> {
+    validate_execution_engine_provenance(&input.provenance, expected_engine)
+}
+
+/// Validate the actual engine and precision recorded by an accepted state
+/// against the runner's resolution of its exact backend plan. This keeps the
+/// provenance aliases in one runner-owned place and rejects plan/lane pairs
+/// that the runtime resolver cannot produce.
+pub fn validate_accepted_state_execution_provenance(
+    plan: &BackendPlanIR,
+    engine: RuntimeEngineId,
+    provenance: &Value,
+) -> Result<(), String> {
+    let (expected_engine, expected_precision) = match (plan, engine) {
+        (BackendPlanIR::Fdm(plan), RuntimeEngineId::FdmCpuReference) => {
+            ("fdm_cpu_reference", plan.precision)
+        }
+        (BackendPlanIR::Fdm(plan), RuntimeEngineId::FdmCuda) => ("fdm_cuda", plan.precision),
+        (BackendPlanIR::FdmMultilayer(plan), RuntimeEngineId::FdmCpuReference) => {
+            ("cpu_reference_multilayer", plan.precision)
+        }
+        (BackendPlanIR::FdmMultilayer(plan), RuntimeEngineId::FdmCuda) => {
+            ("fdm_multilayer_cuda", plan.precision)
+        }
+        (BackendPlanIR::Fem(plan), RuntimeEngineId::FemCpuNative) => {
+            ("fem_cpu_native", plan.precision)
+        }
+        (BackendPlanIR::Fem(plan), RuntimeEngineId::FemNativeGpu) => {
+            ("fem_native_gpu", plan.precision)
+        }
+        _ => {
+            return Err("accepted state engine is incompatible with its resolved backend plan".into())
+        }
+    };
+
+    validate_execution_engine_provenance(provenance, expected_engine)?;
+    let expected_precision = match expected_precision {
+        fullmag_ir::ExecutionPrecision::Single => "single",
+        fullmag_ir::ExecutionPrecision::Double => "double",
+    };
+    let actual_precision = provenance
+        .get("precision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "accepted state provenance has no actual precision".to_string())?;
+    if actual_precision != expected_precision {
+        return Err(format!(
+            "accepted state precision '{actual_precision}' differs from resolved plan precision '{expected_precision}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_engine_provenance(
+    provenance: &Value,
+    expected_engine: &str,
+) -> Result<(), String> {
+    let actual = provenance
+        .get("execution_engine")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let matches_lane = match expected_engine {
         "fdm_cpu_reference" => matches!(actual, "cpu_reference" | "fdm_cpu_reference"),
         "fdm_cuda" => matches!(actual, "cuda_fdm" | "fdm_cuda"),
@@ -660,7 +721,9 @@ fn validate_provenance(input: &AcceptedMagnetizationInput, expected_engine: &str
         other => actual == other,
     };
     if !matches_lane {
-        return Err(format!("accepted state engine '{actual}' differs from requested lane '{expected_engine}'"));
+        return Err(format!(
+            "accepted state engine '{actual}' differs from requested lane '{expected_engine}'"
+        ));
     }
     Ok(())
 }
@@ -892,7 +955,8 @@ fn append_airbox_observations(
     fields: &mut Vec<AcceptedMaterializedField>,
     unavailable: &mut BTreeMap<String, String>,
 ) -> Result<(), String> {
-    if !request.problem.problem_meta.runtime_metadata.contains_key("airbox_observation")
+    if !matches!(&request.plan.backend_plan, BackendPlanIR::FdmMultilayer(_))
+        || !crate::fdm::cpu::airbox_observation::airbox_observation_requested(request.problem)
         || !fields.iter().any(|field| field.quantity_id == "H_demag")
     { return Ok(()); }
     let plan = crate::materialize_study_magnetization_input(request.plan,

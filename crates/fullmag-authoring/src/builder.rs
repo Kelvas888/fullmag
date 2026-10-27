@@ -811,9 +811,13 @@ pub struct ScriptBuilderFdmDemagState {
     #[serde(default = "default_fdm_demag_mode")]
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fft_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_cells: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_cells_xy: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_cell_size: Option<[f64; 3]>,
     #[serde(default = "default_true")]
     pub explain: bool,
 }
@@ -823,8 +827,10 @@ impl Default for ScriptBuilderFdmDemagState {
         Self {
             strategy: default_fdm_demag_strategy(),
             mode: default_fdm_demag_mode(),
+            fft_backend: None,
             common_cells: None,
             common_cells_xy: None,
+            common_cell_size: None,
             explain: default_true(),
         }
     }

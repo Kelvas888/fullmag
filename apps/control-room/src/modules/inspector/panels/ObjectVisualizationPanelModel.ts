@@ -27,6 +27,7 @@ import {
   isScalarSpatialQuantityId,
   quantityCatalogEntrySupportsAirbox,
   quantityCatalogEntrySupportsSpatialVisualization,
+  quantityCatalogPickerItem,
   resolveCanonicalQuantityId,
 } from "@/kernel/api/quantityIds";
 import {
@@ -112,6 +113,7 @@ export function resolveObjectVisualizationDataState({
   backendAvailabilityStatus,
   carrier,
   fieldCatalog,
+  fieldCatalogRequested = true,
   fieldCatalogStatus,
   quantityId,
   requiresFieldData,
@@ -121,6 +123,8 @@ export function resolveObjectVisualizationDataState({
   backendAvailabilityStatus?: string;
   carrier?: TargetFieldCarrierDescriptor | null;
   fieldCatalog: FieldCatalogResource | null | undefined;
+  /** False while the catalog is demand-driven and nobody has asked for it. */
+  fieldCatalogRequested?: boolean;
   fieldCatalogStatus: string;
   quantityId: string;
   requiresFieldData: boolean;
@@ -152,6 +156,9 @@ export function resolveObjectVisualizationDataState({
       return "Supported";
     }
     if (backendState === "ready" && !fieldCatalog) {
+      // An unrequested catalog never arrives; the backend's ready state is
+      // then the only evidence, so do not show an endless "Loading".
+      if (!fieldCatalogRequested) return "Ready";
       // The backend reports the quantity, but its field payload has not
       // reached the inspector yet: that is loading, not ready data.
       return fieldCatalogStatus === "error" ? "Ready" : "Loading";
@@ -2285,10 +2292,9 @@ export function visualizationQuantityItems(
             ? quantityCatalogEntrySupportsAirbox
             : quantityCatalogEntrySupportsSpatialVisualization,
         )
-        .map((quantity) => ({
-          label: quantity.label || quantity.id,
-          value: quantity.id,
-        }))
+        .map((quantity) =>
+          quantityCatalogPickerItem(quantity, quantity.label || quantity.id),
+        )
     : [];
   const fieldItems = fieldCatalog
     ? fieldCatalog.quantities
@@ -2308,7 +2314,10 @@ export function visualizationQuantityItems(
         })
     : [];
   const baseItems = quantityCatalog
-    ? mergeVisualizationQuantityItems(capabilityItems, fieldItems)
+    ? mergeVisualizationQuantityItems<{ disabled?: boolean; label: string; value: string }>(
+        mergeVisualizationQuantityItems(capabilityItems, fieldItems),
+        targetKind === "airbox" ? pendingAirboxQuantityItems(quantityCatalog) : [],
+      )
     : targetKind === "airbox"
       ? fieldItems.filter((item) =>
           fieldCatalogQuantitySupportsAirbox(fieldCatalog, item.value),
@@ -2370,11 +2379,42 @@ export function visualizationQuantityItems(
   ];
 }
 
-function mergeVisualizationQuantityItems(
-  capabilityItems: Array<{ label: string; value: string }>,
-  fieldItems: Array<{ label: string; value: string }>,
-): Array<{ label: string; value: string }> {
-  const merged = new Map<string, { label: string; value: string }>();
+/**
+ * Full-domain fields the Airbox can show once the solver provides them
+ * (H_demag, H_ext, H_eff before or early in a run). Listing them disabled
+ * explains an otherwise empty Airbox quantity list.
+ */
+function pendingAirboxQuantityItems(
+  quantityCatalog: QuantityCatalogResource,
+): Array<{ disabled: true; label: string; value: string }> {
+  return quantityCatalog.quantities
+    .filter(
+      (quantity) =>
+        quantity.domain === "full_domain" &&
+        (quantity.shape === "vector_field" || quantity.shape === "spatial_scalar") &&
+        quantity.interactive_preview &&
+        !quantityCatalogEntrySupportsAirbox(quantity),
+    )
+    .map((quantity) => ({
+      disabled: true,
+      // A term the study does not contain (no external field, say) never
+      // becomes available; anything else is still waiting for the solver.
+      label: `${quantity.label || quantity.id} (${
+        quantity.resolved_capability?.reason_code === "quantity_unsupported"
+          ? "not in this study"
+          : "not available yet"
+      })`,
+      value: quantity.id,
+    }));
+}
+
+function mergeVisualizationQuantityItems<
+  Item extends { disabled?: boolean; label: string; value: string },
+>(
+  capabilityItems: Item[],
+  fieldItems: Item[],
+): Item[] {
+  const merged = new Map<string, Item>();
   for (const item of capabilityItems) merged.set(item.value, item);
   for (const item of fieldItems) {
     if (!merged.has(item.value)) merged.set(item.value, item);

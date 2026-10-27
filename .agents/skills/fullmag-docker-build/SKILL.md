@@ -30,6 +30,21 @@ cache. Aplikację buduje i uruchamia ten sam `backend`; Next/HMR działa w
   Wolumen nie jest quota ani gwarancją braku wzrostu: wymagane są pomiary,
   kontrola generacji i bezpieczna retencja.
 
+## Lokalizacja nowych obrazów ext4 na tym hoście
+
+Decyzja użytkownika z 24.10.2026: nowe pliki obrazów ext4 (backing images)
+mają powstawać w `E:\git\storage` (WSL: `/mnt/e/git/storage`), zamiast
+w `storage/build-volumes` projektu. Jest to lokalizacja plików obrazów,
+nie mount linuksowego filesystemu ani zmiana storage danych użytkownika.
+Nie zmienia to obowiązku named volumes/BuildKit dla danych buildu Docker DEV.
+Przed utworzeniem obrazu sprawdź, czy właściwy launcher/resolver obsługuje
+wybraną lokalizację. Brak obsługi oznacza `NOT VERIFIED`; nie twórz obrazu
+w starej lokalizacji jako fallbacku. Ta instrukcja nie zmienia konfiguracji
+Dockera/WSL ani nie przenosi istniejących obrazów. Ich migracja wymaga
+osobnego planu i kontroli właścicieli, procesów oraz mountów.
+Historyczne ścieżki w audycie writerów opisują wcześniejszy stan kodu,
+a nie obowiązujące miejsce tworzenia nowych obrazów.
+
 ## Dobierz instrukcje do zadania
 
 Przed uruchomieniem Docker DEV przeczytaj główny [AGENTS.md](../../../AGENTS.md),

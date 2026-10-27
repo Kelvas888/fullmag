@@ -211,9 +211,28 @@ fn annotate_runtime_quantity_state(
             resolved.request,
             fullmag_runner::QuantityRequestCapability::FieldVector
         ) && resolved.reason_code.as_deref() != Some("prepared_initial_state");
+        // The Docker runtime only adopts fields a finished accepted run
+        // published; it has no evaluator for a prepared state. Report such a
+        // field as supported but not yet computable instead of letting a
+        // Compute request fail.
+        if entry.materializable
+            && materialization_state == "unmaterialized"
+            && accepted_fields_require_terminal_run(snapshot)
+        {
+            entry.materializable = false;
+            entry.materialization_reason_code = Some("accepted_state_required".to_string());
+        }
         entry.renderable = resolved.render == fullmag_runner::QuantityRenderCapability::Renderable;
         entry.resolved_capability = Some(resolved.into());
     }
+}
+
+/// Whether field materialization must wait for a finished accepted run.
+fn accepted_fields_require_terminal_run(snapshot: &SessionStateResponse) -> bool {
+    crate::live_accepted_execution::docker_api_only_runtime()
+        && !snapshot.run.as_ref().is_some_and(|run| {
+            matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+        })
 }
 
 pub(crate) fn current_field_carriers(
@@ -525,13 +544,13 @@ mod tests {
                     "grid": { "cells": [1, 1, 1] }
                 }
             }
-        }));
+        }).into());
         snapshot.mesh_workspace = Some(serde_json::json!({
             "preparation_id": "prep-current",
             "plan_fingerprint": "plan-current",
             "source_scene_revision": 7,
             "status": "completed"
-        }));
+        }).into());
         let mut scene = fullmag_authoring::SceneDocument::default();
         scene.revision = 7;
         snapshot.scene_document = Some(scene);
@@ -729,7 +748,7 @@ mod tests {
         snapshot.capabilities = None;
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
-        }));
+        }).into());
         let mut response = QuantityCatalogResponse::build();
         annotate_runtime_quantity_state(&mut response, &snapshot);
 

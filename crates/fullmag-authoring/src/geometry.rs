@@ -716,7 +716,17 @@ fn validate_object_geometry(
                 universe_center[2] + universe_size[2] / 2.0,
             ];
             if (0..3).any(|axis| {
-                bounds_min[axis] < universe_min[axis] || bounds_max[axis] > universe_max[axis]
+                // Bounds and transforms can reach the same authored face by
+                // different floating-point operations. Admit only roundoff
+                // at that axis' coordinate scale, never a physical padding.
+                let scale = universe_size[axis].abs()
+                    .max(universe_min[axis].abs())
+                    .max(universe_max[axis].abs())
+                    .max(bounds_min[axis].abs())
+                    .max(bounds_max[axis].abs());
+                let roundoff = 8.0 * f64::EPSILON * scale;
+                bounds_min[axis] < universe_min[axis] - roundoff
+                    || bounds_max[axis] > universe_max[axis] + roundoff
             }) {
                 let manual = universe.mode.eq_ignore_ascii_case("manual");
                 diagnostics.push(diagnostic(

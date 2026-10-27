@@ -8,7 +8,6 @@ import {
   ChevronsUpDown,
   RefreshCw,
   Search,
-  SlidersHorizontal,
 } from "lucide-react";
 
 import type {
@@ -73,6 +72,7 @@ import { usePhysicsGraphResource } from "@/kernel/resources/physicsGraphResource
 import { useObservationFrameListResource } from "@/kernel/resources/observationFrameResources";
 import { useCurrentTransportsResource } from "@/kernel/resources/spinAuthoringResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { matchesAirboxTopologyIdentity } from "@/kernel/resources/meshTopologyIdentity";
 import {
   usePlatformCapabilitiesResource,
   usePlatformHealthResource,
@@ -727,6 +727,40 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
         (modelSnapshot.objects ?? []).map((object) => object.id),
       ),
     });
+    const currentSceneRevision = modelResource.status === "ready"
+      ? revisionValue(modelResourceRecord?.revision ?? modelResourceRecord?.scene_revision)
+      : null;
+    const currentManifestParts = Array.isArray(manifest.data?.mesh_parts)
+      ? manifest.data.mesh_parts
+      : null;
+    const manifestSceneRevision = revisionValue(manifest.data?.source_scene_revision);
+    const sceneRevisionMatches = currentSceneRevision !== null &&
+      manifestSceneRevision !== null &&
+      String(currentSceneRevision) === String(manifestSceneRevision);
+    const topologyIdentityMatches = matchesAirboxTopologyIdentity(
+      sessionStatusData,
+      manifest.data,
+    );
+    const outerBoundaryEvidenceStatus: NonNullable<
+      ModelTreeMeshSnapshot["outerBoundaryEvidenceStatus"]
+    > = manifest.status === "error" || modelResource.status === "error"
+      ? "error"
+      : manifest.status === "stale" || modelResource.status === "stale"
+        ? "stale"
+        : manifest.status === "loading" || modelResource.status === "loading"
+          ? "loading"
+          : manifest.status === "ready" && modelResource.status === "ready"
+            ? currentSceneRevision !== null && manifestSceneRevision !== null &&
+                !sceneRevisionMatches
+              ? "stale"
+              : topologyIdentityMatches && sceneRevisionMatches && currentManifestParts !== null
+                ? "verified"
+                : "unknown"
+            : "unknown";
+    const outerBoundaryPartCount = outerBoundaryEvidenceStatus === "verified" &&
+      currentManifestParts !== null
+      ? currentManifestParts.filter(isUniverseOuterBoundaryCarrier).length
+      : null;
     const mesh: ModelTreeMeshSnapshot = {
       activeBuildStatus: meshPipelineStatusIsActive(activeBuildStatus)
         ? activeBuildStatus
@@ -747,8 +781,8 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
       meshName: manifest.data?.mesh_name,
       meshRevision: meshSummary.data?.revision ?? manifest.data?.revision,
       objectSegmentCount: manifest.data?.object_segments?.length ?? null,
-      outerBoundaryPartCount:
-        manifest.data?.mesh_parts?.filter(isUniverseOuterBoundaryCarrier).length ?? null,
+      outerBoundaryEvidenceStatus,
+      outerBoundaryPartCount,
       partCount: manifest.data?.mesh_parts?.length ?? null,
       qualityStatus: qualityStatus(qualityGates.data?.gates),
       realizedSizeFieldCount:
@@ -968,6 +1002,28 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
   }, [activeTab, baseNodes, kernel, nodes, selectedNodeId, selectedRef]);
 
   useEffect(() => {
+    if (
+      !modelTabActive ||
+      selectedRef?.type !== "airbox" ||
+      !selectedNodeId
+    ) {
+      return;
+    }
+    const currentNode = resolveCurrentExplorerSelectionNode(
+      baseNodes,
+      selectedNodeId,
+      selectedRef,
+      baseNodes,
+    );
+    if (!currentNode || !currentNode.kind.startsWith("airbox.")) return;
+    const currentRef = selectionRefFromNode(currentNode);
+    if (selectionRefEquals(selectedRef, currentRef)) return;
+    // Refresh only the selected node's resource facets. Selection identity and
+    // inspector routing remain stable as mesh resources invalidate.
+    selectExplorerNode(kernel, currentNode, "explorer");
+  }, [baseNodes, kernel, modelTabActive, selectedNodeId, selectedRef]);
+
+  useEffect(() => {
     const unsubscribe = subscribeExplorerTextureLoadNodeRequested(
       kernel.bus,
       (event) => {
@@ -1035,17 +1091,55 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           }}
           rebindDisabledReason={rebindDisabledReason}
         />
-        <label className="fm-explorer-filter">
-          <Search size={13} aria-hidden="true" className="fm-explorer-filter__search-icon" />
-          <input
-            aria-label="Filter explorer"
-            value={filterText}
-            onChange={(event) => setExplorerFilterText(event.target.value)}
-            placeholder="Filter nodes..."
-            type="search"
-          />
-          <SlidersHorizontal size={13} aria-hidden="true" className="fm-explorer-filter__options-icon" />
-        </label>
+        {/* Tree actions share the filter row instead of a separate footer row. */}
+        <div className="fm-explorer-filter-row">
+          <label className="fm-explorer-filter">
+            <Search size={13} aria-hidden="true" className="fm-explorer-filter__search-icon" />
+            <input
+              aria-label="Filter explorer"
+              value={filterText}
+              onChange={(event) => setExplorerFilterText(event.target.value)}
+              placeholder="Filter nodes..."
+              type="search"
+            />
+          </label>
+          <div aria-label="Explorer tree actions" className="fm-explorer-toolbar" role="group">
+            <button
+              className="fm-explorer-toolbar__action"
+              aria-label="Expand all explorer nodes"
+              title="Expand All"
+              type="button"
+              onClick={() => {
+                expandExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
+              }}
+            >
+              <ChevronsUpDown size={13} aria-hidden="true" />
+            </button>
+            <button
+              className="fm-explorer-toolbar__action"
+              aria-label="Collapse all explorer nodes"
+              title="Collapse All"
+              type="button"
+              onClick={() => {
+                collapseExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
+              }}
+            >
+              <ChevronsDownUp size={13} aria-hidden="true" />
+            </button>
+            <button
+              className="fm-explorer-toolbar__action"
+              aria-label="Reset explorer filter and expand nodes"
+              title="Reset filter and expand nodes"
+              type="button"
+              onClick={() => {
+                setExplorerFilterText("");
+                expandExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
+              }}
+            >
+              <RefreshCw size={13} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
         <ExplorerTreeView
           activeNodeId={selectedNodeId}
           expandedIds={expandedIds}
@@ -1058,45 +1152,6 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           }
           tabId={activeTab}
         />
-        <footer className="fm-explorer-toolbar">
-          <button
-            className="fm-explorer-toolbar__action"
-            aria-label="Expand all explorer nodes"
-            title="Expand All"
-            type="button"
-            onClick={() => {
-              expandExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
-            }}
-          >
-            <ChevronsUpDown size={13} aria-hidden="true" />
-            <span>Expand All</span>
-          </button>
-          <button
-            className="fm-explorer-toolbar__action"
-            aria-label="Collapse all explorer nodes"
-            title="Collapse All"
-            type="button"
-            onClick={() => {
-              collapseExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
-            }}
-          >
-            <ChevronsDownUp size={13} aria-hidden="true" />
-            <span>Collapse All</span>
-          </button>
-          <button
-            className="fm-explorer-toolbar__action"
-            aria-label="Refresh explorer"
-            title="Refresh"
-            type="button"
-            onClick={() => {
-              setExplorerFilterText("");
-              expandExplorerNodes(activeTab, collectExplorerNodeIds(nodes));
-            }}
-          >
-            <RefreshCw size={13} aria-hidden="true" />
-            <span>Refresh</span>
-          </button>
-        </footer>
       </section>
     </WorkspaceRenderProfiler>
   );

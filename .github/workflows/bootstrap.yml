@@ -186,6 +186,9 @@ jobs:
       - name: Run native modal cancellation completion contract
         run: cargo test -p fullmag-runner native_modal_run_result_completion_matches_status --lib
 
+      - name: Run CPU periodic Newell kernel cache regressions
+        run: cargo test -p fullmag-engine periodic_newell_kernel_cache_tests --lib
+
       - name: Run typed active eigen Stop and Pause contracts
         run: |
           cargo test -p fullmag-engine fem_sparse::tests::lobpcg_control_ --lib
@@ -795,6 +798,8 @@ jobs:
           python -B scripts/test_docker_build_control_cache_admission.py -v
           python -B scripts/test_docker_container_runtime_recovery.py -v
           python -B scripts/test_docker_volume_container_recovery.py -v
+          python -B scripts/test_docker_volume_empty_quarantine.py -v
+          python -B scripts/test_docker_volume_preparation_abort_archive.py -v
           python -B scripts/test_docker_volume_dev_runtime_state.py -v
           python -B scripts/test_docker_volume_dev_cancelled_activation.py -v
           python -B scripts/test_docker_volume_readiness_receipt.py -v

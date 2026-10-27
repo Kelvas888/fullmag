@@ -44,9 +44,10 @@ import {
   type PerspectiveCamera as ThreePerspectiveCamera,
 } from "three";
 
-import type {
-  VisualizationTargetRef,
-  VisualizationTargetSettings,
+import {
+  AIRBOX_VISUALIZATION_TARGET,
+  type VisualizationTargetRef,
+  type VisualizationTargetSettings,
 } from "@/kernel/visualization/ObjectVisualizationController";
 import type { ModeCompositionFieldLayerSnapshotMap } from "@/kernel/visualization/ModeCompositionFieldLayerController";
 import type { PeriodicOverlayModel } from "@/shared/domain/mesh/periodicOverlayModel";
@@ -114,6 +115,7 @@ import {
   type Viewport3DOrbitDebugAngles,
 } from "./CameraControls";
 import { CanvasLifecycleProbe } from "./CanvasLifecycleProbe";
+import { resolveViewport3DCameraDepthRange } from "./viewport3DCameraClip";
 import {
   AirboxLayer,
   DomainBoxLayer,
@@ -222,6 +224,8 @@ interface Viewport3DSceneProps {
   fdmAirboxVectorBuildReference: Viewport3DVectorBuildReference | null;
   fdmAirboxVectorSegments: Float32Array | null;
   fdmMultilayerAirboxView: FdmMultilayerAirboxRenderView | null;
+  /** Authored Universe box, the multilayer Airbox extent until a carrier is published. */
+  fdmMultilayerAirboxAuthoredBounds: Viewport3DBounds | null;
   fdmMultilayerAirboxBuildError: string | null;
   fdmMultilayerAirboxBuildKey: string | null;
   fdmMultilayerAirboxBuildStatus: string;
@@ -414,33 +418,15 @@ export function resolveViewport3DProjectionCameraClip(
     fovDegrees = DEFAULT_VIEWPORT_3D_CAMERA_FOV_DEGREES,
   }: { aspect?: number; fovDegrees?: number } = {},
 ): Viewport3DCameraClip {
-  const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
-  if (!cameraState) return { near: fit.near, far: fit.far };
+  if (!cameraState) {
+    const fit = resolveViewport3DCameraFit(bounds, { aspect, fovDegrees });
+    return { near: fit.near, far: fit.far };
+  }
 
   const position = new Vector3(...cameraState.position);
   const forward = new Vector3(...cameraState.target).sub(position);
   const distance = forward.length();
-  const radius = Math.max(bounds?.radius ?? FALLBACK_GRID_SIZE / 2, 1e-12);
-  // FOV changes projection without moving the camera. A hypothetical fit must
-  // never push the near plane through geometry visible from the actual pose.
-  const minimumNear = 1e-12;
-  const centerDepth = bounds && Number.isFinite(distance) && distance > 0
-    ? new Vector3(...bounds.center).sub(position).dot(forward.divideScalar(distance))
-    : null;
-  const nearestDepth = centerDepth === null ? null : centerDepth - radius;
-  const poseNearLimit = nearestDepth !== null
-    ? nearestDepth > minimumNear ? nearestDepth * 0.5 : minimumNear
-    : Number.isFinite(distance) && distance > 0 ? distance / 100 : minimumNear;
-  const near = Math.max(minimumNear, Math.min(fit.near, poseNearLimit));
-  const orbitFar =
-    Number.isFinite(distance) && distance > 0
-      ? distance + radius * 4
-      : fit.far;
-
-  return {
-    near,
-    far: Math.max(fit.far, orbitFar, (centerDepth ?? 0) + radius * 4, near * 100, 1e-3),
-  };
+  return resolveViewport3DCameraDepthRange(bounds, position, forward, distance);
 }
 
 export function resolveViewport3DOrthographicZoom(
@@ -982,6 +968,7 @@ function Viewport3DOverlayLayerStack({
   dimensionFrameMode,
   fdmAirboxPassPlan,
   fdmDomain,
+  fdmMultilayerAirboxAuthoredBounds,
   fdmMultilayerAirboxView,
   fdmUniverseOutsideSupport,
   fdmSettings,
@@ -1012,6 +999,7 @@ function Viewport3DOverlayLayerStack({
   | "dimensionFrameMode"
   | "fdmAirboxPassPlan"
   | "fdmDomain"
+  | "fdmMultilayerAirboxAuthoredBounds"
   | "fdmMultilayerAirboxView"
   | "fdmUniverseOutsideSupport"
   | "fdmSettings"
@@ -1091,11 +1079,13 @@ function Viewport3DOverlayLayerStack({
             tracker={tracker}
           />
           <FdmMultilayerAirboxBoundsLayer
+            authoredSettings={airboxSettings}
+            authoredUniverseBounds={fdmMultilayerAirboxAuthoredBounds}
             colors={colors}
             onSelect={() => {
-              if (fdmMultilayerAirboxView) {
-                onSelectFdmTarget(fdmMultilayerAirboxView.target);
-              }
+              onSelectFdmTarget(
+                fdmMultilayerAirboxView?.target ?? AIRBOX_VISUALIZATION_TARGET,
+              );
             }}
             tracker={tracker}
             view={fdmMultilayerAirboxView}
@@ -1825,6 +1815,7 @@ export function Viewport3DScene({
   fdmAirboxVectorGlyphColors,
   fdmAirboxVectorBuildReference,
   fdmAirboxVectorSegments,
+  fdmMultilayerAirboxAuthoredBounds,
   fdmMultilayerAirboxView,
   fdmNativeLayerViews,
   fdmTargetViews,
@@ -2297,6 +2288,7 @@ export function Viewport3DScene({
         dimensionFrameMode={visualProfileId === "capture" && !appearance.exportAnnotations ? "off" : dimensionFrameMode}
         fdmAirboxPassPlan={fdmAirboxPassPlan}
         fdmDomain={fdmDomain}
+        fdmMultilayerAirboxAuthoredBounds={fdmMultilayerAirboxAuthoredBounds}
         fdmMultilayerAirboxView={fdmMultilayerAirboxView}
         fdmUniverseOutsideSupport={fdmUniverseOutsideSupport}
         airboxSettings={airboxSettings}

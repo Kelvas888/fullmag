@@ -424,6 +424,12 @@ def export_builder_draft(loaded: LoadedProblem) -> dict[str, object]:
     )
     if resources is not None:
         draft["compute_resources"] = resources.to_ir()
+    visualization_hint = _normalize_mapping(
+        _normalize_mapping(base_problem.runtime_metadata).get("visualization_hint")
+    )
+    airbox_hint = visualization_hint.get("airbox")
+    if airbox_hint is not None:
+        draft["visualization_hint"] = {"airbox": copy.deepcopy(airbox_hint)}
     return draft
 
 
@@ -976,6 +982,59 @@ def _scene_stage_autosave(value: object) -> StageAutosave | None:
 def _render_scene_stage_autosave_suffix(value: object) -> str:
     policy = _scene_stage_autosave(value)
     return _render_stage_autosave(policy) if policy is not None else ""
+
+
+def _render_scene_relax_table_autosave_suffix(
+    value: object,
+    *,
+    kind: str,
+    index: int,
+) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"SceneDocument stages[{index}] {kind} table_autosave must be an object"
+        )
+    rendered_fields = {"kind", "table_id", "every_steps", "quantities", "expressions"}
+    unsupported = sorted(set(value) - rendered_fields)
+    if unsupported:
+        names = ", ".join(str(name) for name in unsupported)
+        raise ValueError(
+            f"scene_document_{kind}_table_autosave_unrendered_fields: {names}"
+        )
+    if "kind" in value and value["kind"] != "table_autosave":
+        raise ValueError(
+            f"SceneDocument stages[{index}] {kind} table_autosave kind is unsupported"
+        )
+    expressions = value.get("expressions")
+    if expressions not in (None, []):
+        raise ValueError(
+            f"SceneDocument stages[{index}] {kind} table_autosave expressions "
+            "are not represented by the public relax-stage DSL"
+        )
+    every_steps = _positive_int(value.get("every_steps"))
+    if every_steps is None:
+        raise ValueError(
+            f"SceneDocument stages[{index}] {kind} table_autosave requires positive every_steps"
+        )
+    parts = [f"every_steps={every_steps}"]
+    quantities = value.get("quantities")
+    if quantities is not None:
+        if (not isinstance(quantities, list) or not quantities
+                or any(not isinstance(quantity, str) for quantity in quantities)):
+            raise ValueError(
+                f"SceneDocument stages[{index}] {kind} table_autosave quantities are invalid"
+            )
+        parts.append(f"quantities={_python_literal(quantities)}")
+    table_id = value.get("table_id", "default")
+    if not isinstance(table_id, str) or not table_id.strip():
+        raise ValueError(
+            f"SceneDocument stages[{index}] {kind} table_autosave table_id is invalid"
+        )
+    if table_id != "default":
+        parts.append(f"table_id={_python_literal(table_id)}")
+    return f".tableautosave({', '.join(parts)})"
 
 
 def _omit_scene_mesh_editor_defaults(overrides: dict[str, object]) -> None:
@@ -1549,6 +1608,7 @@ def _render_scene_stage_bootstrap(
                 "gamma",
                 "g",
                 "autosave",
+                "table_autosave",
             },
         )
         kwargs = _scene_relax_stage_kwargs(stage, solver=solver)
@@ -1558,6 +1618,9 @@ def _render_scene_stage_bootstrap(
         # (``_relax_stage_timestep_kwargs``); a separate ``study.solver`` call
         # would also rewrite the study-level dynamics the script never set.
         call = f"study.stages.add_relax({_python_keyword_args(kwargs)})"
+        call += _render_scene_relax_table_autosave_suffix(
+            stage.get("table_autosave"), kind=kind, index=index
+        )
         call += _render_scene_stage_autosave_suffix(stage.get("autosave"))
         return [call]
 
@@ -1619,6 +1682,7 @@ def _render_scene_stage_bootstrap(
                 "gamma",
                 "g",
                 "autosave",
+                "table_autosave",
             },
         )
         kwargs = _scene_relax_stage_kwargs(stage, solver=solver)
@@ -1629,6 +1693,9 @@ def _render_scene_stage_bootstrap(
         # (``_relax_stage_timestep_kwargs``); a separate ``study.solver`` call
         # would also rewrite the study-level dynamics the script never set.
         call = f"study.stages.add_relax({_python_keyword_args(kwargs)})"
+        call += _render_scene_relax_table_autosave_suffix(
+            stage.get("table_autosave"), kind=kind, index=index
+        )
         call += _render_scene_stage_autosave_suffix(stage.get("autosave"))
         return [call]
 
@@ -2439,6 +2506,25 @@ def _render_fdm_bootstrap(
                 )
         if entries:
             kwargs["per_magnet"] = "{" + ", ".join(entries) + "}"
+    demag = fdm.get("demag")
+    if isinstance(demag, Mapping):
+        demag_kwargs = [
+            f"strategy={_python_literal(demag.get('strategy', 'auto'))}",
+            f"mode={_python_literal(demag.get('mode', 'auto'))}",
+            f"explain={_python_literal(demag.get('explain', True))}",
+        ]
+        fft_backend = demag.get("fft_backend")
+        if fft_backend is not None:
+            demag_kwargs.append(f"fft_backend={_python_literal(fft_backend)}")
+        for key in ("common_cells", "common_cells_xy", "common_cell_size"):
+            value = demag.get(key)
+            if value is not None:
+                if not isinstance(value, (list, tuple)):
+                    raise ValueError(f"fdm.demag.{key} must be a vector when present")
+                demag_kwargs.append(f"{key}={_python_literal(tuple(value))}")
+        kwargs["demag"] = _RawExpression(
+            f"fm.FDMDemag({', '.join(demag_kwargs)})"
+        )
     supported_keys = {"default_cell", "per_magnet", "per_object_grid"}
     if any(
         key not in supported_keys and fdm.get(key) not in (None, "", [], {})
@@ -3617,15 +3703,23 @@ def _render_runtime(
     if runtime_metadata.get("wait_for_solve") is True:
         lines.append(f"{_surface_call(surface, 'wait_for_solve')}(True)")
     visualization_hint = _normalize_mapping(runtime_metadata.get("visualization_hint"))
+    scene_visualization_hint = overrides.get("visualization_hint")
+    if scene_visualization_hint is not None:
+        if not isinstance(scene_visualization_hint, Mapping):
+            raise ValueError("SceneDocument.study.visualization_hint must be an object")
+        visualization_hint = {
+            **visualization_hint,
+            **dict(scene_visualization_hint),
+        }
     if visualization_hint:
         active_qty = visualization_hint.get("active_quantity_id")
         if isinstance(active_qty, str) and active_qty.strip():
             lines.append(
                 f"{_surface_call(surface, 'visualization')}(active_quantity_id={_py_repr(active_qty)})"
             )
-        airbox_hint = _normalize_mapping(visualization_hint.get("airbox"))
-        if airbox_hint:
-            airbox_kwargs = _render_visualization_hint_kwargs(airbox_hint)
+        airbox_hint = visualization_hint.get("airbox")
+        if airbox_hint is not None:
+            airbox_kwargs = _render_airbox_visualization_hint_kwargs(airbox_hint)
             if airbox_kwargs and surface == "study":
                 lines.append(f"study.airbox.visualization({airbox_kwargs})")
     adaptive_mesh = _normalize_mapping(runtime_metadata.get("adaptive_mesh"))
@@ -3770,6 +3864,108 @@ def _render_visualization_hint_kwargs(hint: dict[str, object]) -> str:
         parts.append(
             f"active_quantity_id={_py_repr(hint['active_quantity_id'])}"
         )
+    return ", ".join(parts)
+
+
+def _render_airbox_visualization_hint_kwargs(hint: object) -> str:
+    """Render only the validated public StudyAirboxVisualizationHandle fields."""
+    if not isinstance(hint, Mapping):
+        raise ValueError(
+            "SceneDocument.study.visualization_hint.airbox must be an object"
+        )
+
+    supported = (
+        "show",
+        "mode",
+        "active_quantity_id",
+        "wireframe",
+        "shaded",
+        "bounds",
+        "points",
+        "opacity",
+        "geometry_scope",
+        "vector_density",
+        "vector_length_scale",
+        "vector_thickness",
+        "vector_alpha",
+        "vector_color_mode",
+    )
+    unknown = sorted(str(name) for name in set(hint) - set(supported))
+    if unknown:
+        names = ", ".join(unknown)
+        raise ValueError(
+            "SceneDocument.study.visualization_hint.airbox has unsupported fields: "
+            f"{names}"
+        )
+
+    parts: list[str] = []
+    for key in supported:
+        if key not in hint or hint[key] is None:
+            continue
+        value = hint[key]
+        if key in {"show", "wireframe", "shaded", "bounds", "points"}:
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"SceneDocument.study.visualization_hint.airbox.{key} must be a boolean"
+                )
+            parts.append(f"{key}={value!r}")
+        elif key == "mode":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.mode must be a non-empty string"
+                )
+            parts.append(f"mode={_py_repr(value)}")
+        elif key == "active_quantity_id":
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.active_quantity_id "
+                    "must be a non-empty string"
+                )
+            parts.append(f"active_quantity_id={_py_repr(value)}")
+        elif key == "opacity":
+            numeric = _finite_number(value)
+            if numeric is None or not 0.0 <= numeric <= 100.0:
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.opacity must be between 0 and 100"
+                )
+            parts.append(f"opacity={_py_number(numeric)}")
+        elif key == "geometry_scope":
+            if not isinstance(value, str) or value not in ("surface", "full"):
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.geometry_scope "
+                    "must be 'surface' or 'full'"
+                )
+            parts.append(f"geometry_scope={_py_repr(value)}")
+        elif key == "vector_density":
+            density = _positive_int(value)
+            if density is None:
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.vector_density "
+                    "must be a positive integer"
+                )
+            parts.append(f"vector_density={density}")
+        elif key in {"vector_length_scale", "vector_thickness", "vector_alpha"}:
+            numeric = _finite_number(value)
+            if numeric is None:
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox."
+                    f"{key} must be a finite number"
+                )
+            parts.append(f"{key}={_py_number(numeric)}")
+        elif key == "vector_color_mode":
+            if not isinstance(value, str) or value not in (
+                "orientation",
+                "x",
+                "y",
+                "z",
+                "magnitude",
+                "monochrome",
+            ):
+                raise ValueError(
+                    "SceneDocument.study.visualization_hint.airbox.vector_color_mode "
+                    "is unsupported"
+                )
+            parts.append(f"vector_color_mode={_py_repr(value)}")
     return ", ".join(parts)
 
 

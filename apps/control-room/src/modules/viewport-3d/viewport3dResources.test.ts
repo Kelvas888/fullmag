@@ -99,8 +99,8 @@ describe("viewport3dResources", () => {
     expect(hookSource).toContain(
       "retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY",
     );
-    expect(source).toContain("deadlineMs: 15_000");
-    expect(source).toContain("The live 1.4 MiB");
+    expect(source).toContain("deadlineMs: 60_000");
+    expect(source).toContain("45.6 MB topology");
   });
 
   it("keeps the measured sequential topology read alive beyond the generic deadline", async () => {
@@ -123,9 +123,9 @@ describe("viewport3dResources", () => {
         retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY,
       });
 
-      await vi.advanceTimersByTimeAsync(5_001);
+      await vi.advanceTimersByTimeAsync(15_001);
       expect(requestSignal.aborted).toBe(false);
-      expect(VIEWPORT_3D_TOPOLOGY_RETRY_POLICY.deadlineMs).toBe(15_000);
+      expect(VIEWPORT_3D_TOPOLOGY_RETRY_POLICY.deadlineMs).toBe(60_000);
 
       release("decoded topology");
       await expect(result).resolves.toMatchObject({
@@ -2260,6 +2260,42 @@ describe("viewport3dResources", () => {
     ]);
   });
 
+  it("starts a fresh binary request instead of joining one whose consumers all aborted", async () => {
+    const cache = new ResourceCache<string>({ maxBytes: 32 });
+    const requestSignals: AbortSignal[] = [];
+    const request = vi.fn((_etag?: string | null, signal?: AbortSignal) => {
+      if (signal) requestSignals.push(signal);
+      if (requestSignals.length === 1) {
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => queueMicrotask(() => reject(new DOMException("aborted", "AbortError"))),
+            { once: true },
+          );
+        });
+      }
+      return Promise.resolve({
+        byteLength: 5,
+        data: "fresh",
+        etag: '"field-2"',
+        status: "ready" as const,
+      });
+    });
+    const staleController = new AbortController();
+    const stale = loadCachedBinaryResource(cache, "field:m", request, {
+      signal: staleController.signal,
+    });
+    staleController.abort();
+
+    const replacement = loadCachedBinaryResource(cache, "field:m", request);
+
+    await expect(stale).rejects.toHaveProperty("name", "AbortError");
+    await expect(replacement).resolves.toBe("fresh");
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(requestSignals[0]?.aborted).toBe(true);
+    expect(requestSignals[1]?.aborted).toBe(false);
+  });
+
   it("retains oversized binary data as the current entry for future 304 reuse", async () => {
     const cache = new ResourceCache<string>({ maxBytes: 4 });
     const request = vi
@@ -2299,5 +2335,19 @@ describe("viewport3dResources", () => {
     expect(cache.peek("oldest")).toBeNull();
     expect(cache.peek("middle")?.etag).toBe('"mid"');
     expect(cache.peek("newest")?.etag).toBe('"new"');
+  });
+});
+
+describe("viewport field-vector failure notification policy", () => {
+  it("threads the caller's notifyOnError choice into the resource hook, defaulting to toast", () => {
+    const source = readFileSync(viewport3dResourcesSourceUrl, "utf8");
+
+    expect(source).toContain("options: Viewport3DFieldVectorRequestOptions = {},");
+    expect(source).toContain(
+      'options: Pick<Viewport3DFieldVectorRequestOptions, "notifyOnError"> = {},',
+    );
+    expect(
+      source.match(/notifyOnError: options\.notifyOnError \?\? true,/g),
+    ).toHaveLength(2);
   });
 });

@@ -2152,6 +2152,79 @@ fn basic_layer(visible: bool, opacity: f64) -> BasicLayerState {
     BasicLayerState { visible, opacity }
 }
 
+/// Apply an authored initial view once, while publishing a new script session.
+/// The resulting presentation uses the same typed patch and persistence path
+/// as the Inspector; subsequent GETs cannot reset the user's display choices.
+pub(crate) fn initialize_scene_airbox_visualization(
+    scene: &fullmag_authoring::SceneDocument,
+    presentation: &mut DisplayPresentationState,
+) -> Result<(), ApiError> {
+    use serde_json::json;
+    let Some(hint) = scene.study.visualization_hint.as_ref()
+        .and_then(|hint| hint.get("airbox")) else { return Ok(()); };
+    let hint = hint.as_object().ok_or_else(|| ApiError::unprocessable(
+        "study Airbox visualization hint must be an object"))?;
+    let mut airbox = json!({});
+    if let Some(mode) = hint.get("mode") {
+        let (surface, wireframe, vectors) = match mode.as_str() {
+            Some("vectors") => (false, false, true),
+            Some("surface") => (true, false, false),
+            Some("wireframe") => (false, true, false),
+            Some("surface+edges") => (true, true, false),
+            _ => return Err(ApiError::unprocessable("unknown authored Airbox visualization mode")),
+        };
+        airbox["surface"] = json!({"visible": surface});
+        airbox["wireframe"] = json!({"visible": wireframe});
+        airbox["vectors"] = json!({"visible": vectors, "domain": "airbox_only"});
+    }
+    if let Some(show) = hint.get("show") { airbox["visible"] = show.clone(); }
+    for (authored, layer) in [("shaded", "surface"), ("wireframe", "wireframe"),
+        ("bounds", "bounds"), ("points", "points")] {
+        if let Some(value) = hint.get(authored) {
+            if airbox.get(layer).is_none() { airbox[layer] = json!({}); }
+            airbox[layer]["visible"] = value.clone();
+        }
+    }
+    if let Some(opacity) = hint.get("opacity") {
+        let opacity = opacity.as_f64().filter(|value| value.is_finite()
+            && (0.0..=100.0).contains(value)).ok_or_else(||
+                ApiError::unprocessable("authored Airbox opacity must be between 0 and 100"))? / 100.0;
+        airbox["opacity"] = json!(opacity);
+        if airbox.get("surface").is_none() { airbox["surface"] = json!({}); }
+        airbox["surface"]["opacity"] = json!(opacity);
+    }
+    let mut style = json!({});
+    for (authored, target) in [("vector_density", "vector_budget"),
+        ("vector_length_scale", "vector_length_scale"), ("vector_thickness", "vector_thickness"),
+        ("vector_alpha", "vector_alpha"), ("vector_color_mode", "vector_color_mode")] {
+        if let Some(value) = hint.get(authored) { style[target] = value.clone(); }
+    }
+    if let Some(density) = hint.get("vector_density") {
+        if airbox.get("vectors").is_none() { airbox["vectors"] = json!({}); }
+        airbox["vectors"]["density"] = density.clone();
+        airbox["vectors"]["domain"] = json!("airbox_only");
+    }
+    let mut target = json!({"scope": "airbox", "scope_id": "airbox", "style": style});
+    if let Some(quantity) = hint.get("active_quantity_id") {
+        target["quantity"] = json!({"active_quantity_id": quantity});
+    }
+    if let Some(scope) = hint.get("geometry_scope") {
+        target["display"] = json!({"geometry_scope": scope});
+    }
+    let mut overrides = presentation.visualization_overrides.clone().unwrap_or_default();
+    overrides.retain(|entry| !is_airbox_identity_id(&entry.scope_id));
+    overrides.push(serde_json::from_value(target).map_err(|error|
+        ApiError::unprocessable(format!("invalid authored Airbox target settings: {error}")))?);
+    let patch: VisualizationStatePatch = serde_json::from_value(json!({
+        "layers": {"airbox": airbox}, "overrides": overrides,
+    })).map_err(|error| ApiError::unprocessable(format!("invalid authored Airbox display: {error}")))?;
+    validate_visualization_state_patch(&patch)?;
+    let mut next = presentation.clone();
+    apply_visualization_presentation_patch(&mut next, &patch)?;
+    *presentation = next;
+    Ok(())
+}
+
 pub(crate) fn build_visualization_state_response(
     selection: &CurrentDisplaySelection,
     presentation: &DisplayPresentationState,

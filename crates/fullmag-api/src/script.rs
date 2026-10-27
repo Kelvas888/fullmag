@@ -17,6 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const BOUNDED_PYTHON_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Code of a bounded helper that hit its deadline and was killed and reaped.
+pub(crate) const PYTHON_HELPER_TIMEOUT_CODE: &str = "python_helper_timeout";
 const BOUNDED_PYTHON_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const BOUNDED_PYTHON_HELPER_LOG_LIMIT: u64 = 1024 * 1024;
 const STREAMED_PYTHON_HELPER_LINE_LIMIT: usize = 16 * 1024;
@@ -1073,10 +1075,19 @@ fn capture_authored_scene_with_asset_root_and_progress<T: serde::de::Deserialize
     let output = output?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Preparation summaries are bounded. Put the Python exception before
+        // the traceback so the UI retains the cause rather than only frames.
+        let details = if stderr.contains("Traceback (most recent call last)") {
+            let cause = stderr.lines().rev().find(|line| !line.trim().is_empty())
+                .unwrap_or("Python helper failed").chars().take(1024).collect::<String>();
+            format!("{}\n{}", cause.trim(), stderr.trim())
+        } else {
+            stderr.trim().to_string()
+        };
         return Err(ApiError::bad_request(format!(
             "SceneDocument could not be lowered to {}: {}",
             kind.label(),
-            stderr.trim()
+            details
         )));
     }
 
@@ -1224,7 +1235,9 @@ fn run_python_helper_with_policy(
     {
         let mut command = python_command(repo_root)?;
         command.args(args);
-        command.env("PYTHONUNBUFFERED", "1");
+        // Large mesh exports use stdout as a JSON data channel. Keep it
+        // buffered; progress events already flush stderr explicitly.
+        command.env_remove("PYTHONUNBUFFERED");
         if matches!(policy, PythonHelperOutputPolicy::Progress { .. }) {
             command.env("FULLMAG_PROGRESS", "1");
         }
@@ -1522,12 +1535,15 @@ fn run_bounded_python_helper(
                 let now = Instant::now();
                 if now >= deadline {
                     let cleanup = stop_bounded_helper(&mut child);
-                    return Err(BoundedHelperError::Started(
-                        bounded_helper_failure_with_cleanup(
-                            "Python helper exceeded the 30 second deadline",
-                            cleanup,
-                        ),
-                    ));
+                    let reaped = cleanup.is_ok();
+                    let mut error = bounded_helper_failure_with_cleanup(
+                        "Python helper exceeded the 30 second deadline",
+                        cleanup,
+                    );
+                    if reaped {
+                        error.code = Some(PYTHON_HELPER_TIMEOUT_CODE.to_string());
+                    }
+                    return Err(BoundedHelperError::Started(error));
                 }
                 let remaining = deadline.saturating_duration_since(now);
                 thread::sleep(std::cmp::min(

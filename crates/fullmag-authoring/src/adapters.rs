@@ -134,6 +134,7 @@ pub fn scene_document_from_script_builder(builder: &ScriptBuilderState) -> Scene
             execution_profile: builder.execution_profile.clone(),
             execution_layers: builder.execution_layers.clone(),
             initial_state: builder.initial_state.clone(),
+            visualization_hint: None,
         },
         outputs: SceneOutputsState::default(),
         editor: SceneEditorState::default(),
@@ -4896,8 +4897,10 @@ mod tests {
             demag: Some(crate::ScriptBuilderFdmDemagState {
                 strategy: "multilayer_convolution".to_string(),
                 mode: "two_d_stack".to_string(),
+                fft_backend: None,
                 common_cells: None,
                 common_cells_xy: Some([64, 32]),
+                common_cell_size: None,
                 explain: false,
             }),
             boundary_correction: Some("full".to_string()),

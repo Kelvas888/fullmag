@@ -185,6 +185,11 @@ def resolve_namespace(control):
             worktree_id=control.identity["worktree_id"],
             project_id=control.identity["project_id"]):
         pass
+    elif _is_empty_stopped_quarantine_receipt(
+            receipt, namespace=namespace, project=control.project, volume=control.volume,
+            worktree_id=control.identity["worktree_id"],
+            project_id=control.identity["project_id"]):
+        _validate_empty_stopped_control_pins(control, receipt)
     elif receipt.get("schema") == SOURCE_TRANSFER_SCHEMA:
         _validate_source_transfer(control, receipt, namespace=namespace,
                                   receipt_path=receipt_path)
@@ -220,6 +225,50 @@ def assert_namespace_activation(control, request_id=None):
     # Every helper read also checks the base registry SHA. Missing old local
     # unresolved.json is not itself permission: the constructor validates the
     # explicit immutable quarantine/new-request authorization above.
+
+
+def _is_empty_stopped_quarantine_receipt(receipt, *, namespace, project, volume,
+                                          worktree_id, project_id):
+    """Recognize only the separately scoped, no-RunIntent quarantine contract."""
+    token = receipt.get("recovery_id") if isinstance(receipt, dict) else None
+    return (
+        isinstance(receipt, dict)
+        and receipt.get("schema") == "fullmag.docker-control-namespace-empty-quarantine.v1"
+        and receipt.get("state") == "quarantined-empty-not-replayed"
+        and receipt.get("scope") == "empty-stopped-namespace"
+        and receipt.get("namespace") == namespace
+        and isinstance(token, str) and HEX.fullmatch(token) is not None
+        and namespace == "namespaces/" + token
+        and receipt.get("compose_project") == project
+        and receipt.get("control_volume") == volume
+        and receipt.get("source_worktree_id") == worktree_id
+        and receipt.get("source_project_id") == project_id
+        and receipt.get("allow_new_requests") is True
+        and receipt.get("allow_old_request_replay") is False
+        and isinstance(receipt.get("old_request_id"), str)
+        and bool(receipt.get("old_request_id"))
+    )
+
+
+def _validate_empty_stopped_control_pins(control, receipt):
+    pins = receipt.get("control_pins")
+    required = {
+        "active", receipt.get("activation_receipt_path"),
+        receipt.get("activation_marker_path"),
+        receipt.get("development_terminal_path"),
+        receipt.get("development_compose_path"),
+        "runtime-control/runtime-services/OWNER.json",
+        "runtime-control/runtime-services/LAUNCH.json",
+        "runtime-control/runtime-service/process-tree.json",
+    }
+    if (not isinstance(pins, dict) or None in required or not required.issubset(pins)
+            or any(not isinstance(path, str) or SHA.fullmatch(digest or "") is None
+                   for path, digest in pins.items())):
+        raise BuildControlError("Empty namespace quarantine pins are incomplete")
+    for path, expected in pins.items():
+        relative = _safe_relative(control, path)
+        if hashlib.sha256(_raw(control, relative)).hexdigest() != expected:
+            raise BuildControlError("Empty namespace quarantine control pin changed: " + path)
 
 
 def _regular(path):

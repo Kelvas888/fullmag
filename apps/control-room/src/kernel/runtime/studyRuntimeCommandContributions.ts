@@ -29,7 +29,10 @@ import {
   SIMULATION_STAGES_EXECUTION_PATH,
   VISUALIZATION_STATE_PATH,
 } from "../api/apiPaths";
+import { ControlRoomApiError } from "../api/ControlRoomApi";
 import type {
+  CommandDetailResource,
+  CommandResponse,
   JsonObject,
   SceneResource,
   RequestOptions,
@@ -1583,9 +1586,49 @@ async function submitRuntimeCommand(
   const obsoleteAfterRefresh = obsoleteSessionResult(context);
   if (obsoleteAfterRefresh) return obsoleteAfterRefresh;
   const requestOptions = sessionRequestOptions(context);
-  const response = await (requestOptions
-    ? context.api.commands.submit(refreshedCommand, requestOptions)
-    : context.api.commands.submit(refreshedCommand));
+  const clientIntentId = nonEmptyString(refreshedCommand.client_intent_id);
+  let response: CommandResponse;
+  try {
+    response = await (requestOptions
+      ? context.api.commands.submit(refreshedCommand, requestOptions)
+      : context.api.commands.submit(refreshedCommand));
+  } catch (error) {
+    const obsoleteAfterSubmit = obsoleteSessionResult(context);
+    if (obsoleteAfterSubmit) return obsoleteAfterSubmit;
+    if (!isAmbiguousRuntimeCommandSubmitError(error)) throw error;
+
+    const reconciliation = await reconcileRuntimeCommandSubmission(
+      context,
+      refreshedCommand.kind,
+      clientIntentId,
+    );
+    if (reconciliation.kind === "obsolete") return reconciliation.result;
+    const obsoleteAfterReconciliation = obsoleteSessionResult(context);
+    if (obsoleteAfterReconciliation) return obsoleteAfterReconciliation;
+
+    const reconciledCommandId = reconciliation.kind === "matched"
+      ? reconciliation.commandId
+      : undefined;
+    const observation = reconciledCommandId
+      ? "waiting"
+      : reconciliation.kind === "unavailable"
+        ? "disconnected"
+        : "publication-unconfirmed";
+    invalidateRuntimeControlResources(
+      context,
+      reconciledCommandId ?? clientIntentId ?? commandRevision({}, `study:${refreshedCommand.kind}`),
+    );
+    return {
+      commandId: reconciledCommandId,
+      clientIntentId: clientIntentId ?? undefined,
+      clientIntentKind: clientIntentId ? refreshedCommand.kind : undefined,
+      message: reconciledCommandId
+        ? "Command accepted; waiting for the backend result."
+        : "Submission confirmation is pending. The command was not sent again.",
+      observation,
+      status: "pending",
+    };
+  }
   const obsoleteAfterSubmit = obsoleteSessionResult(context);
   if (obsoleteAfterSubmit) return obsoleteAfterSubmit;
   if (!response.accepted) {
@@ -1604,10 +1647,83 @@ async function submitRuntimeCommand(
   // terminal result, including failures after native worker startup.
   return {
     commandId: response.command_id,
+    clientIntentId: clientIntentId ?? undefined,
+    clientIntentKind: clientIntentId ? refreshedCommand.kind : undefined,
     message: successMessage,
     observation: "waiting",
     status: "pending",
   };
+}
+
+type RuntimeCommandSubmissionReconciliation =
+  | { kind: "matched"; commandId: string }
+  | { kind: "not-found" }
+  | { kind: "ambiguous" }
+  | { kind: "unavailable" }
+  | { kind: "obsolete"; result: CommandResult };
+
+async function reconcileRuntimeCommandSubmission(
+  context: CommandContext,
+  expectedKind: string,
+  clientIntentId: string | null,
+): Promise<RuntimeCommandSubmissionReconciliation> {
+  const api = context.api;
+  const requestOptions = sessionRequestOptions(context);
+  if (!api || !requestOptions?.sessionScopeKey || !clientIntentId) {
+    return { kind: "unavailable" };
+  }
+
+  let queue: CommandQueueStatusResource;
+  try {
+    queue = await api.commands.list(requestOptions);
+  } catch {
+    return { kind: "unavailable" };
+  }
+  const obsoleteAfterQueue = obsoleteSessionResult(context);
+  if (obsoleteAfterQueue) return { kind: "obsolete", result: obsoleteAfterQueue };
+
+  const candidates = queue.commands.filter((entry) =>
+    entry.client_intent_id === clientIntentId,
+  );
+  if (candidates.length === 0) return { kind: "not-found" };
+  if (candidates.length !== 1 || candidates[0].kind !== expectedKind) {
+    return { kind: "ambiguous" };
+  }
+
+  const candidate = candidates[0];
+  if (
+    !candidate.command_id ||
+    queue.commands.filter((entry) => entry.command_id === candidate.command_id).length !== 1
+  ) {
+    return { kind: "ambiguous" };
+  }
+
+  let detail: CommandDetailResource;
+  try {
+    detail = await api.commands.detail(candidate.command_id, requestOptions);
+  } catch {
+    return { kind: "unavailable" };
+  }
+  const obsoleteAfterDetail = obsoleteSessionResult(context);
+  if (obsoleteAfterDetail) return { kind: "obsolete", result: obsoleteAfterDetail };
+
+  if (
+    detail.command_id !== candidate.command_id ||
+    detail.client_intent_id !== clientIntentId ||
+    detail.kind !== expectedKind
+  ) {
+    return { kind: "ambiguous" };
+  }
+  return { commandId: detail.command_id, kind: "matched" };
+}
+
+function isAmbiguousRuntimeCommandSubmitError(error: unknown): boolean {
+  return error instanceof ControlRoomApiError &&
+    (error.code === "API_UNAVAILABLE" || error.status === 0);
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 async function refreshRuntimeCommandPrecondition(
@@ -2324,9 +2440,12 @@ export const STUDY_RUNTIME_COMMANDS: CommandContribution[] = [
         ),
       });
       if (outcome.kind === "rejected") return outcome.result;
-      const result = outcome.resource;
+      const planFingerprint =
+        outcome.kind === "materialized"
+          ? outcome.resource.plan_fingerprint
+          : outcome.receipt.plan_fingerprint;
       return {
-        message: `Live preparation accepted (${result.plan_fingerprint.slice(0, 12)}…).`,
+        message: `Live preparation accepted (${planFingerprint.slice(0, 12)}…).`,
         status: "completed",
       };
     },

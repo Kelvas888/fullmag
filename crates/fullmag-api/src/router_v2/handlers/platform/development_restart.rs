@@ -157,10 +157,42 @@ async fn acquire_workspace_for_restart_inner(
             api_instance_id: state.request_scope_instance_id.clone(),
             session_epoch,
         },
+        Some(snapshot)
+            if allow_restored_terminal_without_display_timestamp
+                && is_unadmitted_startup_failure(snapshot)? =>
+        {
+            // Live retirement only: a Docker startup script rejected before any
+            // RunIntent was accepted leaves no run to drain. Archive it like an
+            // idle workspace; the retirement route proves run-store absence.
+            validate_preparation(snapshot)?;
+            validate_mesh_workspace(snapshot.mesh_workspace.as_deref())?;
+            let scene_document = snapshot
+                .scene_document
+                .as_ref()
+                .ok_or_else(|| not_restartable("the current workspace has no canonical scene"))?;
+            let raw_scene_id = scene_document.scene.id.as_str();
+            let scene_id = raw_scene_id.trim();
+            if scene_id.is_empty() || scene_id != raw_scene_id {
+                return Err(not_restartable(
+                    "the current workspace scene has no stable model identity",
+                ));
+            }
+            validate_connectivity(state, false).await?;
+            RestartableWorkspace::Session {
+                identity: RestartableWorkspaceIdentity {
+                    api_instance_id: state.request_scope_instance_id.clone(),
+                    session_id: snapshot.session.session_id.clone(),
+                    run_id: None,
+                    scene_id: scene_id.to_string(),
+                    session_epoch,
+                },
+                scene_document: scene_document.clone(),
+            }
+        }
         Some(snapshot) => {
             let kind = validate_runtime_status(snapshot)?;
             validate_preparation(snapshot)?;
-            validate_mesh_workspace(snapshot.mesh_workspace.as_ref())?;
+            validate_current_mesh_workspace(snapshot)?;
             let scene_document = snapshot
                 .scene_document
                 .as_ref()
@@ -259,6 +291,36 @@ fn validate_runtime_status(snapshot: &SessionStateResponse) -> Result<RuntimeSta
         ));
     }
     Ok(expected)
+}
+
+/// A `startup_failed` workspace that never admitted a RunIntent: no run, no
+/// stage execution and a quiescent runtime projection. Any partial match is a
+/// refusal rather than a fallback to the terminal-run checks.
+pub(crate) fn is_unadmitted_startup_failure(
+    snapshot: &SessionStateResponse,
+) -> Result<bool, ApiError> {
+    if snapshot.session.status != "startup_failed" {
+        return Ok(false);
+    }
+    let effective_code = crate::session::effective_runtime_status_code(snapshot);
+    if snapshot.run.is_some()
+        || snapshot.stage_execution.is_some()
+        || snapshot.live_state.is_some()
+        || effective_code != "startup_failed"
+        || snapshot.runtime_status.code != effective_code
+        || snapshot.runtime_status.kind != RuntimeStatus::Unknown
+        || snapshot.runtime_status.is_busy
+        || snapshot.runtime_status.can_accept_commands
+        || snapshot.session.session_id.trim().is_empty()
+        || snapshot.session.session_id != snapshot.session.session_id.trim()
+        || snapshot.session.run_id.trim().is_empty()
+        || snapshot.session.run_id != snapshot.session.run_id.trim()
+    {
+        return Err(not_restartable(
+            "the startup-failed workspace is not demonstrably unadmitted and idle",
+        ));
+    }
+    Ok(true)
 }
 
 fn is_idle_scratch(
@@ -409,6 +471,52 @@ fn validate_preparation(snapshot: &SessionStateResponse) -> Result<(), ApiError>
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_current_mesh_workspace(snapshot: &SessionStateResponse) -> Result<(), ApiError> {
+    let Some(workspace) = snapshot.mesh_workspace.as_deref().and_then(Value::as_object) else {
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_deref());
+    };
+    if workspace.get("schema_version").and_then(Value::as_str)
+        != Some(crate::live_scene_preparation::LIVE_SCENE_PREPARATION_READ_MODEL_SCHEMA)
+    {
+        return validate_mesh_workspace(snapshot.mesh_workspace.as_deref());
+    }
+    // Accepted workers publish one completed receipt, rather than the legacy
+    // FEM/grid mesher phase array. Validate that producer's run-bound shape;
+    // this remains workspace capture, never native-process drain evidence.
+    let pipeline = workspace.get("mesh_pipeline_status").and_then(Value::as_array);
+    let valid_pipeline = pipeline.is_some_and(|stages| {
+        stages.len() == 1 && stages[0].get("status").and_then(Value::as_str) == Some("completed")
+            && matches!(stages[0].get("id").and_then(Value::as_str),
+                Some("startup" | "solve" | "run" | "relax" | "resume" | "mesh_build" | "fdm_grid_refresh"
+                    | "accepted_run_reattach" | "accepted_projection_stage_preparation" | "remesh"))
+    });
+    let fingerprint = workspace.get("plan_fingerprint").and_then(Value::as_str)
+        .and_then(|value| value.strip_prefix("sha256:"));
+    let has_identity = ["preparation_id", "accepted_step_id"].iter().all(|key| {
+        workspace.get(*key).and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty())
+    });
+    if workspace.get("status").and_then(Value::as_str) != Some("completed")
+        || workspace.get("active_build").is_none_or(|value| !value.is_null())
+        || workspace.get("last_build_error").is_none_or(|value| !value.is_null())
+        || workspace.get("accepted_run_id").and_then(Value::as_str)
+            != snapshot.run.as_ref().map(|run| run.run_id.as_str())
+        || snapshot.run.is_none()
+        || workspace.get("source_scene_revision").and_then(Value::as_u64).is_none()
+        || !fingerprint.is_some_and(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        || !has_identity || !valid_pipeline
+    {
+        return Err(not_restartable("accepted preparation workspace has no complete run-bound receipt"));
+    }
+    let plan = workspace.get("execution_plan")
+        .ok_or_else(|| not_restartable("accepted preparation workspace has no execution plan"))?;
+    // Deserialize by reference to avoid cloning the large JSON mesh first.
+    // The workspace projection does not contain requested_execution; that
+    // belongs to the separate persisted preparation read model.
+    let _: fullmag_ir::ExecutionPlanIR = serde::Deserialize::deserialize(plan)
+        .map_err(|_| not_restartable("accepted preparation workspace execution plan is malformed"))?;
     Ok(())
 }
 
@@ -749,6 +857,21 @@ fn validate_command_ledger<'a>(
 }
 
 async fn validate_connectivity(state: &AppState, is_scratch: bool) -> Result<(), ApiError> {
+    if !is_scratch && crate::live_accepted_execution::docker_api_only_runtime() {
+        // Accepted workers do not publish the legacy interactive heartbeat.
+        // Reuse the same fresh owner/configuration/liveness proof as status;
+        // terminal task and lease evidence is checked separately by retirement.
+        let connectivity =
+            crate::router_v2::handlers::sessions::status::refresh_current_live_connectivity(state)
+                .await;
+        return if connectivity == SessionConnectivity::Connected {
+            Ok(())
+        } else {
+            Err(not_restartable(
+                "the native runtime service is not ready for workspace handoff",
+            ))
+        };
+    }
     let connectivity = *state.current_live_connectivity.read().await;
     if connectivity != SessionConnectivity::Connected {
         return Err(not_restartable(
@@ -889,6 +1012,45 @@ mod tests {
             &state.current_workspace_root,
         )
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn unadmitted_startup_failure_is_retirable_only_without_run_evidence() {
+        let state = scratch_state().await;
+        let mut snapshot = state.current_live_state.read().await.clone().unwrap();
+        snapshot.session.status = "startup_failed".to_string();
+        snapshot.runtime_status = crate::session::build_runtime_status_view("startup_failed");
+        assert!(is_unadmitted_startup_failure(&snapshot).unwrap());
+
+        // The ordinary restart route keeps refusing the unknown status.
+        *state.current_live_state.write().await = Some(snapshot.clone());
+        assert!(acquire_workspace_for_restart(&state).await.is_err());
+
+        let mut admitted = snapshot.clone();
+        admitted.run = Some(RunManifest {
+            run_id: admitted.session.run_id.clone(),
+            session_id: admitted.session.session_id.clone(),
+            status: "failed".to_string(),
+            total_steps: 0,
+            final_time: None,
+            final_e_ex: None,
+            final_e_demag: None,
+            final_e_ext: None,
+            final_e_ani: None,
+            final_e_dmi: None,
+            final_e_rotated_dmi: None,
+            final_e_total: None,
+            artifact_dir: "".to_string(),
+        });
+        assert!(is_unadmitted_startup_failure(&admitted).is_err());
+
+        let mut busy = snapshot.clone();
+        busy.runtime_status.is_busy = true;
+        assert!(is_unadmitted_startup_failure(&busy).is_err());
+
+        let mut idle = snapshot;
+        idle.session.status = "awaiting_command".to_string();
+        assert!(!is_unadmitted_startup_failure(&idle).unwrap());
     }
 
     fn tracked_command(
@@ -1211,7 +1373,7 @@ mod tests {
             .await
             .as_mut()
             .unwrap()
-            .mesh_workspace = Some(serde_json::json!({"active_build": {"status": "running"}}));
+            .mesh_workspace = Some(serde_json::json!({"active_build": {"status": "running"}}).into());
         assert!(acquire_workspace_for_restart(&state).await.is_err());
 
         let state = scratch_state().await;
@@ -1222,7 +1384,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .mesh_workspace = Some(
-            serde_json::json!({"mesh_pipeline_status": [{"id": "remesh", "status": "queued"}]}),
+            serde_json::json!({"mesh_pipeline_status": [{"id": "remesh", "status": "queued"}]}).into(),
         );
         assert!(acquire_workspace_for_restart(&state).await.is_err());
     }
