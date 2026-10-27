@@ -14,9 +14,10 @@ CSS = STATIC_DIR / "fullmag-docs.css"
 class ResponsivePublicDocumentationTableTests(unittest.TestCase):
     @staticmethod
     def _rules_for_selector(css: str, selector: str) -> list[str]:
+        uncommented = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
         return [
             declarations
-            for selector_list, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+            for selector_list, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", uncommented)
             if selector in {item.strip() for item in selector_list.split(",")}
         ]
 
@@ -189,6 +190,52 @@ class ResponsivePublicDocumentationTableTests(unittest.TestCase):
         header_rules = self._rules_for_selector(css, "#main-header")
         self.assertTrue(
             any(re.search(r"overflow-x:\s*clip", declarations) for declarations in header_rules)
+        )
+
+    def test_embedded_mode_collapses_duplicate_sphinx_header_and_search_modal(self) -> None:
+        embed_css = (STATIC_DIR / "fullmag-embed.css").read_text(encoding="utf-8")
+        root_rules = self._rules_for_selector(embed_css, "html[data-fullmag-embedded]")
+        self.assertTrue(
+            any(
+                "--header-height: 0px !important" in declarations
+                and "--announcement-height: 0px !important" in declarations
+                for declarations in root_rules
+            )
+        )
+        for selector in (
+            "html[data-fullmag-embedded] #main-header",
+            "html[data-fullmag-embedded] #searchModal",
+        ):
+            rules = self._rules_for_selector(embed_css, selector)
+            self.assertTrue(
+                any("display: none !important" in declarations for declarations in rules),
+                selector,
+            )
+
+    def test_documentation_theme_tokens_align_with_fullmag_light_and_dark_palettes(self) -> None:
+        css = CSS.read_text(encoding="utf-8")
+        light_rules = self._rules_for_selector(css, 'html[data-theme="light"]')
+        dark_rules = self._rules_for_selector(css, 'html[data-theme="dark"]')
+
+        self.assertTrue(
+            any(
+                "--fm-docs-bg-app: #eff1f5" in declarations
+                and "--fm-docs-bg-chrome: #e6e9ef" in declarations
+                and "--fm-docs-text-primary: #4c4f69" in declarations
+                and "--fm-docs-accent: #1e66f5" in declarations
+                and "--color-base-100: var(--fm-docs-bg-app)" in declarations
+                for declarations in light_rules
+            )
+        )
+        self.assertTrue(
+            any(
+                "--fm-docs-bg-app: #1e1e2e" in declarations
+                and "--fm-docs-bg-chrome: #181825" in declarations
+                and "--fm-docs-text-primary: #cdd6f4" in declarations
+                and "--fm-docs-accent: #89b4fa" in declarations
+                and "--color-base-100: var(--fm-docs-bg-app)" in declarations
+                for declarations in dark_rules
+            )
         )
 
 

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import { createCommandContext } from "@/kernel/commands/commandContext";
+import { useSavedResultsPlaybackSelection } from "@/kernel/saved-results/useSavedResultsPlayback";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
 import { useWorkspaceContentScope } from "@/kernel/layout/WorkspaceContentScope";
 import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
@@ -21,6 +22,7 @@ import { resolveInspectorDescriptor } from "./inspectorDescriptor";
 import { resolveInspectorPanel } from "./inspectorRegistry";
 import { resolveUnknownInspectorRoute } from "./inspectorRouteCatalog";
 import { InspectorShell } from "./InspectorShell";
+import { SavedResultsPlaybackInspector } from "./panels/SavedResultsPlaybackInspector";
 
 function PendingFormBridge() {
   const kernel = useKernel();
@@ -72,6 +74,11 @@ function PendingFormBridge() {
 }
 
 export default function InspectorModule() {
+  const savedPlayback = useSavedResultsPlaybackSelection();
+  return savedPlayback ? <SavedResultsPlaybackInspector /> : <LiveInspectorModule />;
+}
+
+function LiveInspectorModule() {
   const kernel = useKernel();
   const projectOnly = useWorkspaceContentScope() === "project";
   const selection = useSelectionSelector((state) => state, {

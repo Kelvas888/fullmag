@@ -64,6 +64,7 @@ BASE_CONTEXT_FILES = (
     ("Dockerfile.dev", "docker/all-in-one/Dockerfile.dev"),
     ("Dockerfile.dev.dockerignore", "docker/all-in-one/Dockerfile.dev.dockerignore"),
     ("entrypoint.py", "docker/all-in-one/entrypoint.py"),
+    ("backend_auto_maintenance.py", "docker/all-in-one/backend_auto_maintenance.py"),
     ("windows_folder_probe.py", "docker/all-in-one/windows_folder_probe.py"),
     ("linux_native_probe.py", "docker/all-in-one/linux_native_probe.py"),
     ("runtime_service.py", "docker/all-in-one/runtime_service.py"),
@@ -2520,6 +2521,14 @@ def _parser() -> argparse.ArgumentParser:
     empty_quarantine.add_argument("--activation", required=True)
     empty_quarantine.add_argument("--recovery-id", required=True)
     empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
+    reattest = subparsers.add_parser("reattest-host-device-volume", help="explicitly reattest a stopped WSL group's renumbered host device")
+    reattest.add_argument("--source-root", type=Path, required=True)
+    reattest.add_argument("--attempt", required=True)
+    reattest.add_argument("--config-sha256", required=True)
+    reattest.add_argument("--certificate-sha256", required=True)
+    reattest.add_argument("--expected-host-device", type=int, required=True)
+    reattest.add_argument("--apply", action="store_true")
+    reattest.add_argument("--interrupted-iteration", help="exact absent helper iteration to reconcile after an abrupt host stop")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
@@ -2690,6 +2699,14 @@ def _parser() -> argparse.ArgumentParser:
     recreate_volume.add_argument("--config-sha256", required=True)
     recreate_volume.add_argument("--source-root", type=Path, required=True)
     recreate_volume.add_argument("--port", type=int, required=True)
+    recreate_volume.add_argument(
+        "--helper-source-root", type=Path,
+        help="durable clean infrastructure checkout used only for managed runtime helpers",
+    )
+    recreate_volume.add_argument(
+        "--helper-source-commit",
+        help="full commit pin for --helper-source-root",
+    )
     recreate_volume.add_argument(
         "--migrate-host-capacity", action="store_true",
         help="explicitly migrate quiescent shared host capacity when rendering the replacement services",
@@ -2963,6 +2980,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = stop_bootstrap(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
+            import docker_helper_source as helper_source
+            try:
+                helper_pair = helper_source.validate_option_pair(
+                    args.helper_source_root, args.helper_source_commit
+                )
+            except helper_source.HelperSourceError as error:
+                raise _fail(str(error)) from error
+            if args.recovery_authorization is not None and helper_pair is not None:
+                raise _fail("helper-source pins are unsupported with --recovery-authorization")
             if args.resume_recreation is not None:
                 from docker_volume_dev import resume_recreation
                 resume_recreation(args)
@@ -2985,6 +3011,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "quarantine-empty-stopped":
             from docker_volume_empty_quarantine import quarantine
             quarantine(args)
+        elif args.action == "reattest-host-device-volume":
+            from docker_volume_host_device import run as reattest_host_device
+            print(json.dumps(reattest_host_device(args), sort_keys=True))
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)

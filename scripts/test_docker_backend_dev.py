@@ -1252,17 +1252,17 @@ class BackendPackageTests(unittest.TestCase):
             current = backend._validated_package(
                 package, "retention fixture current", exclude_development_control=True
             )
-            original_remove = backend._remove_owned_tree
             failed = False
 
-            def fail_first_backup_delete(path):
+            def fail_first_backup_retirement(source, target, backup_name):
                 nonlocal failed
-                if path.name.startswith(".backend-package-backup-") and not failed:
+                if not failed:
                     failed = True
-                    raise backend.BackendBuildError("injected backup delete failure")
-                return original_remove(path)
+                    raise backend.BackendBuildError("injected backup retirement failure")
+                return original_rename(source, target, backup_name)
 
-            with patch.object(backend, "_remove_owned_tree", side_effect=fail_first_backup_delete):
+            original_rename = backend._rename_backup_to_tombstone
+            with patch.object(backend, "_rename_backup_to_tombstone", side_effect=fail_first_backup_retirement):
                 with self.assertRaises(backend.BackendBuildError):
                     backend._retain_package_backups(package, control, current[0], current[1])
             self.assertEqual(
