@@ -319,3 +319,86 @@ per-ampere basis, source FFT i LLG drive. Pełna mapa H Universe oraz widok
 przeglądarki/WebGL nadal NOT VERIFIED. Rust unit tests nie kompilowano.
 Retencja: bieżący pakiet i osiem backupów zachowane, bez kasowania cache,
 wyników i wolumenów; pełna kwalifikacja retencji nadal NOT VERIFIED.
+
+
+## Pomiar całego wywołania native — 27.10.2026
+
+Nie zmieniono metody, precyzji, tolerancji, siatek ani punktów próbkowania.
+Dodano opcjonalny native_call_wall_ns: czas całego profilowanego wywołania ABI,
+zawierający operator pola. To pomiar zagnieżdżony, nie dziesiąta faza do sumowania.
+Dziewięć dotychczasowych faz zachowuje identyfikatory i znaczenie.
+Stare raporty bez pola pozostają czytelne; wyłączony profiler nie odczytuje
+dodatkowego zegara. Producer i walidator sprawdzają operator <= call <= total,
+zachowując oznaczenie anomalii zegara i pomiar po kontrolowanym błędzie native.
+
+Właściciele: crates/fullmag-runner/src/native_fem/steady_transport.rs::solve_rt0_common,
+crates/fullmag-runner/src/antenna_field_solution/closed_loop_execution.rs::execute_antenna_closed_loop_inspection_profiled_typed,
+crates/fullmag-runner/src/solver_profile.rs::SolverProfileOperationSample::validate,
+crates/fullmag-api/src/schemas/diagnostics.rs::SolverProfileOperationResource.
+
+Zarządzana iteracja 54271fb73a40410db92124c665001de0: sukces, Make 548536 ms,
+pakowanie 4393 ms, weryfikacja pakietu 3456 ms.
+Snapshot 24e18593ff4171f3619e0bb427e7f4c0b86e0b7ee4b576e86c5a63ec0b8c9344,
+bazowy commit d3cc5a5800bd463c5af99741b99825c86dba2e3d z jawnym dirty.
+API instance f0996610-45cc-4f9d-ba4d-92e77f6f1e63; HTTP OpenAPI potwierdził pole
+opcjonalne. Nie kompilowano testów jednostkowych Rust; źródła regresji dodano,
+ale nie zgłoszono ich wykonania.
+
+Oddzielny run run-c83f5ac8dfdb61c79eb80802915786b6c5cb40a59b16688a050e71aa71e0f310,
+task task-966b29c29240483138e1c651705747c3c816404e9c2792c71efb06560f93367d,
+attempt attempt-1848fa78c683425c802ed60a0d8f6620, epoch 1:
+**Succeeded**, katalog rewizja 98. Zamrożone archiwum, katalog Study, asset_paths
+i immutable_assets są identyczne z poprzednią próbą; nowy RunIntent utworzył
+publiczny producer. Submit wykonano jeden raz. Po timeout klienta początkowy
+GET zwracał 404, późniejszy GET potwierdził trwałe przyjęcie. Nie potraktowano
+timeout/404 jako dowodu zakończenia żądania. Fingerprint
+92d7d3484608cab3e098a8e5eb7fb175d7a74a22871f0faa5f251cb1d4a8df38
+porównano z producerem przed jednorazową materializacją.
+
+| Zmierzony zakres | Czas [s] |
+|---|---:|
+| Cała operacja runnera | 95.924504469 |
+| Całe wywołanie native ABI | 85.573669145 |
+| Operator pola | 26.591040381 |
+| Native poza operatorem pola | 58.982628764 |
+| Runner poza wywołaniem native | 10.350835324 |
+
+To rozdziela poprzednie „unattributed”, ale nie identyfikuje konkretnego etapu
+native. Nie wolno przypisać 58.98 s samemu solve potencjału ani projekcji RT0
+bez kolejnego pomiaru. Różnica czasu względem poprzedniej próby nie jest
+deklaracją przyspieszenia. Historyczne 3 godziny nie są baseline'em aktualnego
+kernela bez potwierdzenia identycznego pakietu/operatora.
+
+Publiczny odczyt przypiętego pakietu i v_raw, j_center_raw, h_raw, sample_xyz:
+HTTP 200; wszystkie bajty mają te same SHA256 co poprzednia próba.
+Worker PID 4669 zakończony; lease lease-cac02fd40e5c4a918fea16f7860cb6da
+normalnie Released o 2026-10-27T04:45:04.013756390Z.
+Nadal inspection_only: display/current_density dostępne,
+per_ampere_basis/source_fft/llg_drive zablokowane.
+Pełna mapa Universe, kwalifikacja naukowa i browser/WebGL nadal NOT VERIFIED.
+
+Dowody w wolumenie kontrolnym: verification/native-call-timing-20261027/.
+Profil SHA256 1bb4c366d59812fe652d53c6c5c18b340a7c9942479a8598f2aaffb4221e86ff;
+timing-breakdown.json, public-vjh-comparison.json, pinned-resource.json,
+run-terminal.json, submit-fingerprint-confirmed.json,
+openapi-field-verification.json, build-receipt.json.
+Pozostawiono 9 generacji rollback; brak usuwania. Skill fullmag-build-stage-cleanup
+nadal nieobecny; retencja nie jest zakwalifikowana.
+
+### Napotkana blokada generowania typów API
+
+docker-dev-codegen używał starego development/verified.json mimo bieżących usług
+z powiązanej udanej iteracji. Poprawka 36cbcb40f6dd006b28aba3c507c288c75c72f101
+w scripts/docker_dev_codegen.py::_validate_admitted_source_mount używa aktualnego
+terminala i istniejącego scripts/docker_volume_activate.py::_linked_runtime_terminals.
+Zachowuje kontrolę obu kontenerów, obrazu, konfiguracji, mountów i wyścigu receiptów.
+26 interpretowanych regresji przeszło, RED odtworzył starą odmowę, rzeczywisty wybór
+obu usług przeszedł. TMPDIR=/build był potrzebny wykonywalnemu interpreterowi
+fixture, ponieważ kontenerowe /tmp jest noexec.
+
+Po poprawce codegen przeszedł bramkę usług, ale prawidłowo odmówił przez stale-source
+gate: zmieniony skrypt należy do snapshotu runtime. Nie osłabiono _source_matches
+ani nie zmieniono receiptów. Pozostają zarządzany build z aktualnymi źródłami
+i regeneracja klienta/typów; nie zgłoszono ich jako zakończonych. Następny krok
+wydajności: pomiar etapów native i osobno poprawka operatora pola, z kontrolą
+identycznych wyników.

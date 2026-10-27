@@ -372,6 +372,9 @@ pub struct SolverProfileOperationResource {
     pub outcome: String,
     pub total_wall_time_ns: u64,
     pub native_operator_wall_ns: Option<u64>,
+    /// Entire native ABI call, containing the surface operator duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_call_wall_ns: Option<u64>,
     pub phases: Vec<SolverProfilePhaseResource>,
     pub accounting_issue: bool,
 }

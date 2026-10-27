@@ -1203,6 +1203,7 @@ pub(crate) struct NativeFemSurfaceRt0Profile {
     pub available: bool,
     pub accounting_issue: bool,
     pub operator_wall_time_ns: u64,
+    pub native_call_wall_ns: Option<u64>,
     pub phase_wall_time_ns: [u64; 9],
 }
 
@@ -1794,9 +1795,11 @@ fn solve_rt0_common(request:Rt0NumericInput<'_>,view:Rt0InputView<'_>,oersted_me
                 };
                 // The profile is a separate, disjoint fixed buffer. The native
                 // call fills it on controlled refusal as well as success.
+                let started = std::time::Instant::now();
                 let status = unsafe { ffi::fullmag_fem_solve_prepared_closed_loop_rt0_surface_profiled_v1(
                     &surface_request, &mut buffer.header, &mut charge_snapshot_ffi, &mut prepared.outer,
                     &mut native_profile) };
+                profile.native_call_wall_ns = Some(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
                 if native_profile.abi_version != ffi::FULLMAG_FEM_SURFACE_RT0_PROFILE_ABI_VERSION
                     || native_profile.reserved_flags != 0
                     || native_profile.struct_size != std::mem::size_of::<ffi::fullmag_fem_surface_rt0_profile_result_v1>() as u64

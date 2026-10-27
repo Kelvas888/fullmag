@@ -10,6 +10,7 @@ struct NativeFemSurfaceRt0Profile {
     available: bool,
     accounting_issue: bool,
     operator_wall_time_ns: u64,
+    native_call_wall_ns: Option<u64>,
     phase_wall_time_ns: [u64; 9],
 }
 use fullmag_ir::{BackendTarget, ExecutionDevice, ExecutionMode, ExecutionPrecision,
@@ -124,7 +125,7 @@ pub fn execute_antenna_closed_loop_inspection_profiled_typed(
         None
     };
     profile.record_antenna_operation(outcome, total_wall_time_ns,
-        native_operator_wall_ns, phases, native_profile.accounting_issue);
+        native_operator_wall_ns, native_profile.native_call_wall_ns, phases, native_profile.accounting_issue);
     result.map_err(|error| classify_execution_error(error, native_status))
 }
 
