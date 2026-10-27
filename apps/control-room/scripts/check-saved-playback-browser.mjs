@@ -18,14 +18,16 @@ const sha=value=>createHash("sha256").update(value).digest("hex");
 const scriptSha=sha(await readFile(fileURLToPath(import.meta.url)));
 assert.equal(scriptSha,process.env.CONTROL_ROOM_BROWSER_QA_SAVED_PLAYBACK_SCRIPT_SHA256);
 const errors=[],hookErrors=[],payloads=new Map(),solverRequests=[];
-let proxy,browser,context;
+let proxy,browser,context,page;
 let result;
+let evidenceScreenshot;
+const networkTrace=[];
 const timeout=Math.min(Number(process.env.CONTROL_ROOM_BROWSER_QA_TIMEOUT_MS ?? 180000),180000);
 try {
   proxy=await startBrowserQaLoopbackProxy(publicUrl,probeUrl);
   browser=await chromium.launch({headless:true,args:["--no-sandbox","--enable-unsafe-swiftshader","--use-angle=swiftshader-webgl"]});
   context=await browser.newContext({viewport:{width:1500,height:1000},deviceScaleFactor:1,serviceWorkers:"block"});
-  const page=await context.newPage(); page.setDefaultTimeout(timeout);
+  page=await context.newPage(); page.setDefaultTimeout(timeout);
   page.on("pageerror",e=>{errors.push(e.message);if(/Rendered (fewer|more) hooks|order of Hooks/i.test(e.message))hookErrors.push(e.message);});
   page.on("console",m=>{if(m.type()==="error" && /Rendered (fewer|more) hooks|Context Lost|WebGL.*error/i.test(m.text())) errors.push(m.text());});
   page.on("request",request=>{
@@ -36,11 +38,30 @@ try {
   assert.equal(sessionsBeforeResponse.status(),200);
   const sessionsBefore=await sessionsBeforeResponse.json();
   assert.equal(sessionsBefore.sessions.length,0,"This qualification must start without a simulation session.");
-  page.on("response",response=>{
+  for(const event of ["request","requestfinished","requestfailed","response"]) {
+    context.on(event,value=>{
+      if(value.url().includes("/playback/frames/")) networkTrace.push({event,url:value.url()});
+    });
+  }
+  context.on("response",async response=>{
     const url=new URL(response.url());
     const match=url.pathname.match(new RegExp("/v2/workspace/items/"+itemId+"/playback/frames/([0-9]+)$"));
-    if(match && response.ok()) {
-      response.body().then(body=>payloads.set(Number(match[1]),{hash:sha(body),bytes:body.length}),e=>errors.push(String(e)));
+    if(!match || !response.ok())return;
+    try {
+      const body=await response.body();
+      payloads.set(Number(match[1]),{hash:sha(body),bytes:body.length});
+    } catch(error) {networkTrace.push({event:"body-unavailable",message:String(error)});}
+  });
+  context.on("requestfinished",async request=>{
+    const url=new URL(request.url());
+    const match=url.pathname.match(new RegExp("/v2/workspace/items/"+itemId+"/playback/frames/([0-9]+)$"));
+    if(!match)return;
+    const response=await request.response();
+    if(response?.ok()) {
+      try {
+        const body=await response.body();
+        payloads.set(Number(match[1]),{hash:sha(body),bytes:body.length});
+      } catch(error) {networkTrace.push({event:"finished-body-unavailable",message:String(error)});}
     }
   });
   const detailResponse=await context.request.get(proxy.origin+"/v2/workspace/items/"+itemId);
@@ -120,13 +141,15 @@ try {
         currentPose[key].forEach((value,i)=>assert(Math.abs(value-firstPose[key][i])<1e-9,"Scrubbing moved the camera."));
       }
     }
-    canvasHashes.push(sha(await canvas.screenshot({type:"png"})));
-    for(let attempt=0;attempt<50&&!payloads.has(index);attempt++) await page.waitForTimeout(20);
+    evidenceScreenshot=await canvas.screenshot({type:"png"});
+    canvasHashes.push(sha(evidenceScreenshot));
+    for(let attempt=0;attempt<500&&!payloads.has(index);attempt++) await page.waitForTimeout(20);
     assert.equal(payloads.get(index)?.hash,expected[indices.indexOf(index)],"UI adopted a different field payload.");
     result={drawing_buffer:glState.size};
   }
-  assert(new Set(canvasHashes).size>1,"Different fields did not change the rendered canvas.");
   const screenshot=await page.screenshot({type:"png"});
+  evidenceScreenshot=screenshot;
+  assert(new Set(canvasHashes).size>1,"Different fields did not change the rendered canvas.");
   assert(screenshot.length<=512*1024,"Screenshot exceeds managed evidence bound.");
   await inspector.getByRole("button",{name:"Close playback",exact:true}).click();
   await row.waitFor({state:"visible"});
@@ -144,8 +167,9 @@ try {
     ...result,field_payloads_verified:true,changed_canvas:true,inspector_stable:true,
     camera_stable:true,hook_errors:hookErrors,errors,screenshot_base64:screenshot.toString("base64")};
 } catch(error) {
+  try {evidenceScreenshot ??= await page?.screenshot({type:"png",timeout:5000});} catch {}
   result={schema:"fullmag.docker-dev-saved-playback-result.v1",state:"failed",scenario:"saved-playback",
-    item_id:itemId,errors:[...errors,error?.stack??String(error)]};
+    item_id:itemId,errors:[...errors,error?.stack??String(error)],network_trace:networkTrace.slice(-24),screenshot_base64:evidenceScreenshot?.toString("base64")};
   process.exitCode=1;
 } finally {
   await context?.close();await browser?.close();await proxy?.close();

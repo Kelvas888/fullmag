@@ -262,7 +262,9 @@ describe("control-room Next dev proxy config", () => {
 
   it("keeps generated Next route types stable across dev and audit builds", () => {
     const nextEnvSource = readFileSync(
-      new URL("./next-env.d.ts", import.meta.url),
+      process.env.FULLMAG_TEST_SOURCE_ROOT
+        ? resolve(process.env.FULLMAG_TEST_SOURCE_ROOT, "apps/control-room/next-env.d.ts")
+        : new URL("./next-env.d.ts", import.meta.url),
       "utf8",
     );
     const packageSource = readFileSync(

@@ -96,7 +96,10 @@ describe("SavedResultsPlaybackInspector", () => {
     expect(lastFrame).not.toMatch(/<button[^>]*aria-label="Previous frame"[^>]*disabled=""/);
     expect(lastFrame).toMatch(/<button[^>]*aria-label="Next frame"[^>]*disabled=""/);
     expect(lastFrame).toMatch(/<button[^>]*aria-label="Last frame"[^>]*disabled=""/);
-    expect(lastFrame).toContain('aria-valuenow="2"');
+    // Radix assigns the Thumb's collection index after DOM registration.
+    // SSR verifies the visible selection; managed browser QA checks the hydrated ARIA value.
+    expect(lastFrame).toContain('>3 / 3</output>');
+    expect(lastFrame).toContain("Time: 2 ns");
   });
 
   it("clamps descriptor-driven frame indexes to the saved range", () => {

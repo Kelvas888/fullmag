@@ -8,6 +8,7 @@ import { useSavedResultsPlaybackSelection } from "@/kernel/saved-results/useSave
 import { useSavedResultsFrameResource, useSavedResultsManifestResource } from "@/kernel/resources/savedResultsPlaybackResources";
 import { scalarColorPaletteGradientCss } from "@/shared/visualization/scalarColorPalette";
 import { Viewport3DCanvas } from "./Viewport3DCanvas";
+import { useBatchedInvalidate } from "./viewport3dBatchedInvalidate";
 import { Viewport3DErrorBoundary } from "./Viewport3DErrorBoundary";
 import { useViewport3DColors } from "./hooks/useViewport3DColors";
 import { savedFrameColors, savedGridGeometry } from "./model/savedResultsPlaybackModel";
@@ -15,12 +16,12 @@ import { savedFrameColors, savedGridGeometry } from "./model/savedResultsPlaybac
 type Geometry = ReturnType<typeof savedGridGeometry>;
 
 function SavedGridLayer({geometry,colors}: {geometry:Geometry;colors:Float32Array|null}) {
-  const invalidate=useThree(state=>state.invalidate);
+  const invalidate=useBatchedInvalidate("frame-commit");
   const gl=useThree(state=>state.gl);
   const meshRef=useRef<InstancedMesh>(null);
   const resources=useMemo(()=>({
     box:new BoxGeometry(...geometry.cellSize),
-    material:new MeshBasicMaterial({vertexColors:true,toneMapped:false}),
+    material:new MeshBasicMaterial({toneMapped:false}),
   }),[geometry]);
   const args=useMemo<[BoxGeometry,MeshBasicMaterial,number]>(()=>[resources.box,resources.material,geometry.count],[resources,geometry.count]);
   useLayoutEffect(()=>{
@@ -52,7 +53,7 @@ function SavedGridLayer({geometry,colors}: {geometry:Geometry;colors:Float32Arra
 }
 
 function SavedCamera({center,frameIndex}: {center:[number,number,number];frameIndex:number}) {
-  const invalidate=useThree(state=>state.invalidate);
+  const invalidate=useBatchedInvalidate("frame-commit");
   const camera=useThree(state=>state.camera);
   const gl=useThree(state=>state.gl);
   const report=()=>{gl.domElement.setAttribute("data-saved-camera-pose",JSON.stringify({position:camera.position.toArray(),quaternion:camera.quaternion.toArray()}));};
