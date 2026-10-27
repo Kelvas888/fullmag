@@ -279,6 +279,7 @@ export async function findBuiltDocsSource({
   }
 
   const requiresV2Sections =
+    existsSync(resolve(currentRepoRoot, "public_docs/site/conf.py")) &&
     existsSync(resolve(currentRepoRoot, "public_docs/site/physics/index.md")) &&
     existsSync(resolve(currentRepoRoot, "public_docs/site/changelog/index.md"));
 
@@ -289,7 +290,9 @@ export async function findBuiltDocsSource({
         (await hasBuiltDocs(candidate)) &&
         (!requiresV2Sections ||
           (existsSync(join(candidate, "physics/index.html")) &&
-            existsSync(join(candidate, "changelog/index.html")))),
+            existsSync(join(candidate, "changelog/index.html")) &&
+            existsSync(join(candidate, "_static/fullmag-embed.css")) &&
+            existsSync(join(candidate, "_static/fullmag-embed.js")))),
     })),
   );
   return checks.find((entry) => entry.valid)?.candidate ?? null;
@@ -680,13 +683,16 @@ export async function bundleDocumentation({
   }
 
   const requiresV2Sections =
+    existsSync(resolve(currentRepoRoot, "public_docs/site/conf.py")) &&
     existsSync(resolve(currentRepoRoot, "public_docs/site/physics/index.md")) &&
     existsSync(resolve(currentRepoRoot, "public_docs/site/changelog/index.md"));
   const hasCurrentTargetDocs =
     (await hasBuiltDocs(targetDir)) &&
     (!requiresV2Sections ||
       (existsSync(join(targetDir, "physics/index.html")) &&
-        existsSync(join(targetDir, "changelog/index.html"))));
+        existsSync(join(targetDir, "changelog/index.html")) &&
+        existsSync(join(targetDir, "_static/fullmag-embed.css")) &&
+        existsSync(join(targetDir, "_static/fullmag-embed.js"))));
 
   if (!fetchOnly && hasCurrentTargetDocs) {
     await ensureEmbedAssets(targetDir, staticSourceDir);

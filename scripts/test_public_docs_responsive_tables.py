@@ -14,9 +14,10 @@ CSS = STATIC_DIR / "fullmag-docs.css"
 class ResponsivePublicDocumentationTableTests(unittest.TestCase):
     @staticmethod
     def _rules_for_selector(css: str, selector: str) -> list[str]:
+        uncommented = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
         return [
             declarations
-            for selector_list, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+            for selector_list, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", uncommented)
             if selector in {item.strip() for item in selector_list.split(",")}
         ]
 
@@ -190,6 +191,26 @@ class ResponsivePublicDocumentationTableTests(unittest.TestCase):
         self.assertTrue(
             any(re.search(r"overflow-x:\s*clip", declarations) for declarations in header_rules)
         )
+
+    def test_embedded_mode_collapses_duplicate_sphinx_header_and_search_modal(self) -> None:
+        embed_css = (STATIC_DIR / "fullmag-embed.css").read_text(encoding="utf-8")
+        root_rules = self._rules_for_selector(embed_css, "html[data-fullmag-embedded]")
+        self.assertTrue(
+            any(
+                "--header-height: 0px !important" in declarations
+                and "--announcement-height: 0px !important" in declarations
+                for declarations in root_rules
+            )
+        )
+        for selector in (
+            "html[data-fullmag-embedded] #main-header",
+            "html[data-fullmag-embedded] #searchModal",
+        ):
+            rules = self._rules_for_selector(embed_css, selector)
+            self.assertTrue(
+                any("display: none !important" in declarations for declarations in rules),
+                selector,
+            )
 
 
 if __name__ == "__main__":

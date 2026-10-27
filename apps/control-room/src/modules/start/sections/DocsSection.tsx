@@ -22,6 +22,12 @@ import { startScreenStore } from "../model/startScreenState";
 
 const EMBED_FALLBACK_STYLE_ID = "fullmag-embed-fallback-style";
 const EMBED_FALLBACK_CSS = `
+html[data-fullmag-embedded] {
+  --header-height: 0px !important;
+  --announcement-height: 0px !important;
+}
+html[data-fullmag-embedded] #main-header,
+html[data-fullmag-embedded] #searchModal,
 html[data-fullmag-embedded] .fm-header-build-stamp,
 html[data-fullmag-embedded] .mode-select,
 html[data-fullmag-embedded] #announcement,
@@ -29,6 +35,37 @@ html[data-fullmag-embedded] .announcement {
   display: none !important;
 }
 `;
+
+function docPathFromSrc(srcUrl: string): string {
+  const [pathname = "/docs/index.html", rawQuery = ""] = srcUrl.split("?");
+  return resolveFramedDocPath(pathname, rawQuery ? `?${rawQuery}` : "");
+}
+
+function extractSearchQueryFromDocPath(docPath: string): string | null {
+  const [page = "", rawQuery = ""] = docPath.split("?");
+  if (page !== "search.html" || !rawQuery) {
+    return null;
+  }
+  const params = new URLSearchParams(rawQuery);
+  return params.get("q");
+}
+
+function clearSphinxSearchHighlight(frame: HTMLIFrameElement | null): void {
+  try {
+    window.localStorage.removeItem("sphinx_highlight_terms");
+  } catch {
+    // Ignore restricted storage environments.
+  }
+  try {
+    const win = frame?.contentWindow as
+      | (Window & { SphinxHighlight?: { hideSearchWords?: () => void } })
+      | null
+      | undefined;
+    win?.SphinxHighlight?.hideSearchWords?.();
+  } catch {
+    // Ignore cross-origin or uninitialized frame errors.
+  }
+}
 
 function syncSameOriginDocsDocument(
   frame: HTMLIFrameElement | null,
@@ -112,19 +149,29 @@ export function DocsSection() {
   // Reading moves the frame without touching `src`, so a request for the page the
   // state already names must still bring the frame back; a new key reloads it.
   const [frameKey, setFrameKey] = useState(0);
-  const [pagePath, setPagePath] = useState("");
+  const [pagePath, setPagePath] = useState(() =>
+    docPathFromSrc(docsPageUrl(docsRequest?.page)),
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const frameRef = useRef<HTMLIFrameElement>(null);
   const { theme } = useTheme();
+
+  const applyNavigatedPath = useCallback((nextPath: string) => {
+    setPagePath(nextPath);
+    const searchQuery = extractSearchQueryFromDocPath(nextPath);
+    if (searchQuery !== null) {
+      setQuery(searchQuery);
+    }
+  }, []);
 
   // The framed site is same-origin; address it explicitly rather than with "*".
   const sendTheme = useCallback(() => {
     const resolvedPath = syncSameOriginDocsDocument(frameRef.current, theme);
     if (resolvedPath) {
-      setPagePath(resolvedPath);
+      applyNavigatedPath(resolvedPath);
     }
     frameRef.current?.contentWindow?.postMessage(themeMessage(theme), window.location.origin);
-  }, [theme]);
+  }, [applyNavigatedPath, theme]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
@@ -134,11 +181,11 @@ export function DocsSection() {
       const message = parseDocsMessage(event.data);
       if (!message) return;
       if (message.type === "ready") sendTheme();
-      else setPagePath(message.path);
+      else applyNavigatedPath(message.path);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [sendTheme]);
+  }, [applyNavigatedPath, sendTheme]);
 
   // A theme change after the page is up reaches it without a reload.
   useEffect(() => {
@@ -158,17 +205,37 @@ export function DocsSection() {
   useEffect(() => {
     if (!docsRequest || docsRequest.seq === handledRequest.current) return;
     handledRequest.current = docsRequest.seq;
-    setSrc(docsPageUrl(docsRequest.page));
+    const nextSrc = docsPageUrl(docsRequest.page);
+    clearSphinxSearchHighlight(frameRef.current);
+    setQuery("");
+    setSrc(nextSrc);
+    setPagePath(docPathFromSrc(nextSrc));
     setFrameKey((key) => key + 1);
   }, [docsRequest]);
 
   useEffect(() => {
-    if (availability === "available") inputRef.current?.focus();
-  }, [availability]);
+    if (availability !== "available") return;
+    inputRef.current?.focus();
+    const timer = window.setTimeout(() => {
+      inputRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [availability, docsRequest?.seq]);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    setSrc(docsSearchUrl(query));
+    const trimmed = query.trim();
+    if (!trimmed) {
+      clearSphinxSearchHighlight(frameRef.current);
+      const nextSrc = docsPageUrl();
+      setSrc(nextSrc);
+      setPagePath(docPathFromSrc(nextSrc));
+      setFrameKey((key) => key + 1);
+      return;
+    }
+    const nextSrc = docsSearchUrl(trimmed);
+    setSrc(nextSrc);
+    setPagePath(docPathFromSrc(nextSrc));
     setFrameKey((key) => key + 1);
   };
 
@@ -180,7 +247,19 @@ export function DocsSection() {
           <input
             aria-label="Search the documentation"
             disabled={availability !== "available"}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              const nextValue = event.target.value;
+              setQuery(nextValue);
+              if (nextValue === "" && query !== "") {
+                clearSphinxSearchHighlight(frameRef.current);
+                if (pagePath.startsWith("search.html")) {
+                  const nextSrc = docsPageUrl();
+                  setSrc(nextSrc);
+                  setPagePath(docPathFromSrc(nextSrc));
+                  setFrameKey((key) => key + 1);
+                }
+              }
+            }}
             placeholder="Search the documentation"
             ref={inputRef}
             type="search"
@@ -190,8 +269,30 @@ export function DocsSection() {
         <Button
           disabled={availability !== "available"}
           onClick={() => {
+            const trimmed = query.trim();
+            if (!trimmed) {
+              inputRef.current?.focus();
+              return;
+            }
+            const nextSrc = docsSearchUrl(trimmed);
+            setSrc(nextSrc);
+            setPagePath(docPathFromSrc(nextSrc));
+            setFrameKey((key) => key + 1);
+          }}
+          size="sm"
+          type="button"
+          variant="secondary"
+        >
+          Search
+        </Button>
+        <Button
+          disabled={availability !== "available"}
+          onClick={() => {
+            clearSphinxSearchHighlight(frameRef.current);
             setQuery("");
-            setSrc(docsPageUrl());
+            const nextSrc = docsPageUrl();
+            setSrc(nextSrc);
+            setPagePath(docPathFromSrc(nextSrc));
             setFrameKey((key) => key + 1);
           }}
           size="sm"
