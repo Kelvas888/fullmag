@@ -1598,6 +1598,9 @@ async fn publish_accepted_startup_realtime(
     result
 }
 
+/// Metadata members written by the prepared domain publication.
+const PREPARED_DOMAIN_METADATA_KEYS: [&str; 2] = ["execution_plan", "artifact_layout"];
+
 async fn publish_startup_result(
     state: &Arc<AppState>,
     context: &CurrentLiveRequestContext,
@@ -1644,7 +1647,7 @@ async fn publish_startup_result(
         final_e_total: None,
         artifact_dir,
     });
-    snapshot.metadata = Some(json!({
+    let mut metadata = json!({
         STARTUP_METADATA_KEY: {
             "request": request,
             "request_id": request.request_id,
@@ -1657,7 +1660,19 @@ async fn publish_startup_result(
             "runtime_metadata": loaded.runtime,
             "output_storage_binding": loaded.output_storage_binding,
         }
-    }).into());
+    });
+    // Keep the prepared domain published for this session. An FDM grid
+    // exists only as this plan/layout (FEM keeps its mesh separately), so
+    // dropping it left FDM sessions with an empty domain: no geometry in the
+    // viewport and material fields that never qualified.
+    if let (Some(previous), Some(object)) = (snapshot.metadata.as_deref(), metadata.as_object_mut()) {
+        for key in PREPARED_DOMAIN_METADATA_KEYS {
+            if let Some(value) = previous.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    snapshot.metadata = Some(metadata.into());
     snapshot.state_version = snapshot.state_version.saturating_add(1);
     let response = DockerStartupResponse {
         schema: RESPONSE_SCHEMA,
