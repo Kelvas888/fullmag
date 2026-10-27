@@ -369,7 +369,7 @@
   gap: var(--fm-space-2);
   flex: 1 1 280px;
   min-width: 0;
-  max-width: 500px;
+  max-width: 720px;
   color: var(--fm-text-secondary);
   font-size: var(--fm-font-size-2xs);
   font-variant-numeric: tabular-nums;
@@ -413,4 +413,50 @@
     animation: none !important;
     transition: none;
   }
+}
+
+.fm-footer-telemetry-tabs {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.fm-footer-telemetry-tabs__list {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding-inline: var(--fm-space-2);
+  border-bottom: 1px solid var(--fm-border-subtle);
+}
+
+.fm-footer-telemetry-tabs__content {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+.fm-footer-telemetry-tabs__content > .fm-footer-telemetry {
+  height: 100%;
+}
+
+.fm-footer-telemetry__empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--fm-space-2);
+  padding: var(--fm-space-3);
+  font-size: var(--fm-font-size-xs);
+  color: var(--fm-text-secondary);
+}
+
+.fm-footer-telemetry__antenna-eta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fm-text-tertiary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

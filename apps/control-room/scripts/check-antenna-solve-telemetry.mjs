@@ -69,6 +69,12 @@ const status = select({ status: "ready", data: fixture.status });
 const stages = fixture.stages_execution;
 const model = (stageResource = stages, selectedStatus = status, nowMs = null) =>
   build(selectedStatus, null, null, null, stageResource, null, null, null, { magneticModelPresent: false, nowMs });
+const renderFooter = (view = "antenna") => renderToStaticMarkup(React.createElement(
+  mod.namespace.FooterTelemetry, {
+    bus: { subscribe: () => () => {} }, status: selectedStatus,
+    stageExecution: { data: selectedStages, status: "ready" }, view,
+  },
+));
 const first = model();
 assert.deepEqual(first.metrics.map(metric => metric.label), ["Solve state", "Phase", "Field samples", "Source cells", "Stage elapsed", "Publication"],
   "An explicit nonmagnetic antenna solve must replace LLG time/STEP/rate/dt/M/energy counters");
@@ -88,10 +94,10 @@ assert.deepEqual(missing.metrics, [], "Absent session telemetry must not publish
 assert.equal(missing.statusTitle, "System Status: No live telemetry");
 assert.equal(missing.awaitingCompute, false);
 selectedStatus = null; selectedStages = stages; calls.length = 0;
-const missingMarkup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+const missingMarkup = renderFooter("overview");
 assert.ok(missingMarkup.includes("No live telemetry"));
 assert.ok(!missingMarkup.includes(">Step<") && !missingMarkup.includes("Sim time"));
-for (const name of ["useScalarWindowResource", "useFrequencyDomainResponseProgressResource", "useFrequencyDomainResponseSweepResource", "useStageExecutionResource", "useSolverStatusResource"]) {
+for (const name of ["useScalarWindowResource", "useFrequencyDomainResponseProgressResource", "useFrequencyDomainResponseSweepResource", "useSolverStatusResource"]) {
   assert.equal(calls.find(call => call.name === name).options.enabled, false, name);
 }
 console.log("PASS absent telemetry rejects stale samples and renders no fabricated zero counters");
@@ -143,7 +149,7 @@ assert.ok(llg.metrics.some(metric => metric.id === "avg-m"));
 assert.ok(llg.metrics.some(metric => metric.id === "energy-total"));
 console.log("PASS magnetic LLG telemetry remains unchanged");
 selectedStatus = status; selectedStages = stages; calls.length = 0;
-const markup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+const markup = renderFooter();
 assert.ok(markup.includes("Antenna solve"));
 assert.ok(markup.includes("Not reported"));
 assert.ok(!markup.includes(">Step<") && !markup.includes("Sim time") && !markup.includes("Average magnetization"));
@@ -152,14 +158,15 @@ for (const name of ["useScalarWindowResource", "useFrequencyDomainResponseProgre
   assert.equal(calls.find(call => call.name === name).options.enabled, false, name);
 }
 assert.equal(calls.find(call => call.name === "useObjectMetricsResource").options, null);
-assert.equal(calls.filter(call => call.name === "useStageExecutionResource").length, 1);
+assert.equal(calls.filter(call => call.name === "useStageExecutionResource").length, 0, "FooterModule exclusively owns the stage resource");
 assert.equal(calls.filter(call => call.name === "useSolverStatusResource").length, 1);
 selectedStages = { ...stages, request_scope_epoch: "other" }; calls.length = 0;
-renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+renderFooter();
 for (const name of ["useScalarWindowResource", "useFrequencyDomainResponseProgressResource", "useFrequencyDomainResponseSweepResource"]) {
-  assert.equal(calls.find(call => call.name === name).options.enabled, true, name);
+  assert.equal(calls.find(call => call.name === name).options.enabled, false, name);
 }
-console.log("PASS real footer SSR uses one stage/solver owner and disables only irrelevant antenna data requests");
+assert.match(renderFooter(), /No antenna stage in the current execution/);
+console.log("PASS real footer SSR consumes the parent stage snapshot and rejects stale antenna data without LLG requests");
 const numericalProgress = {
   phase: "evaluating_field", completed_targets: 1_000, total_targets: 2_000,
   source_cells: 1_856, elapsed_seconds: 61,
@@ -180,10 +187,12 @@ journalBeforeOperation.stages[0].started_at_unix_ms = 1_000;
 assert.equal(value(model(journalBeforeOperation, status, 121_000), "Operation elapsed"), "1m 01.000s");
 journalBeforeOperation.stages[0].antenna_progress = undefined;
 assert.equal(value(model(journalBeforeOperation, status, 121_000), "Stage elapsed"), "2m 00.000s");
-const halfMarkup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+const halfMarkup = renderFooter();
 assert.match(halfMarkup, /role="progressbar"/);
 assert.match(halfMarkup, /aria-valuenow="50"/);
 assert.match(halfMarkup, /aria-label="Antenna field sampling"/);
+assert.match(halfMarkup, /Estimating field time/);
+assert.ok(!halfMarkup.includes("Estimated field time left"), "SSR has no observed field-completion window");
 for (const progress of [
   null, { ...numericalProgress, phase: "future_phase" },
   ...["completed_targets", "total_targets", "source_cells", "elapsed_seconds"].flatMap(key =>
@@ -200,7 +209,7 @@ for (const progress of [
   const invalidModel = model(selectedStages);
   assert.equal(invalidModel.antennaProgress.percent, null);
   assert.equal(value(invalidModel, "Phase"), "Progress not reported");
-  const invalidMarkup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+  const invalidMarkup = renderFooter();
   assert.ok(!invalidMarkup.includes("aria-valuenow="), "Unknown/malformed progress must be indeterminate");
 }
 const beforeSampling = model(withProgress({ ...numericalProgress, phase: "solving_potential", completed_targets: 0 }));
@@ -214,10 +223,13 @@ assert.equal(failedPublication.antennaProgress.percent, 100);
 assert.equal(failedPublication.antennaProgress.active, false);
 assert.equal(value(failedPublication, "Publication"), "Not completed");
 assert.match(failedPublication.statusTitle, /Failed/);
-const failedMarkup = renderToStaticMarkup(React.createElement(mod.namespace.FooterTelemetry, { bus: { subscribe: () => () => {} } }));
+const failedMarkup = renderFooter();
 assert.match(failedMarkup, /aria-valuenow="100"/);
 assert.match(failedMarkup, /data-active="false"/);
 assert.match(failedMarkup, /Failed/);
+assert.match(failedMarkup, /Field sampling complete/);
+assert.ok(!failedMarkup.includes("Estimated field time left") && !failedMarkup.includes("Estimating field time"),
+  "N/N and failed publication must not claim an active or zero overall-stage ETA");
 for (const state of ["failed", "cancelled", "completed", "pending"]) {
   assert.equal(model(withProgress(null, state)).antennaProgress.active, false);
 }
@@ -230,7 +242,7 @@ const ast = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarge
 const clockDeclaration = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "useAntennaStageClock");
 assert.ok(clockDeclaration);
 const eligibilityCode = ["validStageTimestamp", "resolveFooterAntennaStage"].map(name =>
-  ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(ast)).join("\n");
+  ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(ast).replace(/^export /, "")).join("\n");
 const eligibilityContext = vm.createContext({});
 vm.runInContext(ts.transpileModule(eligibilityCode, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, eligibilityContext);
 assert.equal(eligibilityContext.resolveFooterAntennaStage(status, stages).clockKey, null,

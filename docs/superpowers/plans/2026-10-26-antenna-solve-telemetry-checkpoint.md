@@ -956,3 +956,46 @@ sesja pozostała przypisana do historycznego runu 62d…; nie wolno podmienić
 jego danych postępem innego runu. Wcześniejsza blokada odczytu przeglądarki
 nadal obowiązuje. Żaden z powyższych wyników nie potwierdza wizualnej
 kwalifikacji UI, odzyskania publikacji pełnej mapy ani ukończenia E0–E12.
+
+
+### Telemetry → Antenna oraz estymowany czas pola — 27.10.2026
+
+Dodano osobną zakładkę Antenna wewnątrz Telemetry, używając wspólnych Tabs.
+Nowy jawny running stage anteny jednorazowo otwiera ten panel. Kolejne próbki
+nie odbierają użytkownikowi ręcznie wybranego Overview lub Logs. Jeden owner
+StageExecution pozostaje w FooterModule; stopka otrzymuje jego snapshot.
+Tożsamość obejmuje session, session_epoch, request_scope_epoch, run i stage.
+Brak zgodnego etapu daje czytelny pusty widok, bez liczników LLG.
+
+Przy pasku Field samples dodano przybliżony pozostały czas obliczania H.
+Na początku widnieje Estimating field time…. Po co najmniej trzech nowo
+ukończonych punktach i dziesięciu sekundach obserwacji estymata korzysta
+z ilorazu przyrostu czasu i liczby ukończonych punktów, przemnożonego przez
+liczbę punktów pozostałych. Historia obejmuje najwyżej 32 rekordy ukończenia;
+pulsy z niezmienionym licznikiem aktualizują czas, ale nie zapełniają okna.
+Nie dolicza się przygotowania źródła ani pracy sprzed otwarcia panelu.
+Estymata może wzrastać, ponieważ koszt poszczególnych punktów jest różny.
+Zmiana tożsamości, cofnięcie licznika/czasu lub zmiana total resetuje historię.
+
+To szacowany czas samego pola, bez walidacji i publikacji. N/N pokazuje
+Field sampling complete zamiast obietnicy zerowego czasu całego etapu.
+Stan terminalny i fazy poza evaluating_field nie publikują aktywnej ETA.
+Nie dodano pollingu API ani nowego timera; licznik elapsed pochodzi z DTO.
+Nowy hook ma ograniczoną historię i maksymalnie dwa rendery na obserwację,
+co sprawdza test zamontowanego React. Pierwszy render jest zgodny z SSR.
+
+Weryfikacja we własnym frontendzie Docker: 81/81 testów skupionych, 9/9 grup
+interpretowanego SSR/lifecycle, typecheck, ESLint z max-warnings=0 i kontrola
+architektury — PASS. Wcześniejszy odbiór zakładek obejmował też pełny zestaw
+108 testów stopki; późniejsza regresja sprawdza rzeczywisty Radix SSR.
+Nie kompilowano testów Rust. Nowy kod ETA został dostarczony przez HMR;
+backendowy kontrakt postępu pozostaje bez zmian. Nie uruchomiono nowego Solve.
+
+Dowody: wolumen frontendu, development/verification/
+antenna-telemetry-tabs-20261027/ oraz antenna-telemetry-eta-20261027/,
+w tym source-manifest.json, raporty testów i review-final.json.
+Niezależny przegląd nie wykazał Required/Blocker. Rzeczywisty wygląd,
+interakcje klawiaturą w przeglądarce i live StageExecution dla nowego solve
+pozostają NOT VERIFIED z powodu wcześniejszej blokady dostępu do strony.
+Pełna mapa1145 nadal czeka na odzyskanie publikacji; nie jest to ukończenie
+wizualizacji Universe ani całego zakresu E0–E12.

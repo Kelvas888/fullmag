@@ -31,7 +31,6 @@ import {
   useObjectMetricsResource,
   useScalarWindowResource,
   useSolverStatusResource,
-  useStageExecutionResource,
 } from "@/kernel/resources/studyRuntimeResources";
 import {
   formatRuntimeStateLabel,
@@ -42,11 +41,16 @@ import {
   resolveRuntimeUserSolvePhase,
   type RuntimeUserSolvePhase,
 } from "@/kernel/runtime/runtimeStateDisplay";
-import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { Progress } from "@/shared/ui/Progress";
 import { formatTorqueT } from "@/shared/domain/physics/torqueUnits";
 import { hasEmptyObjectMagneticModel } from "@/shared/domain/physics/objectMagneticModel";
+
+import {
+  formatAntennaFieldEta,
+  useAntennaFieldEta,
+  type AntennaFieldEta,
+} from "./antennaFieldEta";
 
 // UI display locale only. Scientific values and exports keep their existing
 // invariant serialization and are not routed through this formatter.
@@ -80,20 +84,35 @@ const FOOTER_SCALAR_COLUMNS = [
 
 export function FooterTelemetry({
   bus,
+  status,
+  stageExecution,
+  view,
 }: {
   bus: EventBus<KernelEventMap>;
+  status: FooterTelemetryStatus | null;
+  stageExecution: Pick<ResourceResult<StageExecutionResource | null>, "data" | "status">;
+  view: "overview" | "antenna";
 }) {
-  const status = useSessionStatusSelector(selectFooterTelemetryStatus, {
-    isEqual: footerTelemetryStatusEquals,
-  });
-  const solverStatus = useSolverStatusResource({ enabled: Boolean(status) });
-  const stageExecution = useStageExecutionResource({ enabled: Boolean(status) });
+  const solverStatus = useSolverStatusResource({ enabled: Boolean(status) && view === "overview" });
   const antennaStage = resolveFooterAntennaStage(status, stageExecution.data);
-  const antennaNowMs = useAntennaStageClock(antennaStage?.clockKey ?? null);
+  const antennaNumerical = antennaStage ? readAntennaProgress(antennaStage.record) : null;
+  const antennaNowMs = useAntennaStageClock(
+    view === "antenna" && !antennaNumerical ? antennaStage?.clockKey ?? null : null,
+  );
+  const antennaEta = useAntennaFieldEta(
+    view === "antenna" && antennaStage?.active && antennaNumerical?.phase === "evaluating_field"
+      ? {
+          identity: antennaStage.identityKey,
+          completed: antennaNumerical.completed_targets,
+          total: antennaNumerical.total_targets,
+          elapsedSeconds: antennaNumerical.elapsed_seconds,
+        } : null,
+  );
+  const generalTelemetryEnabled = Boolean(status) && view === "overview" && !antennaStage;
   const liveSample = useFooterLiveScalarSample(bus);
   const scalarWindow = useScalarWindowResource({
     columns: FOOTER_SCALAR_COLUMNS,
-    enabled: Boolean(status) && !antennaStage,
+    enabled: generalTelemetryEnabled,
     limit: 1,
     tail: true,
   });
@@ -109,14 +128,14 @@ export function FooterTelemetry({
     () => resolvePrimaryTelemetryObjectId(scene.data, selectedObjectId),
     [scene.data, selectedObjectId],
   );
-  const objectMetrics = useObjectMetricsResource(antennaStage ? null : objectId);
+  const objectMetrics = useObjectMetricsResource(generalTelemetryEnabled ? objectId : null);
   const responseProgress = useFrequencyDomainResponseProgressResource({
-    enabled: Boolean(status) && !antennaStage,
+    enabled: generalTelemetryEnabled,
   });
   const responseSweep = useFrequencyDomainResponseSweepResource({
-    enabled: Boolean(status) && !antennaStage,
+    enabled: generalTelemetryEnabled,
   });
-  const currentRun = useCurrentRunResource({ enabled: Boolean(status) });
+  const currentRun = useCurrentRunResource({ enabled: generalTelemetryEnabled });
   const userSolvePhase = status
     ? resolveRuntimeUserSolvePhase({
         detailedRuntimeState: solverStatus.data?.runtime_state,
@@ -147,8 +166,25 @@ export function FooterTelemetry({
     },
   );
 
+  if (view === "antenna" && !antennaStage) {
+    return (
+      <div className="fm-footer-telemetry__empty" role="region" aria-label="Antenna telemetry">
+        <strong>No antenna stage in the current execution</strong>
+        <span>Antenna progress requires an explicitly authored stage matching the current session and run.</span>
+      </div>
+    );
+  }
+  if (view === "overview" && antennaStage) {
+    return (
+      <div className="fm-footer-telemetry__empty" role="region" aria-label="Simulation telemetry">
+        <strong>{telemetry.statusTitle}</strong>
+        <span>Open the Antenna tab for field samples, phase and result publication.</span>
+      </div>
+    );
+  }
+
   return (
-    <div className="fm-footer-telemetry" role="region" aria-label="Simulation telemetry">
+    <div className="fm-footer-telemetry" role="region" aria-label={view === "antenna" ? "Antenna telemetry" : "Simulation telemetry"}>
       <div className="fm-footer-telemetry__strip">
         <span
           className="fm-footer-telemetry__strip-dot"
@@ -163,7 +199,7 @@ export function FooterTelemetry({
           {telemetry.onlineTitle}
         </span>
         {telemetry.antennaProgress ? (
-          <AntennaFieldProgressStrip progress={telemetry.antennaProgress} />
+          <AntennaFieldProgressStrip progress={telemetry.antennaProgress} eta={antennaEta} />
         ) : telemetry.frequencyDomainProgress ? (
           <>
             <span className="w-px h-3 bg-fm-subtle flex-shrink-0 mx-fm-1" aria-hidden="true" />
@@ -215,7 +251,7 @@ type FooterTelemetryMetric = {
   value: string;
 };
 
-type FooterTelemetryStatus = {
+export type FooterTelemetryStatus = {
   energies: Pick<
     LiveStatusResource["energies"],
     "anisotropy" | "demag" | "dmi" | "exchange" | "total" | "zeeman"
@@ -685,11 +721,12 @@ export function buildFooterTelemetryModel(
 
 type FooterAntennaStage = {
   active: boolean;
+  identityKey: string;
   clockKey: string | null;
   record: StageExecutionResource["stages"][number];
 };
 
-function resolveFooterAntennaStage(
+export function resolveFooterAntennaStage(
   status: FooterTelemetryStatus | null | undefined,
   execution: StageExecutionResource | null | undefined,
 ): FooterAntennaStage | null {
@@ -715,7 +752,12 @@ function resolveFooterAntennaStage(
       execution.request_scope_epoch, execution.run_id, record.stage_id,
       record.antenna_solve_stage_id, record.started_at_unix_ms])
     : null;
-  return { active: record.status === "running" && execution.runtime_state === "running", clockKey, record };
+  return {
+    active: record.status === "running" && execution.runtime_state === "running",
+    identityKey: JSON.stringify([execution.session_id, execution.session_epoch,
+      execution.request_scope_epoch, execution.run_id, record.stage_id, record.antenna_solve_stage_id, record.index]),
+    clockKey, record,
+  };
 }
 
 function validStageTimestamp(value: unknown): value is number {
@@ -765,7 +807,10 @@ function readAntennaProgress(record: FooterAntennaStage["record"]) {
   return { ...progress, phase };
 }
 
-function AntennaFieldProgressStrip({ progress }: { progress: FooterAntennaProgress }) {
+function AntennaFieldProgressStrip({ progress, eta }: {
+  progress: FooterAntennaProgress;
+  eta: AntennaFieldEta;
+}) {
   return (
     <div className="fm-footer-telemetry__antenna-progress" data-active={progress.active}>
       <span className="fm-footer-telemetry__antenna-progress-label">Field samples</span>
@@ -777,6 +822,18 @@ function AntennaFieldProgressStrip({ progress }: { progress: FooterAntennaProgre
       <span className="fm-footer-telemetry__antenna-progress-count">
         {progress.percent === null ? "Progress not reported" : progress.samples}
       </span>
+      {progress.percent === 100 ? (
+        <span className="fm-footer-telemetry__antenna-eta">Field sampling complete</span>
+      ) : eta.state === "ready" || eta.state === "estimating" ? (
+        <span
+          className="fm-footer-telemetry__antenna-eta"
+          title="Approximate remaining field evaluation time from recent completed points and elapsed pulses. Point cost varies; validation and publication are excluded."
+        >
+          {eta.state === "ready"
+            ? "Estimated field time left " + formatAntennaFieldEta(eta.seconds)
+            : "Estimating field time…"}
+        </span>
+      ) : null}
     </div>
   );
 }
