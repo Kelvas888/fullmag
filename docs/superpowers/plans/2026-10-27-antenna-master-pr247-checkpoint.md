@@ -258,3 +258,38 @@ wszystkie regresje obu rodziców zachowane. Niezależny przegląd launchera:
 `verification/pr247-master0e5d-20261027/backend-cache-conflict-review.json`
 (SHA256 `11c2d37913430efaa96927e937dcf7b9d45aa787e312aa7647aa3060f7fb8e10`)
 oraz `verification/master-merge-0e5d179d-20261027/launcher-merge-review.json`.
+
+
+## CI po integracji 62f222 oraz próba runtime
+
+HEAD `62f222f732bd6c44056673ad0320ff8ab9134c2e` jest wypchnięty i PR #247
+ma stan MERGEABLE. Ostatni odczyt CI: 20 success, 1 failure, 10 skipped,
+1 in progress. Poprawione rodziny Rust i Python przeszły. Jedyny zakończony
+błąd source-contracts to losowy fixture
+`mixed_domain_plan_digest_survives_permuted_full_request_roundtrip`:
+MeshIR serializuje mapę jakości w kolejności BTreeMap, a test szukał fragmentu
+HashMap o losowej kolejności. Awaria następowała przed kontrolą digestu.
+Korekta porządkuje tylko mapę wzorca testowego; oba kierunki permutacji,
+zgodność planu/digestu i odmowa zmienionego wejścia pozostają. Parser rustfmt
+i diff check PASS; testów Rust lokalnie nie kompilowano ani nie uruchamiano.
+Pełny log: `verification/pr247-ci-62f222-20261027/source-contracts-122368971209.log`
+w control volume. SHA256 poprawionego pliku:
+`bbf5115d3b675d24a1f9f526b822ee24fe9eed12ff03d231db905bbb0c660f79`.
+
+Zarządzany restart własnej grupy nie uruchomił buildu: po poprawnym drainie
+Docker odmówił nowego PID 1 z NVIDIA prestart `ldconfig terminated with signal 9`.
+Attempt `c037af6df84448b1ba6576157b822914`, wynik
+`outcome-unknown-resources-retained`. Backend jest stopped/PID 0/exit128,
+frontend stopped/exit0; kontenery, pakiet, cache i wyniki zachowane.
+Dowód `backend-drain.json`: state drained, process receipt SHA256
+`34949a31456d06d5b5238b74b777ebd4bc0522e597367a0f792bf5989f9d5f38`.
+Stan przed próbą: 1391 plików wynikowych, 43 katalogi runów, 2 pliki
+odzyskanego rozwiązania, zero aktywnych zadań. Snapshot i checker:
+`verification/master-runtime-62f222-20261027/`.
+
+Nie zastosowano ręcznego startu ani zastępczego checkpointu. Niezależny audyt
+wykazał, że dotychczasowy prestart recovery wymaga saved-authoring checkpoint;
+ta próba prawidłowo użyła terminal-session-preflight i drain. Dla niej brakuje
+obsługi tego wariantu dowodów. Potrzebne są osobny proof, exact config/container/
+history CAS, kontrola braku nowej publikacji, preview i przypięta kontynuacja.
+Nie przedstawiamy nieudanego restartu jako buildu ani działającego API.
