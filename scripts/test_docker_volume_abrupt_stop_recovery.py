@@ -14,6 +14,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import docker_volume_container_recovery as r
 
 
+def _typed_foreign_alias_proof(alias, container_id):
+    alias_sha = hashlib.sha256(alias.encode()).hexdigest()
+    kernel = {
+        "schema": "fullmag.docker-bind-overlap-proof.v1",
+        "decision": "disjoint",
+        "probe_schema": "fullmag.docker-bind-overlap-probe.v1",
+        "candidate_alias_sha256": alias_sha,
+        "reference_root_sha256": "a" * 64,
+        "reference_marker_sha256": "b" * 64,
+        "reference_marker_size": 10,
+        "reference_marker_stat": {},
+        "reference_stat": {},
+        "reference_mount": {},
+        "candidate_mounts": [],
+        "candidate_stat": {},
+        "mountinfo_sha256": "c" * 64,
+    }
+    return {
+        "schema": "fullmag.foreign-bind-disjoint-proof.v1",
+        "decision": "disjoint",
+        "container_id": container_id,
+        "image_id": "sha256:" + "d" * 64,
+        "started_at": "2026-10-27T10:00:00Z",
+        "status": "running",
+        "running": True,
+        "pid": 234,
+        "inspection_sha256": "e" * 64,
+        "candidate_alias_sha256": alias_sha,
+        "reference_root_sha256": "a" * 64,
+        "kernel_proof": kernel,
+    }
+
+
 class AbruptStopTests(unittest.TestCase):
     def fixture(self):
         project = 'fullmag-master'
@@ -39,14 +72,14 @@ class AbruptStopTests(unittest.TestCase):
             containers[service] = {'Id': pins[service+'_container_id'], 'Image': pins['old_image_id'],
                 'Config': {'Hostname': 'old-backend' if service=='backend' else 'old-frontend', 'Labels': {
                     'com.docker.compose.project': project, 'com.docker.compose.service': service}},
-                'HostConfig': {'PidMode': '', 'IpcMode': 'private', 'NetworkMode': 'fullmag-private'},
-                'NetworkSettings': {'Networks': {'fullmag-private': {'NetworkID': 'e'*64}}},
+                'HostConfig': {'PidMode': '', 'IpcMode': 'private', 'NetworkMode': 'fullmag-master_fullmag'},
+                'NetworkSettings': {'Networks': {'fullmag-master_fullmag': {'NetworkID': 'e'*64}}},
                 'Mounts': [{'Type': 'bind', 'Source': '/state/source', 'Destination': '/state', 'RW': True}],
                 'State': {'Status': 'exited', 'Running': False, 'Paused': False, 'Restarting': False,
                           'Pid': 0, 'ExitCode': 255, 'StartedAt': '2026-10-26T00:00:00Z', 'FinishedAt': '2026-10-27T00:00:00Z'}}
         proof = {'schema': r.ABRUPT_PROOF_SCHEMA, 'authorization_pins': pins,
                  'docker_engine_id_sha256': 'f'*64, 'raw_records': records, 'containers': containers,
-                 'network': {'name': 'fullmag-private', 'network_id': 'e'*64, 'state': 'absent'},
+                 'network': {'name': 'fullmag-master_fullmag', 'network_id': 'e'*64, 'state': 'absent'},
                  'storage_proof': {'run_records': []}, 'retained_terminal_runs': None}
         auth = r.validate_operator_authorization({**pins, 'schema_version': r.ABRUPT_OPERATOR_SCHEMA,
             'abrupt_stop_proof': 'verification/abrupt-proof.json', 'abrupt_stop_proof_sha256': r._sha256(r._canonical(proof))})
@@ -97,7 +130,7 @@ class AbruptStopTests(unittest.TestCase):
 
     def test_network_name_reuse_and_foreign_consumers_fail_closed(self):
         proof,_,_=self.fixture(); b,f=proof['containers'].values()
-        reused=SimpleNamespace(stdout=json.dumps({'Name':'fullmag-private','ID':'a'*64}).encode())
+        reused=SimpleNamespace(returncode=0,stdout=json.dumps({'Name':'fullmag-master_fullmag','ID':'a'*64}).encode())
         with patch.object(r,'docker_capture',return_value=reused):
             with self.assertRaisesRegex(r.ContainerRecoveryError,'changed'): r._abrupt_network(b,f,'fullmag-master')
         foreign={'Id':'a'*64,'Mounts':b['Mounts']}
@@ -129,8 +162,75 @@ class AbruptStopTests(unittest.TestCase):
         for alias in ('hashA','hashB','unknown'):
             foreign={'Id':'a'*64,'Mounts':[{'Type':'bind','Source':prefix+alias,'Destination':'/state','RW':True}]}
             with self.subTest(alias=alias),patch.object(r,'docker_capture',side_effect=[SimpleNamespace(stdout=('a'*64).encode()),SimpleNamespace(stdout=json.dumps([foreign]).encode())]):
-                with self.assertRaisesRegex(r.ContainerRecoveryError,'unresolved storage identity'):
+                with self.assertRaisesRegex(r.ContainerRecoveryError,'foreign Docker container references|unresolved storage identity'):
                     r._assert_no_foreign_storage_consumers(SimpleNamespace(),b,f,compose)
+
+    def test_unknown_foreign_alias_uses_only_exact_disjoint_proof_and_keeps_other_guards(self):
+        proof, _, compose = self.fixture()
+        backend, frontend = proof['containers'].values()
+        prefix = '/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/'
+        backend['Mounts'][0]['Source'] = prefix + 'master-state'
+        compose['services'] = {'backend': {'volumes': [
+            {'type': 'bind', 'source': '/canonical/state', 'target': '/state'}],
+            'x-fullmag-daemon-binds': {'/state': prefix + 'master-state'}}}
+        alias = prefix + 'unknown-mongo-config'
+        foreign = {'Id': 'a' * 64, 'Mounts': [
+            {'Type': 'bind', 'Source': alias, 'Destination': '/etc/mongo.conf', 'RW': False}]}
+        responses = [SimpleNamespace(stdout=foreign['Id'].encode()),
+                     SimpleNamespace(stdout=json.dumps([foreign]).encode())]
+        called = []
+        with patch.object(r, 'docker_capture', side_effect=responses), \
+             patch('docker_foreign_bind_identity.canonical_bind_sources',
+                   side_effect=r.BuildControlError('not a registered Fullmag group')):
+            r._assert_no_foreign_storage_consumers(
+                SimpleNamespace(), backend, frontend, compose,
+                prove_foreign_disjoint=lambda item, source: called.append((item, source)) or
+                    _typed_foreign_alias_proof(source, item['Id']))
+        self.assertEqual(called, [(foreign, alias)])
+
+        incomplete = {'Id': foreign['Id']}
+        with patch.object(r, 'docker_capture', side_effect=[
+                SimpleNamespace(stdout=foreign['Id'].encode()),
+                SimpleNamespace(stdout=json.dumps([incomplete]).encode())]), \
+             patch('docker_foreign_bind_identity.canonical_bind_sources',
+                   side_effect=r.BuildControlError('not registered')):
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'no complete mount inventory'):
+                r._assert_no_foreign_storage_consumers(
+                    SimpleNamespace(), backend, frontend, compose,
+                    prove_foreign_disjoint=lambda *_args: self.fail(
+                        'incomplete consumer inventory must not use the fallback'))
+
+        bad = _typed_foreign_alias_proof(alias, foreign['Id'])
+        bad['decision'] = 'overlap'
+        with patch.object(r, 'docker_capture', side_effect=[
+                SimpleNamespace(stdout=foreign['Id'].encode()),
+                SimpleNamespace(stdout=json.dumps([foreign]).encode())]), \
+             patch('docker_foreign_bind_identity.canonical_bind_sources',
+                   side_effect=r.BuildControlError('not registered')):
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'unresolved storage identity'):
+                r._assert_no_foreign_storage_consumers(
+                    SimpleNamespace(), backend, frontend, compose,
+                    prove_foreign_disjoint=lambda *_args: bad)
+
+        foreign_with_ledger = copy.deepcopy(foreign)
+        backend['Mounts'].extend([
+            {'Type': 'volume', 'Name': 'control-vol', 'Source': '/control',
+             'Destination': '/opt/fullmag/control'},
+            {'Type': 'volume', 'Name': 'ledger-vol', 'Source': '/ledger',
+             'Destination': '/host-ledger'},
+        ])
+        foreign_with_ledger['Mounts'].append(
+            {'Type': 'volume', 'Name': 'ledger-vol', 'Destination': '/ledger'})
+        with patch.object(r, 'docker_capture', side_effect=[
+                SimpleNamespace(stdout=foreign['Id'].encode()),
+                SimpleNamespace(stdout=json.dumps([foreign_with_ledger]).encode())]), \
+             patch('docker_foreign_bind_identity.canonical_bind_sources',
+                   side_effect=r.BuildControlError('not registered')):
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'control/ledger'):
+                r._assert_no_foreign_storage_consumers(
+                    SimpleNamespace(), backend, frontend, compose,
+                    prove_foreign_disjoint=lambda item, source: _typed_foreign_alias_proof(
+                        source, item['Id']))
 
     def test_wrapper_publish_runs_real_consumer_gate_with_authenticated_lease(self):
         import contextlib
@@ -327,7 +427,7 @@ class AbruptStopTests(unittest.TestCase):
         def docker(*args,**kwargs):
             if args[0]=='rm': return SimpleNamespace(returncode=0,stdout=b'',stderr=b'')
             if args[:2]==('network','ls'): return SimpleNamespace(returncode=0,stdout=b'',stderr=b'')
-            if args[:2]==('network','inspect'): return SimpleNamespace(returncode=1,stdout=b'',stderr=b'No such network')
+            if args[:2]==('network','inspect'): return SimpleNamespace(returncode=1,stdout=b'',stderr=('Error response from daemon: network '+str(args[2])+' not found').encode())
             if args[0]=='inspect': return SimpleNamespace(returncode=1,stdout=b'',stderr=b'No such object')
             self.fail('unexpected Docker command '+str(args))
         device={'resource_id':'runtime-cpu','mapping_sha256':'6'*64,'mapping_detached':True}

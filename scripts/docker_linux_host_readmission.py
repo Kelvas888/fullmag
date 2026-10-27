@@ -313,9 +313,10 @@ def _validate_terminal_and_compose(control, request, identity, raw_terminal, raw
 def _engine_id():
     result = docker_capture("info", "--format", "{{.ID}}", timeout=30)
     value = result.stdout.decode("utf-8", "strict").strip()
-    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise ValueError("current Docker engine ID is unavailable or malformed")
-    return value
+    # Info.ID is an opaque daemon identity, not a container/image digest.
+    # Docker Desktop returns UUIDs; older engines also used colon-separated IDs.
+    # The complete value is still compared exactly with the retained certificate.
+    return _bounded_text(value, "current Docker engine ID", maximum=256)
 
 
 def _filesystem_uuid(state):
@@ -389,15 +390,26 @@ def _validate_stopped_state(actual):
     def timestamp(value, label):
         if not isinstance(value, str) or not value or value.startswith("0001-01-01T"):
             raise ValueError("retained service " + label + " timestamp is missing")
+        # Python 3.10's fromisoformat accepts only millisecond/microsecond
+        # fractions. Docker emits RFC3339Nano. Parse the whole second with the
+        # standard calendar parser and retain all nine fractional digits for
+        # ordering; the original inspection strings are never rewritten.
+        match = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})",
+            value,
+        )
+        if match is None:
+            raise ValueError("retained service " + label + " timestamp is malformed")
+        zone = "+00:00" if match.group(3) == "Z" else match.group(3)
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(match.group(1) + zone)
         except ValueError as error:
             raise ValueError("retained service " + label + " timestamp is malformed") from error
-        if parsed.tzinfo is None:
-            raise ValueError("retained service " + label + " timestamp has no timezone")
-        if parsed.timestamp() > datetime.now(timezone.utc).timestamp() + 600:
+        stamp = (int(parsed.timestamp()), int((match.group(2) or "").ljust(9, "0")))
+        now = datetime.now(timezone.utc)
+        if stamp > (int(now.timestamp()) + 600, now.microsecond * 1000):
             raise ValueError("retained service " + label + " timestamp is in the future")
-        return parsed
+        return stamp
 
     started = timestamp(state.get("StartedAt"), "StartedAt")
     finished = timestamp(state.get("FinishedAt"), "FinishedAt")
@@ -436,22 +448,57 @@ def _container_mounts_by_target(actual, target):
 
 
 def _daemon_state_aliases(compose, actual):
+    services = compose.get("services") if isinstance(compose, dict) else None
+    if not isinstance(services, dict) or not isinstance(actual, dict):
+        raise ValueError("retained Compose state mount identity is incomplete")
     aliases = set()
     for service in ("backend", "frontend"):
-        item = actual[service]
-        mount = _container_mounts_by_target(item, "/state")
-        if mount.get("Type") != "bind" or not isinstance(mount.get("Source"), str):
+        item = actual.get(service)
+        service_document = services.get(service)
+        if not isinstance(item, dict) or not isinstance(service_document, dict):
+            raise ValueError("retained " + service + " Compose identity is missing")
+        mounts = item.get("Mounts")
+        if not isinstance(mounts, list) or any(not isinstance(mount, dict) for mount in mounts):
+            raise ValueError("retained " + service + " app container has no complete mount inventory")
+        actual_state = [mount for mount in mounts if mount.get("Destination") == "/state"]
+
+        declared = service_document.get("volumes", [])
+        if not isinstance(declared, list) or any(not isinstance(volume, dict) for volume in declared):
+            raise ValueError("retained " + service + " Compose volume inventory is malformed")
+        for volume in declared:
+            target = volume.get("target")
+            if (not isinstance(target, str) or not target.startswith("/")
+                    or ".." in PurePosixPath(target).parts
+                    or str(PurePosixPath(target)) != target):
+                raise ValueError("retained " + service + " Compose volume target is not canonical")
+        declared_state = [volume for volume in declared if volume.get("target") == "/state"]
+
+        daemon_binds = service_document.get("x-fullmag-daemon-binds", {})
+        if not isinstance(daemon_binds, dict):
+            raise ValueError("retained " + service + " daemon bind pins are malformed")
+        has_daemon_pin = "/state" in daemon_binds
+        if (service == "frontend" and not actual_state
+                and not declared_state and not has_daemon_pin):
+            continue
+        if len(actual_state) != 1:
+            raise ValueError("retained " + service + " must have exactly one /state mount")
+        if len(declared_state) != 1:
+            raise ValueError("retained " + service + " must declare exactly one /state mount")
+        mount = actual_state[0]
+        declaration = declared_state[0]
+        if (mount.get("Type") != "bind" or not isinstance(mount.get("Source"), str)
+                or not mount["Source"]):
             raise ValueError("retained " + service + " state mount is not a bind")
-        aliases.add(mount["Source"])
-        daemon_binds = compose["services"][service].get("x-fullmag-daemon-binds")
-        pinned = daemon_binds.get("/state") if isinstance(daemon_binds, dict) else None
-        if not isinstance(pinned, str) or pinned != mount["Source"]:
-            raise ValueError("retained " + service + " state alias is not bound to its Compose pin")
-        aliases.add(pinned)
-        source = next((volume.get("source") for volume in compose["services"][service].get("volumes", [])
-                       if isinstance(volume, dict) and volume.get("target") == "/state"), None)
-        if not isinstance(source, str) or not Path(source).is_absolute() or ".." in Path(source).parts:
+        source = declaration.get("source")
+        if (declaration.get("type") != "bind" or not isinstance(source, str)
+                or not Path(source).is_absolute() or ".." in Path(source).parts
+                or str(PurePosixPath(source)) != source):
             raise ValueError("retained " + service + " Compose state source is not canonical")
+        pinned = daemon_binds.get("/state")
+        if not has_daemon_pin or not isinstance(pinned, str) or pinned != mount["Source"]:
+            raise ValueError("retained " + service + " state alias is not bound to its Compose pin")
+        aliases.add(mount["Source"])
+        aliases.add(pinned)
         aliases.add(source)
     return aliases
 
@@ -516,7 +563,8 @@ def _under(path, root):
 
 def _assert_no_live_consumers(containers, *, state_paths, control_volume,
                               ledger_mounts, allowed_ids, state_alias_sources=(),
-                              protected_paths=(), canonicalize_foreign=None):
+                              protected_paths=(), canonicalize_foreign=None,
+                              prove_foreign_disjoint=None):
     """Reject every unproved running bind alias or shared protected resource."""
     allowed = set(allowed_ids)
     known_aliases = set(state_alias_sources)
@@ -569,37 +617,63 @@ def _assert_no_live_consumers(containers, *, state_paths, control_volume,
                         or ".." in PurePosixPath(source).parts
                         or str(PurePosixPath(source)) != source):
                     raise ValueError("running Docker consumer bind source is unsafe")
-                if destination == "/state" or destination.startswith("/state/"):
-                    raise ValueError("a live Docker consumer has the historical /state alias")
                 canonical_source = source
                 alias_was_authenticated = False
+                use_kernel_fallback = False
                 if source.startswith(_WSL_ALIAS_PREFIXES) and source not in known_aliases:
                     # Different Desktop bind hashes are not a proof of
-                    # different host stores. Resolve only through the shared
-                    # read-only current-incarnation authenticator; otherwise
-                    # fail closed without touching the foreign group.
-                    if canonicalize_foreign is None:
-                        raise ValueError("foreign Docker Desktop bind alias has unresolved storage identity")
+                    # different host stores. Prefer the exact registered
+                    # incarnation resolver; an unresolved alias needs an
+                    # independent physical kernel proof, never a path guess.
                     identifier = item["Id"]
                     if identifier not in canonical_aliases:
-                        mapping = canonicalize_foreign(item)
-                        if not isinstance(mapping, dict):
-                            raise ValueError("foreign Docker bind alias resolver returned no mapping")
-                        canonical_aliases[identifier] = mapping
-                    mapped = canonical_aliases[identifier].get(source)
-                    if not isinstance(mapped, str):
-                        raise ValueError("foreign Docker Desktop bind alias is absent from authenticated mapping")
-                    try:
-                        canonical_source = str(storage.absolute(Path(mapped), "authenticated foreign bind source"))
-                    except (OSError, RuntimeError, storage.StorageError) as error:
-                        raise ValueError("authenticated foreign bind source is not canonical") from error
-                    alias_was_authenticated = True
-                if any(_under(source, path) or _under(path, source)
-                       or _under(canonical_source, path) or _under(path, canonical_source)
-                       for path in canonical_paths):
+                        try:
+                            canonical_aliases[identifier] = (
+                                canonicalize_foreign(item) if canonicalize_foreign is not None else None
+                            )
+                        except Exception:
+                            # The independent proof below is the only fallback
+                            # for a denied or unavailable registration.
+                            canonical_aliases[identifier] = None
+                    mapping = canonical_aliases[identifier]
+                    if mapping is None:
+                        use_kernel_fallback = True
+                    elif not isinstance(mapping, dict):
+                        raise ValueError("foreign Docker bind alias resolver returned a malformed mapping")
+                    elif source not in mapping:
+                        use_kernel_fallback = True
+                    else:
+                        mapped = mapping[source]
+                        if not isinstance(mapped, str):
+                            raise ValueError("authenticated foreign bind source is malformed")
+                        try:
+                            canonical_source = str(storage.absolute(
+                                Path(mapped), "authenticated foreign bind source"))
+                        except (OSError, RuntimeError, storage.StorageError) as error:
+                            raise ValueError("authenticated foreign bind source is not canonical") from error
+                        alias_was_authenticated = True
+                paths_to_compare = [source]
+                if alias_was_authenticated:
+                    paths_to_compare.append(canonical_source)
+                if any(_under(candidate, path) or _under(path, candidate)
+                       for candidate in paths_to_compare for path in canonical_paths):
                     raise ValueError("a live Docker consumer references the retained Linux state/control/ledger")
                 if ("bind", source) in ledger_mounts:
                     raise ValueError("a live Docker consumer references the retained ledger bind")
+                if use_kernel_fallback:
+                    if prove_foreign_disjoint is None:
+                        raise ValueError("foreign Docker Desktop bind alias has unresolved storage identity")
+                    try:
+                        proof = prove_foreign_disjoint(item, source)
+                    except Exception as error:
+                        raise ValueError("foreign Docker Desktop bind alias has no current disjoint proof") from error
+                    import docker_bind_overlap_probe as overlap_probe
+                    try:
+                        overlap_probe.validate_foreign_alias_disjoint_proof(
+                            proof, alias=source, container_id=identifier)
+                    except BuildControlError as error:
+                        raise ValueError("foreign Docker Desktop bind alias returned an invalid disjoint proof") from error
+                    continue
                 if alias_was_authenticated:
                     resolved_text = canonical_source
                 else:
@@ -610,8 +684,6 @@ def _assert_no_live_consumers(containers, *, state_paths, control_volume,
                 if any(_under(resolved_text, path) or _under(path, resolved_text)
                        for path in canonical_paths):
                     raise ValueError("a live Docker consumer aliases the retained Linux state root")
-            elif destination == "/state" or destination.startswith("/state/"):
-                raise ValueError("a live Docker consumer has the historical /state alias")
 
 
 def _validate_runtime_records(control, request):
@@ -625,6 +697,13 @@ def _canonicalize_foreign_alias(context, container):
         raise ValueError("read-only foreign WSL alias authenticator is unavailable") from error
     return foreign_identity.canonical_bind_sources(
         container, repo_root=context["repo"]
+    )
+
+
+def _prove_foreign_alias_for_readmission(control, backend, container, alias, state):
+    import docker_bind_overlap_probe as overlap_probe
+    return overlap_probe.prove_foreign_alias_disjoint(
+        control, backend, container, alias, state
     )
 
 
@@ -726,6 +805,8 @@ def _observe(context, request, request_raw, request_path, *, plan=None, allowed_
         state_alias_sources=aliases,
         protected_paths=protected_paths,
         canonicalize_foreign=lambda container: _canonicalize_foreign_alias(context, container),
+        prove_foreign_disjoint=lambda container, alias: _prove_foreign_alias_for_readmission(
+            control, actual_by_service["backend"], container, alias, state),
     )
     # Planner/classifier performs another complete no-follow readback. Keep the
     # raw old records in the snapshot for immutable archival and resume CAS.

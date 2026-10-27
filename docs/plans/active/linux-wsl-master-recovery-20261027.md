@@ -34,8 +34,39 @@ Commit `350cce8fd330c52461a87a7caeaca66b8f3bc4a8`: czysty planner i CAS readmisj
 - `feb092575b44ac075bd77457a45a1facf0dd8d78`: bridge v3, faktyczny binary capability gate i atomowy immutable proof. 19 testów runtime service i 5 istniejących bridge PASS. P2 publikacji po częściowym zapisie poprawiony. Native v3 dostarcza skoordynowany branch; jego integracja jest osobną wymaganą bramką.
 - Kontroler readmisji: 15 regresji Python PASS; review wyścigu RELEASED i klasyfikacji unknown poprawione. Jeszcze bez wykonania na runtime.
 
-Odczyt magazynu wykazał 17 runów: 2 cancelled, 3 failed, 10 succeeded i 2 accepted. Decyzja operatora o dwóch przyjętych runach jest oczekiwana; nie zmieniamy ich statusu i nie rozszerzamy v3 do accepted. Zachowano inwentarz 1240 plików (około 1,55 GB), SHA 44 katalogów runów/artefaktów oraz metadane plików. Wstępny odczyt nie wykazał innego compute attempt niż bieżący catalog.
+Odczyt magazynu wykazał 17 runów: 2 cancelled, 3 failed, 10 succeeded i 2 accepted. Po audycie właścicieli wycofano propozycję anulowania dwóch przyjętych runów; nie zmieniamy ich statusu i nie rozszerzamy v3 do accepted. Zachowano inwentarz 1240 plików (około 1,55 GB), SHA 44 katalogów runów/artefaktów oraz metadane plików. Wstępny odczyt nie wykazał innego compute attempt niż bieżący catalog.
 
-Kwalifikacja obcych konsumentów pozostaje ścisła: odrębne aliasy są dopuszczane dopiero po potwierdzeniu źródeł. Sześć aliasowych konsumentów spoza Fullmaga wymaga osobnego dowodu odrębności. Nie są zatrzymywane. Walidator kernelowego dowodu tylko do odczytu jest w implementacji.
+Kwalifikacja obcych konsumentów pozostaje ścisła: odrębne aliasy są dopuszczane dopiero po potwierdzeniu źródeł. Sześć aliasowych konsumentów spoza Fullmaga wymaga osobnego dowodu odrębności. Nie są zatrzymywane. Walidator kernelowego dowodu tylko do odczytu został dodany i przeszedł 19 regresji Python; pojedynczy rzeczywisty probe odrębnego mountu pliku zakończył się decyzją disjoint. Pełny dry-run pozostaje osobną bramką.
 
 Master API, świeży probe i UI Airbox: nadal NOT VERIFIED; nie uruchomiono Solve ani Compute Fields i nie zmieniono certyfikatów, natywnego OWNER ani danych magazynu.
+
+## Korekta po audycie właścicieli: zachować ręcznie przygotowane modele
+
+Propozycja anulowania dwóch Accepted została wycofana przed wykonaniem. Jeden run pochodzi z celowo zachowanego podglądu głębi viewportu, drugi z podglądu Inspectora Airboxa w innym czacie. Ten drugi nadal jest wskazany przez checkpoint schedulera preparation. Nie ma podstaw uznać ich za zbędne; brak żywego kontenera nie oznacza porzucenia modelu. Oba mają typed manual-start policy, brak start_release.json, zero compute lease/admission i zakończone przygotowanie. Wszystkie dotychczasowe runy, statusy, checkpointy i wyniki pozostają niezmienione.
+
+### Warianty i decyzja techniczna
+
+Anulowanie zmienia intencję właścicieli; świeży store narusza zachowanie sesji, a pominięcie runów omija inventory. Pozostawienie mastera stopped jest bezpiecznym stanem do czasu kwalifikacji. W ramach autoryzowanej naprawy zachowującej sesję wybieramy osobny, wąski kontrakt v4 dla manual-held Accepted. Dotychczasowe v1/v2/v3 nie są rozluźniane.
+
+### Request v4 i warunki przyjęcia
+
+- schema runtime_service_container_recovery_request.v4; istniejące piny owner/config/launch/store/ledger/Docker namespace bezzmian.
+- retained_terminal_runs: 0..128 pinów v3; retained_held_manual_runs: co najmniej jeden pin {run_id, run_intent_sha256, run_catalog_sha256, start_release: absent}. Cancelled list nieobecna; suma rozłącznych list dokładnie pokrywa inventory, łącznie najwyżej 128.
+- Held wymaga poprawnej immutable manual policy, braku release, tasków Accepted/Blocked bez attempt/resource/resolved input/coordinator/artifact IDs. Cancellation intent, compute lease/admission/journal blokuje operację. Immutable CAS oraz terminalne preparation receipts/exit proofs/released leases są walidowane pod natywnymi blokadami.
+- v3 validator nadal wymaga pełnego terminal inventory. Tylko wewnętrzny per-run validator i bounded inventory mogą być współdzielone z v4; nie wywołujemy v3 na niepełnym podzbiorze.
+- Scheduler references są sprawdzane względem sumy obu list. Nie czyścimy checkpointów. Compute scheduler i API restore korzystają z istniejącego durable manual gate; recovery nie tworzy start_release ani nie odtwarza script/Compute/Fields.
+- Oddzielny outcome retained_manual_held_runs_recovered; host, bridge, absence/replay i faktyczny native capability probe muszą jawnie obsługiwać v4. Brak wsparcia blokuje bez fallbacku.
+
+### Odbiór
+
+Źródłowe regresje negatywne obejmą automatic policy, release, claimed/queued task, cancellation intent, input CAS drift, niepełny inventory, aktywne zasoby i błędne checkpoint references. Lokalny zakaz kompilacji unit tests pozostaje; użytkownik dopuścił wymagane testy tej skoordynowanej naprawy wyłącznie w GitHub CI, co potwierdzono przez odczyt bezpośredniej odpowiedzi.
+
+Po zarządzanym starcie trzeba osobno potwierdzić: te same 17 runów, dwa nadal Accepted/manual-held, identyczne wyniki i checkpointy, ten sam model/sesja, waiting_for_solve, brak release i brak Compute/Solve. Preparation jest przez istniejącą politykę dopuszczone, więc jego ewentualny ponowny start wymaga osobnej obserwacji; nie będzie przedstawiany jako brak jakiejkolwiek pracy. Dopiero potem kontrola Quantity Source Airboxa i WebGL.
+
+## Checkpoint wspólnej ścieżki host/bridge
+
+Przed odrębną integracją host/bridge dodano kernelowy dowód odrębności obcych bindów, archiwizowany pod operacją grupy przed mutacją, i użyto wspólnego obserwatora zatrzymanego bridge. Review nie wykazało nowych P1/P2. Regresje Python helpera: 19 PASS; kontrolera readmisji po poprawkach opaque EngineID, RFC3339Nano na Python 3.10 oraz braku /state we frontendzie: 23 PASS; abrupt-stop: 19 PASS. Wcześniejsze zielone suite pozostały aktualne dla niezmienionych modułów. Nie wykonano publikacji readmisji ani odzyskania native runtime.
+
+Wariant v4 jest kolejnym etapem: rzeczywisty zestaw terminalnych referencji CAS przekracza agregat 128 MiB v3, więc v4 wymaga własnego ograniczonego budżetu agregatu 1 GiB przy zachowaniu limitu pojedynczego obiektu 128 MiB i niezmienionych limitów v1/v2/v3. Katalog całego store oraz CAS muszą być sprawdzane względem sumy terminalnych i held runów. Niepodłączony moduł v4 nie należy do pierwszego PR host/bridge.
+
+Pełny rzeczywisty dry-run kontrolera readmisji zatrzymał się bez zapisów na działających obcych kontenerach z literalnymi ścieżkami Windows w Docker Mounts.Source. Bieżący adapter nie kwalifikuje tych ścieżek na Linux/WSL. Bramka pozostaje fail-closed; należy dodać osobny kwalifikowany adapter albo uzyskać naturalne zatrzymanie tych konsumentów przed execute. Nie jest to podstawa do ich zatrzymania lub pominięcia.

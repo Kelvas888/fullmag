@@ -1214,44 +1214,68 @@ def _strict_stopped(container: Mapping[str, object]) -> None:
 
 
 def _abrupt_network(backend, frontend, project):
-    """A daemon failure is never evidence that the old private bridge vanished."""
-    names = [_network_name(item, service) for item, service in ((backend, "backend"), (frontend, "frontend"))]
-    if names[0] != names[1] or backend.get("HostConfig", {}).get("PortBindings"):
-        _fail("abrupt recovery requires one unpublished backend bridge")
-    name = names[0]
-    endpoints = [item["NetworkSettings"]["Networks"][name] for item in (backend, frontend)]
-    network_ids = {entry.get("NetworkID") for entry in endpoints if isinstance(entry, Mapping)}
-    if len(network_ids) != 1:
-        _fail("abrupt services do not pin the same old network ID")
-    network_id = _require_container(next(iter(network_ids)), "old network ID")
-    def inventory():
-        observed = docker_capture("network", "ls", "--no-trunc", "--format", "{{json .}}", timeout=60)
-        try:
-            rows = [json.loads(line) for line in observed.stdout.decode().splitlines() if line.strip()]
-        except (UnicodeDecodeError, ValueError) as error:
-            _fail(f"Docker network inventory is invalid: {error}")
-        if any(not isinstance(row, dict) or not isinstance(row.get("ID"), str) or not isinstance(row.get("Name"), str) for row in rows):
-            _fail("Docker network inventory has incomplete identities")
-        return rows
-    rows = inventory()
-    matching = [row for row in rows if row["Name"] == name or row["ID"] == network_id]
-    if matching:
-        if len(matching) != 1 or matching[0]["ID"] != network_id or matching[0]["Name"] != name:
-            _fail("old bridge name or immutable ID changed")
-        from docker_volume_dev import _assert_private_restart_network
-        _assert_private_restart_network({"backend": backend, "frontend": frontend},
-            {"backend": backend["Id"], "frontend": frontend["Id"]}, project)
-        return {"name": name, "network_id": network_id, "state": "owned-bridge"}
-    observed = docker_capture("network", "inspect", network_id, allow_failure=True, timeout=60)
-    error = observed.stderr.decode("utf-8", "replace").lower()
-    if not observed.returncode or not ("no such network" in error or "network not found" in error):
-        _fail("old private network absence is not authoritative")
-    if any(row["Name"] == name or row["ID"] == network_id for row in inventory()):
-        _fail("old private network changed during absence observation")
-    return {"name": name, "network_id": network_id, "state": "absent"}
+    from docker_stopped_network import observe_stopped_bridge
+    from docker_volume_dev import _assert_private_restart_network
+    try:
+        return observe_stopped_bridge(backend, frontend, project, capture=docker_capture,
+                                      validate_owned_bridge=_assert_private_restart_network)
+    except BuildControlError as error:
+        _fail(str(error))
 
 
-def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=None):
+def _retained_compose_state_root(backend, compose):
+    if not isinstance(compose, Mapping) or compose.get("name") != "fullmag-master":
+        _fail("foreign alias proof has no retained master Compose identity")
+    service = compose.get("services", {}).get("backend", {})
+    volumes = service.get("volumes") if isinstance(service, Mapping) else None
+    candidates = [item for item in volumes if isinstance(item, Mapping)
+                  and item.get("target") == "/state"] if isinstance(volumes, list) else []
+    if len(candidates) != 1 or candidates[0].get("type") != "bind":
+        _fail("foreign alias proof has no unique retained canonical backend state bind")
+    source = candidates[0].get("source")
+    if (not isinstance(source, str) or not source.startswith("/")
+            or ".." in PurePosixPath(source).parts or str(PurePosixPath(source)) != source):
+        _fail("foreign alias proof retained state source is unsafe")
+    actual = [item for item in backend.get("Mounts", [])
+              if isinstance(item, Mapping) and item.get("Destination") == "/state"]
+    daemon_binds = service.get("x-fullmag-daemon-binds")
+    if (len(actual) != 1 or actual[0].get("Type") != "bind"
+            or not isinstance(actual[0].get("Source"), str)
+            or not isinstance(daemon_binds, Mapping)
+            or daemon_binds.get("/state") != actual[0].get("Source")):
+        _fail("foreign alias proof backend state mount differs from its retained daemon pin")
+    path = Path(source)
+    try:
+        if any(storage.is_link(item) for item in (path, *path.parents)):
+            _fail("foreign alias proof retained state traverses a symlink")
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        _fail("foreign alias proof retained state is unavailable: " + str(error))
+    if resolved != path or not path.is_dir():
+        _fail("foreign alias proof retained state is not a canonical directory")
+    image = backend.get("Image")
+    if not isinstance(image, str) or IMAGE_RE.fullmatch(image) is None:
+        _fail("foreign alias proof retained backend image is not immutable")
+    try:
+        documents = json.loads(docker_capture("image", "inspect", image, timeout=90).stdout)
+        if (not isinstance(documents, list) or len(documents) != 1
+                or documents[0].get("Id") != image):
+            _fail("foreign alias proof retained backend image is unavailable")
+        from docker_volume_dev import _validate_retained_service
+        _validate_retained_service(compose, backend, "backend", documents[0].get("Config", {}))
+    except (json.JSONDecodeError, TypeError, ValueError, BuildControlError) as error:
+        _fail("foreign alias proof retained backend service is not authenticated: " + str(error))
+    return path
+
+
+def _prove_foreign_alias_for_abrupt(control, backend, container, alias, compose):
+    from docker_bind_overlap_probe import prove_foreign_alias_disjoint
+    state_root = _retained_compose_state_root(backend, compose)
+    return prove_foreign_alias_disjoint(control, backend, container, alias, state_root)
+
+
+def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=None, *,
+                                         prove_foreign_disjoint=None):
     """Fence every Docker consumer, including stopped containers able to restart."""
     protected = set()
     for container in (backend, frontend):
@@ -1266,6 +1290,8 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
     if not protected:
         _fail("abrupt recovery has no protected runtime mount inventory")
     listed = docker_capture("ps", "-aq", "--no-trunc", timeout=60).stdout.decode().split()
+    if len(listed) != len(set(listed)):
+        _fail("Docker consumer inventory contains duplicate IDs")
     own = {backend["Id"], frontend["Id"]}
     operation = getattr(control, "_active_operation", None)
     if operation is not None:
@@ -1285,26 +1311,86 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
     for identifier in foreign:
         _require_container(identifier, "foreign Docker consumer ID")
     records = json.loads(docker_capture("inspect", *foreign, timeout=90).stdout)
-    if not isinstance(records, list) or {item.get("Id") for item in records} != set(foreign):
+    if (not isinstance(records, list) or len(records) != len(foreign)
+            or any(not isinstance(item, Mapping) for item in records)
+            or {item.get("Id") for item in records} != set(foreign)):
         _fail("foreign Docker consumer inventory changed during observation")
     for item in records:
         alias_mapping = None
-        for mount in item.get("Mounts", []):
-            key = (mount.get("Type"), mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source"))
-            if key[0] == "bind" and isinstance(key[1], str) and key[1].startswith(
-                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"):
-                # Alias hashes are not identities. Only a registered group's
-                # exact admitted incarnation and historical daemon bind pins
-                # can qualify its canonical source; labels alone cannot.
-                if alias_mapping is None:
-                    from docker_foreign_bind_identity import canonical_bind_sources
+        alias_mapping_decided = False
+        mounts = item.get("Mounts")
+        if not isinstance(mounts, list):
+            _fail("foreign Docker consumer has no complete mount inventory")
+        for mount in mounts:
+            if not isinstance(mount, Mapping):
+                _fail("foreign Docker consumer mount is malformed")
+            kind = mount.get("Type")
+            if kind == "bind":
+                source = mount.get("Source")
+                if (not isinstance(source, str) or not source.startswith("/")
+                        or ".." in PurePosixPath(source).parts
+                        or str(PurePosixPath(source)) != source):
+                    _fail("foreign Docker consumer bind source is unsafe")
+                raw_key = (kind, source)
+            elif kind == "volume":
+                name = mount.get("Name")
+                if not isinstance(name, str) or not name:
+                    _fail("foreign Docker consumer volume identity is unresolved")
+                raw_key = (kind, name)
+            elif kind == "tmpfs":
+                raw_key = (kind, None)
+            else:
+                _fail("foreign Docker consumer mount type is unresolved")
+            key = raw_key
+            alias = raw_key[1] if raw_key[0] == "bind" else None
+            needs_physical_proof = False
+            # Preserve exact and ancestor/descendant source checks before any
+            # cross-group resolver or kernel probe is allowed to run.
+            raw_overlap = raw_key in protected
+            if raw_key[0] == "bind":
+                raw_source = PurePosixPath(raw_key[1])
+                raw_overlap = raw_overlap or any(kind == "bind" and isinstance(path, str)
+                    and (raw_source.is_relative_to(PurePosixPath(path))
+                         or PurePosixPath(path).is_relative_to(raw_source))
+                    for kind, path in protected)
+            if raw_overlap:
+                _fail("a foreign Docker container references the recovery store/control/ledger")
+            if (isinstance(alias, str)
+                    and alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
+                # Alias hashes are not identities. A missing/denied registered
+                # mapping requires an independent physical kernel proof.
+                if not alias_mapping_decided:
                     try:
+                        from docker_foreign_bind_identity import canonical_bind_sources
                         alias_mapping = canonical_bind_sources(item)
-                    except (OSError, ValueError, BuildControlError) as error:
-                        _fail("foreign Docker Desktop bind alias has unresolved storage identity: " + str(error))
-                if key[1] not in alias_mapping:
-                    _fail("foreign Docker Desktop bind alias has unresolved storage identity")
-                key = ("bind", alias_mapping[key[1]])
+                    except Exception:
+                        alias_mapping = None
+                    alias_mapping_decided = True
+                if alias_mapping is None:
+                    needs_physical_proof = True
+                elif not isinstance(alias_mapping, dict):
+                    _fail("foreign Docker Desktop bind resolver returned a malformed mapping")
+                elif alias not in alias_mapping:
+                    needs_physical_proof = True
+                else:
+                    canonical_source = alias_mapping[alias]
+                    if (not isinstance(canonical_source, str) or not canonical_source.startswith("/")
+                            or ".." in PurePosixPath(canonical_source).parts
+                            or str(PurePosixPath(canonical_source)) != canonical_source):
+                        _fail("foreign registered bind source is not a canonical absolute path")
+                    key = ("bind", canonical_source)
+            if needs_physical_proof:
+                callback = prove_foreign_disjoint or (
+                    lambda current, current_alias: _prove_foreign_alias_for_abrupt(
+                        control, backend, current, current_alias, compose))
+                try:
+                    proof = callback(item, alias)
+                    from docker_bind_overlap_probe import validate_foreign_alias_disjoint_proof
+                    validate_foreign_alias_disjoint_proof(
+                        proof, alias=alias, container_id=item.get("Id"))
+                except Exception as error:
+                    _fail("foreign Docker Desktop bind alias has unresolved storage identity: " + str(error))
+                continue
             overlap = key in protected
             if key[0] == "bind" and isinstance(key[1], str):
                 source = PurePosixPath(key[1])
@@ -1597,8 +1683,8 @@ def _verify_network_after_removal(
     absent_before = absent_from_inventory() if abrupt else None
     observed = docker_capture("network", "inspect", network_name, allow_failure=True, timeout=60)
     if observed.returncode:
-        error = observed.stderr.decode("utf-8", "replace").lower()
-        if "no such network" in error or "network not found" in error:
+        from docker_stopped_network import authoritative_network_not_found
+        if authoritative_network_not_found(observed, network_name):
             if abrupt and (not absent_before or not absent_from_inventory()):
                 _fail("post-removal network absence conflicts with Docker inventory")
             return "absent"

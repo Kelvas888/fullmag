@@ -48,6 +48,69 @@ def _record(raw):
             "base64": base64.b64encode(raw).decode("ascii")}
 
 
+def _foreign_alias_proof(alias, container_id):
+    alias_sha = hashlib.sha256(alias.encode()).hexdigest()
+    kernel = {
+        "schema": "fullmag.docker-bind-overlap-proof.v1",
+        "decision": "disjoint",
+        "probe_schema": "fullmag.docker-bind-overlap-probe.v1",
+        "candidate_alias_sha256": alias_sha,
+        "reference_root_sha256": "a" * 64,
+        "reference_marker_sha256": "b" * 64,
+        "reference_marker_size": 10,
+        "reference_marker_stat": {},
+        "reference_stat": {},
+        "reference_mount": {},
+        "candidate_mounts": [],
+        "candidate_stat": {},
+        "mountinfo_sha256": "c" * 64,
+    }
+    return {
+        "schema": "fullmag.foreign-bind-disjoint-proof.v1",
+        "decision": "disjoint",
+        "container_id": container_id,
+        "image_id": "sha256:" + "d" * 64,
+        "started_at": "2026-10-27T10:00:00Z",
+        "status": "running",
+        "running": True,
+        "pid": 234,
+        "inspection_sha256": "e" * 64,
+        "candidate_alias_sha256": alias_sha,
+        "reference_root_sha256": "a" * 64,
+        "kernel_proof": kernel,
+    }
+
+
+def _daemon_state_fixture(*, frontend_state=False):
+    backend_alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Master/backend-state"
+    frontend_alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Master/frontend-state"
+    state_source = "/srv/fullmag/storage"
+    compose = {"services": {
+        "backend": {
+            "volumes": [{"type": "bind", "source": state_source, "target": "/state"}],
+            "x-fullmag-daemon-binds": {"/state": backend_alias},
+        },
+        "frontend": {
+            "volumes": [{"type": "volume", "source": "frontend-build",
+                         "target": "/state/development"}],
+            "x-fullmag-daemon-binds": {},
+        },
+    }}
+    actual = {
+        "backend": {"Mounts": [{"Type": "bind", "Source": backend_alias,
+                                  "Destination": "/state"}]},
+        "frontend": {"Mounts": [{"Type": "volume", "Name": "frontend-build",
+                                   "Destination": "/state/development"}]},
+    }
+    if frontend_state:
+        compose["services"]["frontend"]["volumes"].append(
+            {"type": "bind", "source": state_source, "target": "/state"})
+        compose["services"]["frontend"]["x-fullmag-daemon-binds"]["/state"] = frontend_alias
+        actual["frontend"]["Mounts"].append(
+            {"Type": "bind", "Source": frontend_alias, "Destination": "/state"})
+    return compose, actual, backend_alias, frontend_alias, state_source
+
+
 def _snapshot():
     certificate = b'{"host_device":17}'
     owner = b'{ "host_device" : 17 }'
@@ -79,6 +142,46 @@ def _snapshot():
     return {"plan": plan, "raw": raw, "state_root": "/state",
             "pair": "old/old", "context": {"compose_project": REQUEST["compose_project"],
                         "filesystem_uuid": REQUEST["filesystem_uuid"]}}
+
+
+class EngineIdentityTests(unittest.TestCase):
+    def test_engine_info_id_is_opaque_while_raw_identity_remains_exact(self):
+        identifiers = [
+            "81a2002d-4c88-48aa-b4da-fed771788cfa",
+            "a" * 64,
+            "7TRN:IPZB:QYBB:VPBQ:UMPP:KARE:6ZNR:XE6T:7EWV:PKF4:ZOJD:TPYS",
+        ]
+        for identity in identifiers:
+            with self.subTest(identity=identity), patch.object(readmission, "docker_capture", return_value=SimpleNamespace(stdout=(identity + "\n").encode())):
+                self.assertEqual(readmission._engine_id(), identity)
+        for raw in [b"\n", b"bad\nidentity", b"x" * 257, b"\xff"]:
+            with self.subTest(raw=raw), patch.object(readmission, "docker_capture", return_value=SimpleNamespace(stdout=raw)):
+                with self.assertRaises(ValueError):
+                    readmission._engine_id()
+
+
+class DockerTimestampTests(unittest.TestCase):
+    def actual(self, started, finished):
+        return {"State": {"Status": "exited", "Running": False, "Paused": False,
+                          "Restarting": False, "Pid": 0, "ExitCode": 255,
+                          "StartedAt": started, "FinishedAt": finished}}
+
+    def test_rfc3339_nano_is_supported_without_changing_raw_inspection(self):
+        for fraction in ["1", "12", "123", "123456", "1234567", "12345678", "123456789"]:
+            for zone in ["Z", "+00:00"]:
+                actual = self.actual("2020-10-26T22:31:33." + fraction + zone,
+                                     "2020-10-27T06:46:17.729041395Z")
+                before = _raw(actual)
+                readmission._validate_stopped_state(actual)
+                self.assertEqual(_raw(actual), before)
+
+    def test_nanosecond_order_and_invalid_dates_are_fail_closed(self):
+        actual = self.actual("2020-10-26T22:31:33.123456789Z", "2020-10-26T22:31:33.123456788Z")
+        with self.assertRaisesRegex(ValueError, "precedes"):
+            readmission._validate_stopped_state(actual)
+        for timestamp in ["2020-02-30T00:00:00Z", "2020-10-26T22:31:33.1234567890Z", "2020-10-26T22:31:33", "2999-01-01T00:00:00Z"]:
+            with self.subTest(timestamp=timestamp), self.assertRaises(ValueError):
+                readmission._validate_stopped_state(self.actual(timestamp, timestamp))
 
 
 class FakeControl:
@@ -142,6 +245,11 @@ class FinishedLockHelper:
         return 0
 
 
+class TimedOutLockHelper(FinishedLockHelper):
+    def wait(self, timeout=None):
+        raise readmission.subprocess.TimeoutExpired("managed-docker-probe", timeout)
+
+
 @contextmanager
 def _tracking_lock(flags, name):
     flags[name] = True
@@ -187,6 +295,59 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             readmission._validate_stopped_state(changed)
 
+    def test_daemon_state_aliases_accepts_frontend_without_any_state_identity(self):
+        compose, actual, backend_alias, _frontend_alias, state_source = _daemon_state_fixture()
+        self.assertEqual(
+            readmission._daemon_state_aliases(compose, actual),
+            {backend_alias, state_source},
+        )
+
+    def test_daemon_state_aliases_accepts_frontend_state_only_with_all_exact_pins(self):
+        compose, actual, backend_alias, frontend_alias, state_source = _daemon_state_fixture(
+            frontend_state=True)
+        self.assertEqual(
+            readmission._daemon_state_aliases(compose, actual),
+            {backend_alias, frontend_alias, state_source},
+        )
+
+    def test_daemon_state_aliases_rejects_missing_duplicate_and_mismatched_pins(self):
+        mutations = (
+            ("backend missing actual", lambda c, a: a["backend"].update(Mounts=[])),
+            ("backend missing declaration",
+             lambda c, _a: c["services"]["backend"].update(volumes=[])),
+            ("backend duplicate actual",
+             lambda _c, a: a["backend"]["Mounts"].append(dict(a["backend"]["Mounts"][0]))),
+            ("backend daemon pin mismatch",
+             lambda c, _a: c["services"]["backend"]["x-fullmag-daemon-binds"].update(
+                 {"/state": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/state"})),
+            ("frontend actual is undeclared",
+             lambda _c, a: a["frontend"]["Mounts"].append(
+                 {"Type": "bind", "Source": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/state",
+                  "Destination": "/state"})),
+            ("frontend declaration has no actual mount",
+             lambda c, _a: c["services"]["frontend"]["volumes"].append(
+                 {"type": "bind", "source": "/srv/fullmag/storage", "target": "/state"})),
+            ("frontend daemon pin has no actual mount",
+             lambda c, _a: c["services"]["frontend"]["x-fullmag-daemon-binds"].update(
+                 {"/state": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/state"})),
+            ("frontend duplicate actual",
+             lambda _c, a: a["frontend"]["Mounts"].append(dict(a["frontend"]["Mounts"][-1]))),
+            ("frontend duplicate declaration",
+             lambda c, _a: c["services"]["frontend"]["volumes"].append(
+                 {"type": "bind", "source": "/srv/fullmag/storage", "target": "/state"})),
+            ("frontend mismatched daemon pin",
+             lambda c, _a: c["services"]["frontend"]["x-fullmag-daemon-binds"].update(
+                 {"/state": "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/state"})),
+        )
+        for label, mutate in mutations:
+            with self.subTest(case=label):
+                compose, actual, *_pins = _daemon_state_fixture(
+                    frontend_state=label.startswith("frontend duplicate")
+                    or label == "frontend mismatched daemon pin")
+                mutate(compose, actual)
+                with self.assertRaises(ValueError):
+                    readmission._daemon_state_aliases(compose, actual)
+
     def test_running_consumer_guard_checks_state_alias_control_and_ledger_mounts(self):
         base = {"Id": "9" * 64, "State": {"Running": True}, "Mounts": []}
         readmission._assert_no_live_consumers(
@@ -195,7 +356,7 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
         )
         for mount in (
             {"Type": "bind", "Source": "/storage/fullmag/runs/x", "Destination": "/other"},
-            {"Type": "bind", "Source": "/other", "Destination": "/state"},
+            {"Type": "bind", "Source": "/storage/fullmag", "Destination": "/elsewhere"},
             {"Type": "volume", "Name": "control-vol", "Destination": "/data"},
             {"Type": "volume", "Name": "ledger-vol", "Destination": "/ledger"},
         ):
@@ -205,6 +366,14 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
                     [changed], state_paths=["/storage/fullmag"], control_volume="control-vol",
                     ledger_mounts={("volume", "ledger-vol")}, allowed_ids=set(),
                 )
+        # Guest destinations do not identify host data. The same /state path
+        # is safe when its bind source is a separate host store.
+        readmission._assert_no_live_consumers(
+            [{**base, "Mounts": [{"Type": "bind", "Source": "/other",
+                                   "Destination": "/state"}]}],
+            state_paths=["/storage/fullmag"], control_volume="control-vol",
+            ledger_mounts={("volume", "ledger-vol")}, allowed_ids=set(),
+        )
         controlled = {**base, "Id": "8" * 64,
                       "Mounts": [{"Type": "volume", "Name": "control-vol", "Destination": "/control"}]}
         readmission._assert_no_live_consumers(
@@ -216,7 +385,7 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
     def test_foreign_wsl_alias_requires_readonly_canonical_mapping(self):
         alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/hash/state"
         container = {"Id": "9" * 64, "Mounts": [
-            {"Type": "bind", "Source": alias, "Destination": "/other"},
+            {"Type": "bind", "Source": alias, "Destination": "/state"},
         ]}
         kwargs = dict(state_paths=["/storage/fullmag"], control_volume="control-vol",
                       ledger_mounts={("volume", "ledger-vol")}, allowed_ids=set())
@@ -231,6 +400,42 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
                 [container], **kwargs,
                 canonicalize_foreign=lambda _item: {alias: "/storage/fullmag/other"},
             )
+
+    def test_unknown_alias_needs_exact_typed_kernel_proof_but_canonical_overlap_wins(self):
+        alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/hash/state"
+        container = {"Id": "9" * 64, "Mounts": [
+            {"Type": "bind", "Source": alias, "Destination": "/data"},
+        ]}
+        kwargs = dict(state_paths=["/storage/fullmag"], control_volume="control-vol",
+                      ledger_mounts={("volume", "ledger-vol")}, allowed_ids=set(),
+                      canonicalize_foreign=lambda _item: {})
+        calls = []
+        proof = _foreign_alias_proof(alias, container["Id"])
+        readmission._assert_no_live_consumers(
+            [container], **kwargs,
+            prove_foreign_disjoint=lambda item, source: calls.append((item, source)) or proof,
+        )
+        self.assertEqual(calls, [(container, alias)])
+
+        bad_alias_proof = dict(proof, candidate_alias_sha256="0" * 64)
+        bad_kernel = dict(proof, kernel_proof={**proof["kernel_proof"],
+                                               "candidate_alias_sha256": "0" * 64})
+        for bad_proof in (None, {**proof, "decision": "overlap"}, bad_alias_proof,
+                          {**proof, "container_id": "8" * 64}, bad_kernel):
+            with self.subTest(proof=bad_proof), self.assertRaisesRegex(ValueError, "disjoint proof"):
+                readmission._assert_no_live_consumers(
+                    [container], **kwargs,
+                    prove_foreign_disjoint=lambda _item, _source: bad_proof,
+                )
+        for canonical_source in ("/storage", "/storage/fullmag", "/storage/fullmag/runs/other"):
+            with self.subTest(canonical_source=canonical_source), self.assertRaisesRegex(
+                    ValueError, "retained Linux state"):
+                readmission._assert_no_live_consumers(
+                    [container], **{**kwargs,
+                        "canonicalize_foreign": lambda _item, path=canonical_source: {alias: path}},
+                    prove_foreign_disjoint=lambda *_args: self.fail(
+                        "canonical overlap must not fall back"),
+                )
 
     def test_missing_engine_or_filesystem_uuid_observation_fails_closed(self):
         with patch.object(
@@ -507,6 +712,19 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
                         with readmission._owner_lock(control):
                             pass
                 process.stdout.close()
+
+    def test_owner_lock_wait_timeout_is_unknown_even_after_release_token(self):
+        control = SimpleNamespace(
+            path=lambda _relative: "/control/runtime-control/runtime-services/OWNER.lock",
+            helper_args=lambda _script, **_kwargs: ["managed-docker-probe"],
+        )
+        process = TimedOutLockHelper(b"READY\nRELEASED\n")
+        with patch.object(readmission.subprocess, "Popen", return_value=process), \
+                patch.object(readmission, "_authenticate_owner_helper", return_value="8" * 64):
+            with self.assertRaises(ControlOutcomeUnknown):
+                with readmission._owner_lock(control):
+                    pass
+        process.stdout.close()
 
     def test_unknown_owner_release_preserves_build_control_lifecycle_fence(self):
         control = object.__new__(BuildControl)
