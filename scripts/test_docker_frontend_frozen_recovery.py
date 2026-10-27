@@ -27,6 +27,64 @@ def request():
                 "previous_receipt_sha256")}, "backend_observation": {"active_session": True}}}
 
 
+def volume_fixture():
+    from docker_development_inputs import metadata_cache_key
+    inputs = {"schema": "fullmag.docker-development-inputs.v1",
+              "dependency_seed_sha256": "a" * 64, "toolpins_sha256": "b" * 64,
+              "files": [{"relative": "apps/control-room/package.json", "sha256": "c" * 64}]}
+    raw = canonical(inputs)
+    retained = "fullmag-dev-frontend-v1-" + "3" * 24
+    seeded = "fullmag-dev-frontend-v1-" + metadata_cache_key(inputs, "group")[:24]
+    document = {"volumes": {"frontend-build": {"name": retained}},
+                "services": {"backend": {"environment": {}}}}
+    mount = {"Destination": "/state/development", "Type": "volume", "RW": True, "Name": retained}
+    return raw, document, seeded, mount
+
+
+class BaseVolumeBindingContract(unittest.TestCase):
+    def setUp(self):
+        self.raw_inputs, self.document, self.seeded, self.mount = volume_fixture()
+        self.wanted = request()
+        self.wanted["failure"]["inputs_sha256"] = frozen.digest(self.raw_inputs)
+        self.control = SimpleNamespace(project="group", volume="control", namespace="")
+        self.previous = {"state": "failed-confirmed", "attempt": "a" * 32,
+                         "inputs": {"source_root": "/selected"}, "state_root": "/retained",
+                         "backend_volumes": {"build": "cache"}, "frontend_volume": self.mount["Name"]}
+        self.raw_previous = canonical(self.previous)
+        self.wanted["failure"]["previous_receipt_sha256"] = frozen.digest(self.raw_previous)
+        self.original = {"phase": "resume", "compose_project": "group", "control_volume": "control",
+                         "error": "DEV service exited before readiness: frontend",
+                         "inputs": {"attempt": "a" * 32}, "state_root": "/retained",
+                         "backend_volumes": {"build": "cache"}, "frontend_volume": self.seeded}
+
+    def validate(self, original=None, document=None, raw_inputs=None):
+        def read(control, path):
+            return (self.raw_inputs if raw_inputs is None else raw_inputs) if path == "frontend/development-inputs.json" else self.raw_previous
+        with patch.object(frozen, "read_raw", side_effect=read), \
+             patch.object(frozen, "terminal_context", return_value={"kind": "terminal_history"}):
+            return frozen.validate_base(self.control, self.wanted,
+                                        self.original if original is None else original, self.previous,
+                                        self.document if document is None else document, Path("/selected"))
+
+    def test_requested_seed_and_actual_retained_volume_can_differ_with_exact_proof(self):
+        self.assertNotEqual(self.seeded, self.mount["Name"])
+        self.assertEqual(self.validate(), {"kind": "terminal_history"})
+
+    def test_foreign_seed_or_retained_configuration_is_rejected(self):
+        original = {**self.original, "frontend_volume": "fullmag-dev-frontend-v1-" + "f" * 24}
+        with self.assertRaisesRegex(BuildControlError, "seeded frontend volume"):
+            self.validate(original=original)
+        document = copy.deepcopy(self.document)
+        document["volumes"]["frontend-build"]["name"] = "fullmag-dev-frontend-v1-" + "f" * 24
+        with self.assertRaisesRegex(BuildControlError, "base resources"):
+            self.validate(document=document)
+
+    def test_seed_derivation_requires_the_exact_pinned_input_bytes(self):
+        with self.assertRaisesRegex(BuildControlError, "input CAS"):
+            self.validate(raw_inputs=self.raw_inputs + b"\n")
+
+
+
 class RequestContract(unittest.TestCase):
     def test_explicit_schema_and_all_three_distinct_pins(self):
         reconcile.validate_request(request())
@@ -167,28 +225,52 @@ class CompletionFenceContract(unittest.TestCase):
         wanted["frontend_helper_sha256"] = frozen.digest(Path(frozen.__file__).read_bytes())
         backend = {"Id": "7" * 64, "State": {
             "StartedAt": "2026-10-27T21:32:20Z", "Health": {"Status": "healthy"}}}
-        original = {"inputs": {"attempt": "a" * 32},
+        raw_inputs, document, seeded, mount = volume_fixture()
+        wanted["failure"]["inputs_sha256"] = frozen.digest(raw_inputs)
+        original = {"inputs": {"attempt": "a" * 32}, "frontend_volume": seeded,
                     "backend_started_at": backend["State"]["StartedAt"]}
         failure = {k: v for k, v in wanted["failure"].items()
                    if k not in {"previous_receipt_sha256", "backend_observation"}}
-        control = SimpleNamespace(read=lambda path: {"services": {}})
+        control = SimpleNamespace(project="group", read=lambda path: document)
         qualified = {"qualified": True}
-        with patch.object(frozen, "terminal_context", return_value={"kind": "terminal_history"}), \
+        context = {"kind": "terminal_history", "request": {
+            "observation": {"runtime_config_sha256": "5" * 64}}}
+        with patch.object(frozen, "read_raw", return_value=raw_inputs), \
+             patch.object(frozen, "terminal_context", return_value=context), \
              patch.object(frozen, "frozen_failure", return_value=failure), \
              patch.object(frozen, "backend_observation",
                           return_value=wanted["failure"]["backend_observation"]), \
              patch.object(frozen, "qualified_backend", return_value=(qualified, {
                  "app_source": {"commit": "c" * 40}, "helper_source": {"commit": "d" * 40},
-                 "transition_manifest_sha256": "2" * 64})), \
+                 "transition_manifest_sha256": "2" * 64})) as qualify, \
              patch.object(terminal, "complete") as complete:
-            actual = {"backend": backend, "frontend": {}}
+            actual = {"backend": backend, "frontend": {"Mounts": [mount]}}
             self.assertEqual(frozen.validate_failure(control, "root", wanted, original, actual, Path("/state"))["failure"],
                              wanted["failure"])
             self.assertEqual(complete.call_count, 1)
             self.assertEqual(complete.call_args.args[-1], qualified)
+            qualify.assert_called_once_with(control, "root", wanted, backend,
+                                            runtime_config_sha256="5" * 64)
             complete.side_effect = BuildControlError("native terminal evidence differs")
             with self.assertRaisesRegex(BuildControlError, "native terminal evidence"):
                 frozen.validate_failure(control, "root", wanted, original, actual, Path("/state"))
+
+
+    def test_foreign_readonly_bind_or_duplicate_actual_frontend_mount_is_rejected(self):
+        raw_inputs, document, seeded, mount = volume_fixture()
+        wanted = request()
+        wanted["frontend_helper_sha256"] = frozen.digest(Path(frozen.__file__).read_bytes())
+        wanted["failure"]["inputs_sha256"] = frozen.digest(raw_inputs)
+        original = {"inputs": {"attempt": "a" * 32}, "frontend_volume": seeded}
+        control = SimpleNamespace(project="group", read=lambda path: document)
+        for mounts in ([{**mount, "Name": "foreign"}], [{**mount, "Type": "bind"}],
+                       [{**mount, "RW": False}], [mount, dict(mount)], []):
+            with self.subTest(mounts=mounts), patch.object(frozen, "read_raw", return_value=raw_inputs), \
+                 patch.object(frozen, "terminal_context") as terminal:
+                with self.assertRaisesRegex(BuildControlError, "volume mount"):
+                    frozen.validate_failure(control, "root", wanted, original,
+                                            {"frontend": {"Mounts": mounts}}, Path("/state"))
+                terminal.assert_not_called()
 
     def test_unqualified_transition_is_rejected_before_history_completion(self):
         import docker_dev_codegen as codegen
@@ -198,7 +280,90 @@ class CompletionFenceContract(unittest.TestCase):
              patch.object(frozen, "source_qualification", side_effect=BuildControlError("source transition differs")):
             with self.assertRaisesRegex(BuildControlError, "source transition"):
                 frozen.qualified_backend(object(), "root", request(), {
-                    "Id": "7" * 64, "State": {"StartedAt": "now"}, "Image": "sha256:" + "4" * 64})
+                    "Id": "7" * 64, "State": {"StartedAt": "now"}, "Image": "sha256:" + "4" * 64},
+                    runtime_config_sha256="5" * 64)
+
+
+
+class RuntimeConfigPinContract(unittest.TestCase):
+    def test_qualified_backend_never_reads_live_exclusive_owner_lock(self):
+        import docker_dev_codegen as codegen
+        import docker_volume_dev as dev
+        receipt_raw, provenance_raw = b"receipt", b"provenance"
+        wanted = request()
+        wanted["package_documents"] = {"receipt": frozen.digest(receipt_raw),
+                                       "provenance": frozen.digest(provenance_raw)}
+        actual = {"Id": "7" * 64, "State": {"StartedAt": "now"},
+                  "Image": "sha256:" + "4" * 64}
+        binding = {"app_source": {}, "helper_source": {}}
+        with patch.object(codegen, "_backend_documents", return_value=(
+                {"source": {}}, {}, frozen.digest(receipt_raw), {})), \
+             patch.object(codegen, "_validate_backend", return_value=({}, None, None)), \
+             patch.object(codegen, "_probe_source", return_value=({}, None)), \
+             patch.object(frozen, "source_qualification", return_value=binding), \
+             patch.object(frozen, "read_raw", side_effect=[receipt_raw, provenance_raw]), \
+             patch.object(dev, "_read_runtime_config_digest",
+                          side_effect=AssertionError("live exclusive-owner read must not occur")) as locked:
+            qualified, observed_binding = frozen.qualified_backend(
+                object(), "root", wanted, actual, runtime_config_sha256="5" * 64)
+            self.assertEqual(qualified["runtime_config_sha256"], "5" * 64)
+            self.assertEqual(observed_binding, binding)
+            locked.assert_not_called()
+
+    def test_missing_or_malformed_authenticated_config_pin_fails_before_io(self):
+        import docker_dev_codegen as codegen
+        with patch.object(codegen, "_backend_documents") as documents:
+            for value in (None, "", "short", "A" * 64, "5" * 63, 123):
+                with self.subTest(value=value), self.assertRaises(BuildControlError):
+                    frozen.qualified_backend(object(), "root", request(), {},
+                                             runtime_config_sha256=value)
+            with self.assertRaises(TypeError):
+                frozen.qualified_backend(object(), "root", request(), {})
+            documents.assert_not_called()
+
+    def test_existing_native_completion_rejects_a_different_observed_config(self):
+        import docker_build_control as build
+        import docker_volume_terminal_prestart_recovery as terminal
+        backend = {"Id": "7" * 64, "Image": "sha256:" + "4" * 64,
+                   "State": {"Running": True, "StartedAt": "now"}}
+        qualified = {"backend_container_id": backend["Id"], "backend_started_at": "now",
+                     "image_id": backend["Image"], "package_receipt_sha256": "f" * 64,
+                     "provenance_sha256": "1" * 64, "runtime_config_sha256": "5" * 64}
+        context = {"probe": {}, "request": {"containers": {"backend": {"image": backend["Image"]}},
+                                            "history_baseline": {}, "observation": {}}}
+        observed = {"package_receipt_sha256": "f" * 64, "provenance_sha256": "1" * 64,
+                    "runtime_config_sha256": "6" * 64}
+        control = SimpleNamespace(write=lambda *args: self.fail("mismatched completion must not publish"))
+        operation = {"root": "root", "receipt": {}, "daemon_pending": True}
+        with patch.object(build, "docker_text", return_value=json.dumps([backend])), \
+             patch.object(terminal, "build_observation", return_value=observed):
+            with self.assertRaisesRegex(BuildControlError, "qualified publication"):
+                terminal.complete(control, operation, backend["Id"], context, qualified)
+        self.assertTrue(operation["daemon_pending"])
+
+
+    def test_refresh_uses_the_authenticated_history_config_pin(self):
+        import docker_volume_terminal_prestart_recovery as terminal
+        original = {"inputs": {"attempt": "a" * 32}}
+        raw = canonical(original)
+        observation = {"active_session": True, "run_id": "run"}
+        context = {"resume": "b" * 32, "terminal_sha256": frozen.digest(raw),
+                   "request": {"failure": {"backend_observation": observation}}}
+        history = {"request": {"observation": {"runtime_config_sha256": "5" * 64}}}
+        qualified = {"qualified": True}
+        binding = {"app_source": {}, "helper_source": {}, "transition_manifest_sha256": "2" * 64}
+        backend = {"Id": "7" * 64}
+        control = SimpleNamespace(read=lambda path: {})
+        operation = {"root": "refresh", "receipt": {}}
+        with patch.object(frozen, "read_raw", return_value=raw), \
+             patch.object(frozen, "terminal_context", return_value=history), \
+             patch.object(frozen, "qualified_backend", return_value=(qualified, binding)) as qualify, \
+             patch.object(frozen, "backend_observation", return_value=observation), \
+             patch.object(terminal, "complete") as complete:
+            frozen.complete_refresh(control, operation, context, backend)
+            qualify.assert_called_once_with(control, "resume/attempts/" + "b" * 32,
+                                            context["request"], backend, runtime_config_sha256="5" * 64)
+            complete.assert_called_once_with(control, operation, backend["Id"], history, qualified)
 
 
 if __name__ == "__main__":

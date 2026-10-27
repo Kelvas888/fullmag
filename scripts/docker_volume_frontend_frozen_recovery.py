@@ -116,18 +116,36 @@ def terminal_context(control, original, document):
     return {"kind": "terminal_history", "request": request, "probe": probe}
 
 
+def _frontend_volumes(control, request, original, document):
+    from docker_development_inputs import metadata_cache_key
+    raw = read_raw(control, "frontend/development-inputs.json")
+    require(digest(raw) == request["failure"]["inputs_sha256"],
+            "Seeded frontend input CAS differs")
+    inputs = json.loads(raw)
+    retained = document.get("volumes", {}).get("frontend-build", {}).get("name")
+    require(isinstance(retained, str) and retained.startswith("fullmag-dev-frontend-v1-")
+            and len(retained) == len("fullmag-dev-frontend-v1-") + 24
+            and all(char in "0123456789abcdef" for char in retained[-24:]),
+            "Retained frontend volume configuration differs")
+    seeded = "fullmag-dev-frontend-v1-" + metadata_cache_key(inputs, control.project)[:24]
+    require(original.get("frontend_volume") == seeded,
+            "Recorded seeded frontend volume differs from its pinned inputs")
+    return {"seeded": seeded, "retained": retained}
+
+
 def validate_base(control, request, original, previous, document, selected):
     require(not getattr(control, "namespace", None), "Namespaced frontend recovery is unsupported")
     require(original.get("phase") == "resume" and original.get("compose_project") == control.project
             and original.get("control_volume") == control.volume
             and original.get("error") == "DEV service exited before readiness: frontend",
             "Only this group's exact frontend readiness failure is supported")
+    volumes = _frontend_volumes(control, request, original, document)
     require(previous.get("state") in {"failed-confirmed", "succeeded"}
             and previous.get("attempt") == original["inputs"]["attempt"]
             and previous.get("inputs", {}).get("source_root") == str(selected) == request["source_root"]
             and previous.get("state_root") == original.get("state_root")
             and previous.get("backend_volumes") == original.get("backend_volumes")
-            and previous.get("frontend_volume") == original.get("frontend_volume")
+            and previous.get("frontend_volume") == volumes["retained"]
             and digest(read_raw(control, "development/attempts/" + previous["attempt"] + "/terminal.json"))
                 == request["failure"]["previous_receipt_sha256"],
             "Frozen frontend base resources differ")
@@ -179,9 +197,10 @@ def source_qualification(control, request, actual, current, backend, receipt_sou
     return binding
 
 
-def qualified_backend(control, root, request, actual):
+def qualified_backend(control, root, request, actual, *, runtime_config_sha256):
+    require(isinstance(runtime_config_sha256, str) and SHA.fullmatch(runtime_config_sha256),
+            "Authenticated runtime configuration digest is required")
     import docker_dev_codegen as codegen
-    import docker_volume_dev as dev
     receipt, provenance, receipt_sha, binary = codegen._backend_documents(actual["Id"])
     source, _, _ = codegen._validate_backend(receipt, provenance, receipt_sha, binary)
     source_probe, _ = codegen._probe_source(actual["Id"], request["attempt"])
@@ -194,7 +213,7 @@ def qualified_backend(control, root, request, actual):
                  "backend_started_at": actual["State"]["StartedAt"],
                  "image_id": actual["Image"], "package_receipt_sha256": receipt_sha,
                  "provenance_sha256": request["package_documents"]["provenance"],
-                 "runtime_config_sha256": dev._read_runtime_config_digest(control)}
+                 "runtime_config_sha256": runtime_config_sha256}
     return qualified, binding
 
 
@@ -203,6 +222,12 @@ def validate_failure(control, root, request, original, actual, state):
     require(digest(Path(__file__).read_bytes()) == request["frontend_helper_sha256"],
             "Frozen frontend helper source differs")
     document = control.read("development/attempts/" + original["inputs"]["attempt"] + "/compose.json")
+    volumes = _frontend_volumes(control, request, original, document)
+    mounts = [row for row in actual["frontend"].get("Mounts", [])
+              if row.get("Destination") == "/state/development"]
+    require(len(mounts) == 1 and mounts[0].get("Type") == "volume"
+            and mounts[0].get("RW") is True and mounts[0].get("Name") == volumes["retained"],
+            "Actual retained frontend volume mount differs")
     context = terminal_context(control, original, document)
     require(original.get("backend_started_at") == actual["backend"]["State"]["StartedAt"]
             and actual["backend"]["State"].get("Health", {}).get("Status") == "healthy",
@@ -211,7 +236,9 @@ def validate_failure(control, root, request, original, actual, state):
              "previous_receipt_sha256": request["failure"]["previous_receipt_sha256"],
              "backend_observation": backend_observation(actual["backend"]["Id"])} == request["failure"],
             "Frozen frontend failure or live observation changed")
-    qualified, binding = qualified_backend(control, root, request, actual["backend"])
+    qualified, binding = qualified_backend(
+        control, root, request, actual["backend"],
+        runtime_config_sha256=context["request"]["observation"]["runtime_config_sha256"])
     operation = {"root": root, "receipt": {}, "daemon_pending": True}
     terminal.complete(control, operation, actual["backend"]["Id"], context, qualified)
     require(backend_observation(actual["backend"]["Id"]) == request["failure"]["backend_observation"]
@@ -219,7 +246,8 @@ def validate_failure(control, root, request, original, actual, state):
                 k: v for k, v in request["failure"].items()
                 if k not in {"previous_receipt_sha256", "backend_observation"}},
             "Frontend or terminal session changed during native completion")
-    return {"failure": dict(request["failure"]), "app_source": binding["app_source"],
+    return {"failure": dict(request["failure"]), "frontend_volumes": volumes,
+            "app_source": binding["app_source"],
             "helper_source": binding["helper_source"],
             "transition_manifest_sha256": binding["transition_manifest_sha256"]}
 
@@ -266,7 +294,9 @@ def complete_refresh(control, operation, context, backend):
     original = json.loads(raw)
     document = control.read("development/attempts/" + original["inputs"]["attempt"] + "/compose.json")
     history = terminal_context(control, original, document)
-    qualified, binding = qualified_backend(control, "resume/attempts/" + context["resume"], request, backend)
+    qualified, binding = qualified_backend(
+        control, "resume/attempts/" + context["resume"], request, backend,
+        runtime_config_sha256=history["request"]["observation"]["runtime_config_sha256"])
     terminal.complete(control, operation, backend["Id"], history, qualified)
     operation["receipt"].update(app_source=binding["app_source"], helper_source=binding["helper_source"],
                                 helper_transition_manifest_sha256=binding["transition_manifest_sha256"])
