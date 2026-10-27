@@ -13,10 +13,84 @@ import {
   onlineDocsUrl,
   parseDocsMessage,
   probeDocs,
+  resolveFramedDocPath,
   themeMessage,
   type DocsAvailability,
+  type DocsTheme,
 } from "../model/docs";
 import { startScreenStore } from "../model/startScreenState";
+
+const EMBED_FALLBACK_STYLE_ID = "fullmag-embed-fallback-style";
+const EMBED_FALLBACK_CSS = `
+html[data-fullmag-embedded] .fm-header-build-stamp,
+html[data-fullmag-embedded] .mode-select,
+html[data-fullmag-embedded] #announcement,
+html[data-fullmag-embedded] .announcement {
+  display: none !important;
+}
+`;
+
+function syncSameOriginDocsDocument(
+  frame: HTMLIFrameElement | null,
+  theme: DocsTheme,
+): string | null {
+  if (!frame) return null;
+  try {
+    const doc = frame.contentDocument;
+    const win = frame.contentWindow;
+    if (!doc || !win || !doc.documentElement) return null;
+
+    const root = doc.documentElement;
+    root.dataset.fullmagEmbedded = "";
+    root.dataset.theme = theme;
+    root.style.colorScheme = theme;
+
+    const pygmentsDark = doc.getElementById("pygments_dark_css") as HTMLLinkElement | null;
+    if (pygmentsDark) {
+      pygmentsDark.removeAttribute("media");
+      pygmentsDark.disabled = theme !== "dark";
+    }
+
+    if (doc.head && !doc.getElementById(EMBED_FALLBACK_STYLE_ID)) {
+      const style = doc.createElement("style");
+      style.id = EMBED_FALLBACK_STYLE_ID;
+      style.textContent = EMBED_FALLBACK_CSS;
+      doc.head.appendChild(style);
+    }
+
+    doc.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((anchor) => {
+      const rawHref = anchor.getAttribute("href");
+      if (
+        !rawHref ||
+        rawHref.startsWith("#") ||
+        rawHref.startsWith("mailto:") ||
+        rawHref.startsWith("tel:") ||
+        rawHref.startsWith("javascript:")
+      ) {
+        return;
+      }
+      try {
+        const resolvedUrl = new URL(rawHref, win.location.href);
+        if (
+          (resolvedUrl.protocol === "http:" || resolvedUrl.protocol === "https:") &&
+          resolvedUrl.origin !== win.location.origin
+        ) {
+          anchor.setAttribute("target", "_blank");
+          anchor.setAttribute("rel", "noopener noreferrer");
+        }
+      } catch {
+        // Ignore malformed relative hrefs.
+      }
+    });
+
+    if (win.location.pathname && win.location.pathname !== "about:blank") {
+      return resolveFramedDocPath(win.location.pathname, win.location.search);
+    }
+  } catch {
+    // Ignore cross-origin or uninitialized frame errors.
+  }
+  return null;
+}
 
 /**
  * The documentation inside the app. The query box drives Sphinx's own search
@@ -45,6 +119,10 @@ export function DocsSection() {
 
   // The framed site is same-origin; address it explicitly rather than with "*".
   const sendTheme = useCallback(() => {
+    const resolvedPath = syncSameOriginDocsDocument(frameRef.current, theme);
+    if (resolvedPath) {
+      setPagePath(resolvedPath);
+    }
     frameRef.current?.contentWindow?.postMessage(themeMessage(theme), window.location.origin);
   }, [theme]);
 

@@ -1662,6 +1662,87 @@ impl SessionStore {
         Ok(PreparationReceiptCommitDisposition::Accepted)
     }
 
+    /// Publish the prepared-state observation of one task under the active
+    /// preparation lease that owns the task's preparation (ADR 0071). Every
+    /// referenced CAS object must already exist; the record is immutable.
+    pub fn commit_task_prepared_observation_with_preparation_lease(
+        &self,
+        record: &FmsTaskPreparedObservation,
+        resource_id: &str,
+        preparation_attempt_id: &str,
+        lease_token: &str,
+    ) -> Result<PreparationReceiptCommitDisposition> {
+        let relative = record.relative_path()?;
+        for value in [resource_id, preparation_attempt_id, lease_token] {
+            validate_store_id(value)?;
+        }
+        let _writer_lease = self.write_transaction()?;
+        let lease = self
+            .read_preparation_resource_lease(&record.run_id, resource_id, lease_token)?
+            .context("prepared observation publication requires a durable resource lease")?;
+        if lease.task_id != record.task_id
+            || lease.preparation_attempt_id != preparation_attempt_id
+            || lease.state != FmsResourceLeaseState::Active
+        {
+            anyhow::bail!(
+                "prepared observation publication is not owned by the active preparation lease"
+            );
+        }
+        if let Some(object_ref) = record
+            .object_refs()
+            .iter()
+            .find(|object_ref| !self.cas().contains(object_ref))
+        {
+            anyhow::bail!("prepared observation references missing CAS object `{object_ref}`");
+        }
+        let path = checked_path(&self.root, &relative)?;
+        if path.exists() {
+            let existing = self
+                .read_task_prepared_observation(&record.run_id, &record.task_id)?
+                .context("prepared observation disappeared during publication")?;
+            if existing.same_immutable_payload(record) {
+                return Ok(PreparationReceiptCommitDisposition::Replayed);
+            }
+            anyhow::bail!(
+                "prepared observation for task `{}` is immutable and cannot be replaced",
+                record.task_id
+            );
+        }
+        self.validate_preparation_resource_lease_owner_unlocked(&lease)?;
+        let path = create_parent(&self.root, &relative)?;
+        atomic_write(&path, &serde_json::to_vec_pretty(record)?)?;
+        Ok(PreparationReceiptCommitDisposition::Accepted)
+    }
+
+    /// Read and validate one task's prepared-state observation record.
+    pub fn read_task_prepared_observation(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<FmsTaskPreparedObservation>> {
+        validate_store_id(run_id)?;
+        validate_store_id(task_id)?;
+        let relative = format!("runs/{run_id}/task_prepared_observations/{task_id}.json");
+        let path = checked_path(&self.root, &relative)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => anyhow::bail!("task prepared observation path is not a file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("checking {relative}")),
+        }
+        let data = crate::repository_path::read_bounded_regular_file(
+            &self.root,
+            &relative,
+            crate::archive_document::MAX_CONTROL_DOCUMENT_BYTES as usize,
+        )?;
+        let record: FmsTaskPreparedObservation = serde_json::from_slice(&data)
+            .with_context(|| format!("parsing task prepared observation {}", path.display()))?;
+        if record.relative_path()? != relative {
+            anyhow::bail!("task prepared observation identity does not match its path");
+        }
+        Ok(Some(record))
+    }
+
     /// Read and validate one immutable accepted-run task receipt.
     pub fn read_task_preparation_receipt(
         &self,

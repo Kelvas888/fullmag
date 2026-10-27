@@ -10,6 +10,14 @@ function controlRoomApiProxyTarget(): string {
   ).replace(/\/+$/, "");
 }
 
+export function controlRoomDocsProxyTarget(): string {
+  return (
+    process.env.FULLMAG_DOCS_PROXY_TARGET ??
+    process.env.FULLMAG_DOCS_URL ??
+    "https://fullmag.mzelent.pl"
+  ).replace(/\/+$/, "");
+}
+
 const staticExport = process.env.FULLMAG_CONTROL_ROOM_STATIC_EXPORT === "1";
 const auditBuild = process.env.NEXT_PUBLIC_AUDIT_BUILD === "1";
 const frontendRoot = process.env.FULLMAG_FRONTEND_ROOT?.trim();
@@ -431,10 +439,15 @@ const nextConfig: NextConfig = {
         },
         async rewrites() {
           const apiTarget = controlRoomApiProxyTarget();
+          const docsTarget = controlRoomDocsProxyTarget();
           return [
             {
               source: "/v2/:path*",
               destination: `${apiTarget}/v2/:path*`,
+            },
+            {
+              source: "/docs/:path*",
+              destination: `${docsTarget}/:path*`,
             },
             // Tab addresses (src/kernel/layout/tabRoutes.ts) all serve the
             // workspace page; the page selects the tab from its address.

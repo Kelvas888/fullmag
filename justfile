@@ -7681,3 +7681,7 @@ docker-dev-nf-common-qualify attempt config_sha256 source_root producer_attempt 
 # Preview/apply the pinned native preclaim fallback; matching fingerprints always refuse apply.
 docker-dev-cancel-preclaim source_root backend_container_id image_id candidate_basename candidate_receipt_sha256 request request_sha256 apply="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_dev_preclaim_cancel.py" --source-root {{quote(source_root)}} --backend-container-id {{quote(backend_container_id)}} --image-id {{quote(image_id)}} --candidate-basename {{quote(candidate_basename)}} --candidate-receipt-sha256 {{quote(candidate_receipt_sha256)}} --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
+
+# Explicit maintenance outside startup, bound to the successful DEV receipt.
+docker-dev-maintain-cache attempt config_sha256 source_root:
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev.py" --repo-root "{{repo_root}}" maintain-cache --attempt {{quote(attempt)}} --config-sha256 {{quote(config_sha256)}} --source-root {{quote(source_root)}}

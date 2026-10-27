@@ -226,3 +226,35 @@ Pełny nowy CI jest nadal wymagany. Windows gh zwrócił HTTP 401; ważności
 logowania nie zakładamy. Odczyt `git ls-remote` potwierdził branch PR na c76e
 oraz nowszy master `cc91b2550767e73f3b059ff94fdff466a77e46ef`.
 Wyniki, FMS, cache, grupa 3203 i pełny zakres E0–E12 pozostają zachowane.
+
+
+## Zapis fragmentu i druga aktualizacja mastera
+
+Poprawki powyższych fixture zapisano w
+`bb0afabe56c4d451b4ed666899bf3dff72c5a07a`.
+Master `cc91b2550767e73f3b059ff94fdff466a77e46ef` scalono bez konfliktów
+w `226ec9f7e5afd50d18b7c65cb73b251f4a61cfa8` i wypchnięto do gałęzi PR.
+Systemowy odczyt GitHub CLI potwierdził ważne logowanie keyring; wcześniejszy
+HTTP 401 wystąpił w ograniczonym środowisku polecenia i nie dowodził wygaśnięcia
+systemowego logowania. Nie było potrzeby resetowania danych uwierzytelnienia.
+
+Podczas tej operacji master przesunął się do
+`0e5d179d42e70d7f94662f1e8f40ceb93f140f7a` (m.in. prepared FEM observations,
+compute-fields evaluation, dokumentacja lokalna i shared build storage).
+Integracja wymagała pięciu rozstrzygnięć konfliktów: zachowanie obu recept
+justfile, obu akcji CLI, sumy list testów z zachowaniem scope/oracle,
+spójnych subpath mountów cache oraz regresji Next config z obu gałęzi.
+Wąska regresja launchera: 56/56 PASS, parser justfile i Python PASS;
+Next config 21/21 PASS i ESLint PASS. Logi w control volume:
+`verification/pr247-master0e5d-20261027/`, frontend:
+`verification/master-merge-0e5d179d-20261027/`.
+Zintegrowane źródła nie oznaczają uruchomienia nowej polityki cache ani nowego
+pakietu runtime. Nie wykonano cleanup, migracji storage, restartu ani Solve.
+Testy i przegląd nie zastępują wymaganego nowego CI oraz buildu runtime.
+
+Test cache po scaleniu: 21/21 PASS oraz macierz subpath 10/10 PASS;
+wszystkie regresje obu rodziców zachowane. Niezależny przegląd launchera:
+0 Required/Blocker, 68 modułów stanowi sumę obu list. Raporty:
+`verification/pr247-master0e5d-20261027/backend-cache-conflict-review.json`
+(SHA256 `11c2d37913430efaa96927e937dcf7b9d45aa787e312aa7647aa3060f7fb8e10`)
+oraz `verification/master-merge-0e5d179d-20261027/launcher-merge-review.json`.
