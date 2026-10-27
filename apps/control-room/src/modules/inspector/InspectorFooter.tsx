@@ -24,10 +24,11 @@ export function InspectorFooter({
   const [error, setError] = useState<string | null>(null);
   const busy = operation !== null || !!session?.applying;
   const message = session?.lockReason
-    ?? (staged ? actions.applyReason ?? "Changes ready to apply"
+    ?? (staged ? actions.applyReason ?? "Draft ready to apply"
       : live ? "Display changes apply immediately"
       : session?.mode === "immediate" ? "Use the actions in this panel"
       : "No staged edits in this view");
+  const modeLabel = staged ? "Draft" : live ? "Live" : session?.mode === "immediate" ? "Immediate" : null;
 
   async function run(action: "apply" | "reset") {
     if (!session || inFlight.current || busy || (action === "apply" ? !actions.canApply : !actions.canReset)) return;
@@ -85,7 +86,9 @@ export function InspectorFooter({
           </Button>
         ) : null}
       </div>
-      <p className="fm-inspector__action-reason" id={reasonId}>{message}</p>
+      <p className="fm-inspector__action-reason" id={reasonId}>
+        {modeLabel ? <><strong>{modeLabel}</strong> · </> : null}{message}
+      </p>
       {error ? <p className="fm-inspector__action-error" role="alert">{error}</p> : null}
     </footer>
   );

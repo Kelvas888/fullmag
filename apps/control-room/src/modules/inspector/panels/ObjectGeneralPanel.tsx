@@ -924,28 +924,32 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
             <FieldRow label="Region" value={object.region} />
           </>
         )}
-        {object.mode === "committed" && visualizationSettings ? (
-          <>
-            <FormField
-              label="Primitive color"
-              mono={false}
-              type="text"
-              value={visualizationSettings.primitiveMonoColor ?? ""}
-              hint="Viewport-local primitive preference; a solid shader override takes precedence."
-              onChange={(event) => patchObjectColor("primitiveColor", event.target.value)}
-            />
-            <FieldRow label="Preview color" value={primitiveColor?.color ?? "unavailable"} />
-            <FieldRow label="Preview color source" value={primitiveColor?.source ?? "unavailable"} />
-            <FormField
-              label="Frame color"
-              mono={false}
-              type="text"
-              value={visualizationSettings.wireframeColor}
-              onChange={(event) => patchObjectColor("frameColor", event.target.value)}
-            />
-          </>
-        ) : null}
       </InspectorGroup>
+
+      {object.mode === "committed" && visualizationSettings ? (
+        <InspectorGroup title="Viewport display" badge="Live" collapsible defaultOpen>
+          <p className="fm-inspector-form-field__hint">
+            Display colors apply immediately and are not affected by the draft Apply or Revert.
+          </p>
+          <FormField
+            label="Primitive color"
+            mono={false}
+            type="text"
+            value={visualizationSettings.primitiveMonoColor ?? ""}
+            hint="Viewport-local primitive preference; a solid shader override takes precedence."
+            onChange={(event) => patchObjectColor("primitiveColor", event.target.value)}
+          />
+          <FieldRow label="Preview color" value={primitiveColor?.color ?? "unavailable"} />
+          <FieldRow label="Preview color source" value={primitiveColor?.source ?? "unavailable"} />
+          <FormField
+            label="Frame color"
+            mono={false}
+            type="text"
+            value={visualizationSettings.wireframeColor}
+            onChange={(event) => patchObjectColor("frameColor", event.target.value)}
+          />
+        </InspectorGroup>
+      ) : null}
 
       {!antennaWithoutMagnetization ? <InspectorGroup title="Energies" badge={metricsModel.status} collapsible defaultOpen>
         <FieldRow label="Fetch state" value={objectMetrics.status} />
