@@ -1,6 +1,6 @@
 /* Embedded Control Room documentation overrides.
  * Scoped strictly to html[data-fullmag-embedded] so the standalone public
- * documentation portal (https://fullmag.mzelent.pl/) remains unchanged.
+ * documentation portal (https://fullmag.mzelent.pl/) retains its full chrome.
  */
 html[data-fullmag-embedded] {
   --header-height: 0px !important;
