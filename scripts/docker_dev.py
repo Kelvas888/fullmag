@@ -2563,6 +2563,8 @@ def _parser() -> argparse.ArgumentParser:
     frontend_refresh.add_argument("--config-sha256", required=True)
     frontend_refresh.add_argument("--source-root", type=Path, required=True)
     frontend_refresh.add_argument("--port", type=int, required=True)
+    frontend_refresh.add_argument("--frontend-frozen-resume")
+    frontend_refresh.add_argument("--frontend-frozen-resume-sha256")
     run_script_parser = subparsers.add_parser(
         "run-script",
         help="run one script in the managed DEV group and observe its result; keep API/frontend running",

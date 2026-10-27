@@ -78,5 +78,36 @@ class DevelopmentRecoveryShellTests(unittest.TestCase):
 
 
 
+
+    def test_frontend_frozen_refresh_uses_exact_structured_arguments(self):
+        source = "/selected/$(printf injected);worktree"
+        recipe = ('python "/ignored/scripts/docker_dev.py" --repo-root "/ignored" '
+                  "refresh-frontend-volume --attempt '" + "a" * 32 + "' --config-sha256 '" + "b" * 64
+                  + "' --source-root '" + source + "' --port '3203'")
+        suffix = (" --frontend-frozen-resume '" + "c" * 32
+                  + "' --frontend-frozen-resume-sha256 '" + "d" * 64 + "'")
+        for tail in ("", suffix):
+            with self.subTest(tail=tail):
+                result = self.dispatch(recipe + tail, marker='  *"scripts/docker_dev.py"*)\n')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = [b'/recorded/python', b'/registered/checkout/scripts/docker_dev.py',
+                            b'--repo-root', b'/registered/checkout', b'refresh-frontend-volume',
+                            b'--attempt', b'a' * 32, b'--config-sha256', b'b' * 64,
+                            b'--source-root', source.encode(), b'--port', b'3203']
+                if tail:
+                    expected += [b'--frontend-frozen-resume', b'c' * 32,
+                                 b'--frontend-frozen-resume-sha256', b'd' * 64]
+                self.assertEqual(result.stdout.split(b'\0')[:-1], expected)
+        for tail in (" --frontend-frozen-resume '" + "c" * 32 + "'",
+                     " --frontend-frozen-resume-sha256 '" + "d" * 64 + "'",
+                     suffix + " --unexpected value", suffix + "; printf injected",
+                     suffix + " && printf injected", suffix + "\nprintf injected",
+                     suffix.replace("c" * 32, "$(printf injected)")):
+            with self.subTest(tail=tail):
+                result = self.dispatch(recipe + tail, marker='  *"scripts/docker_dev.py"*)\n')
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(result.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()

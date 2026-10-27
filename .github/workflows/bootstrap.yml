@@ -857,6 +857,9 @@ jobs:
           python -B scripts/test_docker_prestart_resume.py -v
           python -B scripts/test_docker_volume_prestart_recovery.py -v
           python -B scripts/test_docker_terminal_prestart_recovery.py -v
+          python -B scripts/test_docker_frontend_frozen_recovery.py -v
+          python -B scripts/test_docker_helper_source_transition.py -v
+          python -B scripts/test_just_development_recovery_shell.py -v
           python -B scripts/test_docker_volume_reconcile.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v

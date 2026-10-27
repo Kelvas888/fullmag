@@ -570,3 +570,69 @@ trzech linii i entrypointów bez Blocker/Required. Lokalna próba uruchomienia
 nie ma PyYAML. Istniejący workflow CI instaluje przypięte PyYAML przed jego
 własnym testem. Nie zmieniono obrazu ani wymagań dla tej korekty; wynik
 walidacji workflow w nowym CI pozostaje wymagany.
+
+
+## Resume po recovery: backend działa, frontend wymaga odrębnej naprawy
+
+Dla źródeł `c1d0abd675060a3dc5835708f9e85449cc54f40b` kanoniczne apply
+terminal-only recovery zakończyło się `failed-confirmed`, bez zmiany historii
+naukowej. Terminal c037 ma SHA256
+`fd81c95e39a30641cbb74ef3eb971362308ae188872ba9796b82b0ebbe307a3b`.
+Uruchomiono dokładnie jeden managed resume:
+`42c26e8726dd472780391b98cde2a33b`. Build backendu zakończył się exit0
+po 1463739 ms. API health i status zwracają 200, oryginalna scena rev1,
+logiczna sesja i terminalny run62d pozostały zachowane. Nie wykonano Solve.
+
+Nowy sealed package receipt ma SHA256
+`6bb4a36e630c21dfd1301b65b16dc8b12474a6dbb1eb284b55096b328dd2733c`,
+provenance `8278e8437bac6eaade84705f2f5f39812ab9ee4a8160f9ea9d469712c38220ac`.
+Backend to ten sam kontener
+`cc32cb682ae597e3f6c5e52c5e4372fbfa85a8ec1219bf830e3391b94a43bd1b`,
+StartedAt `2026-10-27T21:32:20.056049729Z`. Obraz zachowany.
+Rzeczywista natywna kontrola działającego API przez niezmieniony adapter50d
+przeszła po 51,101 s: wszystkie dane naukowe, baseline i dwa held intents
+zachowane, zero aktywnych rezerwacji. To odczyt/preservation proof,
+nie kwalifikacja fizyki ani zakończenie całego resume.
+
+Frontend zakończył się exit1 (bez OOM): jego zamrożony source commit
+`540677ddb19452c5ffbdbb63db93c006da950c2f` i seed zależności nie odpowiadają
+aktualnym źródłom. Resume42 ma zatem stan
+`outcome-unknown-resources-retained`; owner i dane pozostają zachowane.
+Nie wolno przedstawić udanego buildu backendu jako sukcesu aplikacji.
+Naprawa musi użyć failure-only reconcile oraz jawnego frontend-only refresh,
+z zachowaniem backendu i przypiętym rozdzieleniem źródeł aplikacji i helpera.
+Nie osłabiono `_source_matches` ani nie skasowano frozen manifestu.
+Przegląd przygotowanej poprawki wykazał też konieczność obsługi pinów
+przez ścisły wrapper recepty `just`; stan naprawy pozostaje NOT VERIFIED.
+
+Po uruchomieniu nowego API sprawdzono 19 GET przez kanoniczną ścieżkę Saved:
+discovery, revision, member, artifacts, trzy datasets, pełne FMDS V/J/H,
+geometrię, topologię i support. Wszystkie odpowiedzi 200. Sprawdzono exact
+owner/revision/descriptor, zakresy, sumy kontrolne i skończoność danych.
+H: 1145x3 A/m, J: 7424x3 A/m^2 na nośniku cell-local, V: 677x1 V.
+Surowe payloady są identyczne z zachowanym wynikiem; H ma SHA256
+`39a339762e9a80c5374cef4218a93fc48a4b37d77d4091884f4f91edea1ba115`.
+Odzyskany run5654 nadal Failed/unassessed i inspection-only.
+Geometria H: 1145 węzłów i 6428 Tet4; sprawdzono binarne body i maskę,
+nie nadano nowej kwalifikacji representation lub naukowej.
+
+Dowody są w control volume pod
+`verification/terminal-prestart-recovery-20261027/`:
+`post-build-api-observation.json`, `post-build-live-native-observation.json`,
+`post-build-saved-metadata.json`, `post-build-saved-datasets.json`,
+`post-build-saved-fields-and-geometry.json`,
+`post-build-saved-binary-read-summary.json` oraz zachowane binarne body.
+Rzeczywiste renderowanie Saved/WebGL i przekrój UI pozostają NOT VERIFIED.
+
+CI dla c1: Python nie przeszedł jednego nowo włączonego testu, który używał
+nieistniejącego `/workspace` na runnerze GitHub przed wejściem w mock.
+Minimalna poprawka fixture wskazuje rzeczywisty checkout i zachowuje wszystkie
+asercje source refusal/frontend-only/no producer. Stary przypadek odtworzył
+błąd; kandydat przeszedł 39/39 interpretowanych przypadków przy diagnostycznie
+wymuszonym braku `/workspace`. Scratch diagnostyki znajduje się w exec control
+volume, ponieważ kontenerowe `/tmp` ma noexec; nie zmieniono mount policy.
+Dowód `ci-boris-source-fixture-diagnostic-exec.json` SHA256
+`23fa8d2c5e9f7db8d2eda8be4e178b14a1a7fd09920aa0cb37394d5dbe38023c`.
+To lokalny interpreted diagnostic, nie nowy zielony CI. Rust job122483372274 (workflow40587504104)
+pozostaje w toku na ostatnim odczycie. PR #247 pozostaje otwarty i niescalony;
+pełny zakres E0-E12, kwalifikowana baza/LLG, BORIS i publikacja są otwarte.

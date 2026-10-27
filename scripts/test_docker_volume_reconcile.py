@@ -547,9 +547,10 @@ class BorisPreproducerRefusalTests(unittest.TestCase):
         from unittest.mock import patch
         import docker_boris_volume as boris
         import docker_dev, docker_volume_activate, docker_volume_dev, docker_dev_codegen, docker_backend_volume_cache
+        source_root=Path(__file__).resolve().parents[1]
         for restore_fails in (False,True):
             document={'name':'fullmag-test'}
-            original={'compose_project':'fullmag-test','inputs':{'source_root':'/workspace','image_id':'image'}}
+            original={'compose_project':'fullmag-test','inputs':{'source_root':str(source_root),'image_id':'image'}}
             operation={'receipt':{'attempt':'b'*32},'root':'boris-reference/attempts/'+'b'*32}
             class Control:
                 project='fullmag-test'
@@ -565,8 +566,8 @@ class BorisPreproducerRefusalTests(unittest.TestCase):
                 observed.append(argv)
                 if argv[0]=='start' and restore_fails:raise boris.ControlOutcomeUnknown('injected restore timeout')
                 return SimpleNamespace(stdout=b'',returncode=0)
-            args=SimpleNamespace(attempt='a'*32,config_sha256=boris.hashlib.sha256(boris.canonical(document)).hexdigest(),reference_asset_image_id=boris.ASSET,maximum_build_seconds=1,repo_root=Path('/workspace'),source_root=Path('/workspace'))
-            replacements=[(docker_dev,'_require_native_windows',lambda:None),(docker_dev,'_select_source',lambda *a:(Path('/workspace'),{})),(docker_dev,'_compose_identity',lambda *a:{}),
+            args=SimpleNamespace(attempt='a'*32,config_sha256=boris.hashlib.sha256(boris.canonical(document)).hexdigest(),reference_asset_image_id=boris.ASSET,maximum_build_seconds=1,repo_root=source_root,source_root=source_root)
+            replacements=[(docker_dev,'_require_native_windows',lambda:None),(docker_dev,'_select_source',lambda *a:(source_root,{})),(docker_dev,'_compose_identity',lambda *a:{}),
                 (docker_volume_activate,'_linked_runtime_terminals',lambda *a,**k:[{}]),(docker_volume_activate,'_validate_running_group',lambda *a,**k:('backend','frontend')),
                 (docker_volume_dev,'_assert_private_restart_network',lambda *a:None),(docker_volume_dev,'_retained_startup_enabled',lambda *a:False),
                 (docker_dev_codegen,'_backend_documents',lambda *a:({}, {}, 'sha',None)),(docker_dev_codegen,'_validate_backend',lambda *a:({},None,None)),(docker_dev_codegen,'_probe_source',lambda *a:({},None)),(docker_dev_codegen,'_source_matches',lambda *a:False),

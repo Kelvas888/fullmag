@@ -6045,10 +6045,10 @@ def _verified_frontend_recovery_image(control, selected):
     return parent, witness
 
 
-def _frontend_recovery_backend_observation(backend_id):
+def _frontend_recovery_backend_observation(backend_id, *, allow_empty=False):
     """Read only process incarnations and public session identity, never owner secrets."""
     import docker_dev_codegen as codegen
-    probe = r'''import json,os,pathlib,urllib.request
+    probe = 'ALLOW_EMPTY=' + repr(allow_empty) + '\n' + r'''import json,os,pathlib,urllib.request
 processes=[]
 for entry in pathlib.Path('/proc').iterdir():
  if not entry.name.isdigit():continue
@@ -6061,15 +6061,20 @@ for entry in pathlib.Path('/proc').iterdir():
 if sum(pathlib.Path(p['executable']).name=='fullmag-api' for p in processes)!=1:raise RuntimeError('Expected one live API process')
 with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5) as r:
  health=json.load(r)
- if r.status!=200 or health.get('status')!='ok' or health.get('active_session') is not True:raise RuntimeError('Backend API has no healthy retained session')
+ if r.status!=200 or health.get('status')!='ok' or (health.get('active_session') is not True and not (ALLOW_EMPTY and health.get('active_session') is False)):raise RuntimeError('Backend API has no healthy retained session')
  api=r.headers.get('x-fullmag-api-instance')
+if ALLOW_EMPTY and health['active_session'] is False:
+ if not api:raise RuntimeError('API incarnation is incomplete')
+ print(json.dumps({'processes':sorted(processes,key=lambda p:p['pid']),'api_instance_id':api,
+  'active_session':False,'session':None,'run_id':None,'scene_revision':None}))
+ raise SystemExit(0)
 with urllib.request.urlopen('http://127.0.0.1:8081/v2/sessions/current/status',timeout=5) as r:
  status=json.load(r)
  if r.status!=200 or not api or r.headers.get('x-fullmag-api-instance')!=api:raise RuntimeError('API incarnation changed')
  session=status.get('session')
- if not isinstance(session,dict):raise RuntimeError('Expected the retained authoring session')
- identity={k:session.get(k) for k in ('session_id','session_epoch','request_scope_epoch')}
- if not all(isinstance(v,str) and v for v in identity.values()):raise RuntimeError('Session identity is incomplete')
+ if not isinstance(session,dict) and not (ALLOW_EMPTY and session is None and health['active_session'] is False):raise RuntimeError('Expected the retained authoring session')
+ identity={k:session.get(k) for k in ('session_id','session_epoch','request_scope_epoch')} if session is not None else None
+ if identity is not None and not all(isinstance(v,str) and v for v in identity.values()):raise RuntimeError('Session identity is incomplete')
  resources=status.get('resources')
  if not isinstance(resources,dict) or type(resources.get('scene_revision')) is not int or resources['scene_revision']<0:raise RuntimeError('Scene revision is incomplete')
  run=status.get('run')
@@ -6103,7 +6108,7 @@ def _frontend_refresh_document(document, volume, inputs, *, frontend_image=None)
 
 
 def _refresh_frontend_services(control, args, previous_root, previous, document, selected,
-                               layout, actual, ids, image, operator_probe_record, *, recover_oom=False):
+                               layout, actual, ids, image, operator_probe_record, *, recover_oom=False, frozen_context=None):
     """Create a new DEV handoff by replacing only the frontend generation."""
     import docker_dev_codegen as codegen
     from docker_development_inputs import describe, frontend_view
@@ -6135,6 +6140,9 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
     frontend_image = document['services']['frontend'].get('image', image)
     image_witness = None
     backend_observation = None
+    if frozen_context is not None:
+        from docker_volume_frontend_frozen_recovery import backend_observation
+        backend_observation_pin = backend_observation(ids['backend'])
     if recover_oom:
         frontend_image, image_witness = _verified_frontend_recovery_image(control, selected)
         backend_observation = _frontend_recovery_backend_observation(ids['backend'])
@@ -6155,10 +6163,24 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
                 raise BuildControlError('OOM frontend state changed before controlled recreation')
             if _frontend_recovery_backend_observation(ids['backend']) != backend_observation:
                 raise BuildControlError('Backend processes/session changed during frontend recovery')
+        if frozen_context is not None and backend_observation(ids['backend']) != backend_observation_pin:
+            raise BuildControlError('Terminal backend observation changed during frontend refresh')
         _assert_private_restart_network(current, {'backend': ids['backend'], 'frontend': frontend_id}, control.project)
         return current
     health_script = "import json,urllib.request\nwith urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5) as r:\n value=json.load(r)\n if r.status!=200 or value.get('status')!='ok' or value.get('active_session') is not False:raise RuntimeError('Frontend refresh requires an empty healthy API')\n print(json.dumps(value))"
+    def source_matches(probe, backend_source, package):
+        if frozen_context is None:
+            return codegen._source_matches(probe, backend_source)
+        from docker_volume_frontend_frozen_recovery import source_qualification
+        source_qualification(control, frozen_context['request'], actual['backend'],
+                             probe, backend_source, package['source'])
+        return True
     def healthy_idle():
+        if frozen_context is not None:
+            value = backend_observation(ids['backend'])
+            if value != backend_observation_pin:
+                raise BuildControlError('Terminal backend observation changed during frontend refresh')
+            return value
         if recover_oom:
             return _frontend_recovery_backend_observation(ids['backend'])
         return json.loads(docker_text('exec', ids['backend'], '/usr/local/bin/python3', '-B', '-c', health_script))
@@ -6168,6 +6190,8 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
     if recover_oom:
         inputs.update(frontend_recovery_image_id=frontend_image, frontend_recovery_image_witness=image_witness,
                       selected_source_qualification='NOT VERIFIED')
+    if frozen_context is not None:
+        inputs['helper_transition'] = frozen_context['request']['source_transition']
     inputs.pop('attempt', None)
     inputs.pop('config_sha256', None)
     with control.operation('development', inputs) as operation:
@@ -6175,6 +6199,11 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
         operation['receipt'].update(state='validating-frontend-refresh', state_root=str(state),
             backend_volumes=previous['backend_volumes'], previous_frontend_volume=previous['frontend_volume'])
         inspect_services(ids['frontend']); healthy_idle()
+        if frozen_context is not None:
+            from docker_volume_frontend_frozen_recovery import refresh_context
+            repeated = refresh_context(control, args, previous, document, actual)
+            if repeated != frozen_context:
+                raise BuildControlError('Frozen frontend proof changed under refresh lease')
         try:
             package, provenance, package_sha, binary_provenance = codegen._backend_documents(ids['backend'])
             backend_source, _, _ = codegen._validate_backend(package, provenance, package_sha, binary_provenance)
@@ -6185,7 +6214,7 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
             if error.reconciliation_required:
                 raise ControlOutcomeUnknown(str(error)) from error
             raise
-        if not recover_oom and not codegen._source_matches(source_probe, backend_source):
+        if not recover_oom and not source_matches(source_probe, backend_source, package):
             raise BuildControlError('Frontend refresh requires the current native source capture; run the canonical idle restart first')
         desired = describe(selected, args.port)
         control.write(operation['root'] + '/rollback-compose.json', document)
@@ -6204,7 +6233,7 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
         healthy_idle()
         if not recover_oom:
             source_probe, _ = codegen._probe_source(ids['backend'], operation['receipt']['attempt'])
-            if not codegen._source_matches(source_probe, backend_source):
+            if not source_matches(source_probe, backend_source, package):
                 raise BuildControlError('Backend source changed after frontend quiescence')
         seeded, volume = _frontend(control, operation, selected, state, args.port, frontend_image)
         if seeded['files'] != desired['files']:
@@ -6251,7 +6280,7 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
             again_probe, _ = codegen._probe_source(ids['backend'], operation['receipt']['attempt'])
         if (again_package != package or again_provenance != provenance or again_sha != package_sha
                 or again_binary != binary_provenance
-                or (not recover_oom and not codegen._source_matches(again_probe, backend_source))
+                or (not recover_oom and not source_matches(again_probe, backend_source, package))
                 or describe(selected, args.port)['files'] != seeded['files']
                 or read_owned_regular(certificate_path) != certificate
                 or read_owned_regular(owner_path) != owner):
@@ -6268,6 +6297,11 @@ def _refresh_frontend_services(control, args, previous_root, previous, document,
                 selected_source_qualification='NOT VERIFIED', backend_observation=backend_observation,
                 frontend_generation_changed=True, frontend_image_id=frontend_image,
                 replaced_frontend_container=ids['frontend'], frontend_oom_state=oom_state)
+        if frozen_context is not None:
+            from docker_volume_frontend_frozen_recovery import complete_refresh
+            complete_refresh(control, operation, frozen_context, final['backend'])
+            operation['receipt']['frontend_frozen_resume'] = {
+                'attempt': frozen_context['resume'], 'terminal_sha256': frozen_context['terminal_sha256']}
         operation['receipt'].update(frontend_volume=volume, backend_container=ids['backend'],
             frontend_container=frontend_id, backend_started_at=backend_pin[0], config_sha256=new_config_sha,
             source_commit=backend_source['commit'], source_digest=backend_source['source_digest'],
@@ -6627,8 +6661,10 @@ def _retained_operation(
         return _refresh_frontend_services(control, args, previous_root, previous, document, selected,
             layout, actual, ids, image, operator_probe_record, recover_oom=True)
     if refresh_frontend_service:
+        from docker_volume_frontend_frozen_recovery import refresh_context
+        frozen_context = refresh_context(control, args, previous, document, actual)
         return _refresh_frontend_services(control, args, previous_root, previous, document, selected,
-            layout, actual, ids, image, operator_probe_record)
+            layout, actual, ids, image, operator_probe_record, frozen_context=frozen_context)
     if (previous.get('state') == 'succeeded' and not recreate_services
             and not restart_idle_service and not getattr(args, 'restart_backend', False)):
         return _resume_oom_frontend(control, args, document, actual, ids, selected)
