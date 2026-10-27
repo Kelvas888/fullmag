@@ -1360,6 +1360,12 @@
   font-size: var(--fm-inspector-control-font-size);
 }
 
+.fm-inspector [data-slot="visualization-color-control"] > input[type="color"] {
+  width: var(--fm-inspector-control-height);
+  height: var(--fm-inspector-control-height);
+  border-radius: var(--fm-inspector-control-radius);
+}
+
 .fm-inspector [data-slot="visualization-color-control"] > input[type="text"] {
   height: var(--fm-inspector-control-height);
   min-height: var(--fm-inspector-control-height);
