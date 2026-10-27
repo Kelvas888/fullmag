@@ -3986,9 +3986,7 @@ fn consume_worker_control_commands_with_inbox(
             fullmag_application::WorkerCommand::Heartbeat {
                 lease_heartbeat_sequence,
             } => {
-                inbox
-                    .receive(&command, |_| Ok(()))
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                inbox.receive_control(&command, |_| Ok(()))?;
                 // Keep recovery, duplicate detection, and ACK publication under
                 // one writer fence so Completing cannot stale this watermark.
                 let _transaction = retry_store_writer_busy(|| store.write_transaction())?;
@@ -4018,12 +4016,10 @@ fn consume_worker_control_commands_with_inbox(
                 acknowledged_heartbeat_count += 1;
             }
             fullmag_application::WorkerCommand::Stop { .. } => {
-                inbox
-                    .receive(&command, |_| {
-                        interrupt_requested.store(true, Ordering::Release);
-                        Ok(())
-                    })
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                inbox.receive_control(&command, |_| {
+                    interrupt_requested.store(true, Ordering::Release);
+                    Ok(())
+                })?;
                 return Ok(WorkerControlLoopResult {
                     stop_received: true,
                     acknowledged_heartbeat_count,

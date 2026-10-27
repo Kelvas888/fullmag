@@ -86,6 +86,39 @@ impl DurableWorkerInbox {
         )
     }
 
+    /// Apply only a bounded, in-memory Heartbeat/Stop effect under this inbox's
+    /// writer. Pending and applied checkpoints share that same re-entrant lease,
+    /// so a competing publisher cannot strand a completed control effect.
+    pub fn receive_control<F>(
+        &mut self,
+        envelope: &WorkerCommandEnvelope,
+        execute: F,
+    ) -> anyhow::Result<ProtocolDisposition>
+    where
+        F: FnOnce(&WorkerCommandEnvelope) -> Result<(), ExecutionError>,
+    {
+        if !matches!(
+            &envelope.command,
+            fullmag_application::WorkerCommand::Heartbeat { .. }
+                | fullmag_application::WorkerCommand::Stop { .. }
+        ) {
+            anyhow::bail!("control inbox accepts only Heartbeat or Stop");
+        }
+        let store = &self.store;
+        let claim = &self.claim;
+        // Acquire before changing the in-memory inbox; a typed busy error leaves
+        // its original checkpoint intact. Another SessionStore handle is not
+        // re-entrant and must not own this transaction.
+        let _writer = crate::retry_worker_store_transient(|| store.write_transaction())?;
+        self.inbox
+            .receive_durable(
+                envelope,
+                |checkpoint| persist_checkpoint(store, claim, checkpoint),
+                execute,
+            )
+            .map_err(anyhow::Error::new)
+    }
+
     /// Confirm an externally reconciled pending effect without executing it.
     pub fn confirm_applied(
         &mut self,
@@ -498,6 +531,149 @@ mod tests {
                 claim.run_id.as_str(), &claim.lease.resource_id, claim.lease.lease_token.as_str(),
             ).unwrap(), before_lease);
         }
+    }
+
+    fn control(claim: &TaskClaim, command: WorkerCommand) -> WorkerCommandEnvelope {
+        WorkerCommandEnvelope {
+            schema_version: WORKER_PROTOCOL_SCHEMA.into(),
+            message_id: "worker-control-command".into(),
+            sequence: 2,
+            claim: claim.identity(),
+            command,
+        }
+    }
+
+    fn started_inbox(store: &SessionStore, claim: &TaskClaim) -> DurableWorkerInbox {
+        let mut inbox = DurableWorkerInbox::new(
+            SessionStore::open_existing(store.root()).unwrap(), claim.clone(),
+        );
+        inbox.receive(&start(claim, "worker-control-start"), |_| Ok(())).unwrap();
+        inbox
+    }
+
+    fn read_checkpoint(store: &SessionStore, checkpoint: &WorkerInboxCheckpoint) -> WorkerInboxCheckpoint {
+        let path = fullmag_session::FmsWorkerInboxRecord::new(
+            serde_json::to_value(checkpoint).unwrap(),
+        ).unwrap().relative_path().unwrap();
+        let bytes = store.read_document(&path).unwrap().unwrap();
+        let record: fullmag_session::FmsWorkerInboxRecord = serde_json::from_slice(&bytes).unwrap();
+        record.validate().unwrap();
+        serde_json::from_value(record.payload).unwrap()
+    }
+
+    #[test]
+    fn control_waits_for_native_writer_before_publishing_pending() {
+        let (_directory, store, claim) = fixture();
+        let mut inbox = started_inbox(&store, &claim);
+        let before = inbox.checkpoint();
+        let command = control(&claim, WorkerCommand::Heartbeat { lease_heartbeat_sequence: 1 });
+        let expected = command.clone();
+        let rival = SessionStore::open_existing(store.root()).unwrap();
+        let writer = rival.write_transaction().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let result = inbox.receive_control(&command, |_| Ok(()));
+            result_tx.send((result, inbox.checkpoint())).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(read_checkpoint(&store, &before), before);
+        drop(writer);
+        let (result, after) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(result.unwrap(), ProtocolDisposition::Accepted);
+        worker.join().unwrap();
+        assert!(after.pending.is_none());
+        assert_eq!(after.applied.last(), Some(&expected));
+        assert_eq!(read_checkpoint(&store, &after), after);
+    }
+
+    #[test]
+    fn control_keeps_pending_effect_and_applied_under_one_native_writer() {
+        let (_directory, store, claim) = fixture();
+        let mut inbox = started_inbox(&store, &claim);
+        let before_catalog = store.read_run_catalog(claim.run_id.as_str()).unwrap();
+        let before_lease = store.read_resource_lease(claim.run_id.as_str(),
+            &claim.lease.resource_id, claim.lease.lease_token.as_str()).unwrap();
+        let command = control(&claim, WorkerCommand::Heartbeat { lease_heartbeat_sequence: 1 });
+        let mut effects = 0;
+        assert_eq!(inbox.receive_control(&command, |current| {
+            effects += 1;
+            let pending = read_checkpoint(&store, &WorkerCommandInbox::new(&claim).checkpoint());
+            assert_eq!(pending.pending.as_ref(), Some(current));
+            assert_eq!(pending.applied.len(), 1);
+            let rival = SessionStore::open_existing(store.root()).unwrap();
+            let contender = std::thread::spawn(move || {
+                let error = rival.write_transaction().err().expect("control writer must exclude a rival");
+                assert!(error.chain().any(|cause| cause.is::<fullmag_session::StoreWriterBusy>()));
+            });
+            contender.join().unwrap();
+            Ok(())
+        }).unwrap(), ProtocolDisposition::Accepted);
+        // An ACK-eligible return is possible only after applied is durable.
+        let retained = read_checkpoint(&store, &inbox.checkpoint());
+        assert_eq!(retained.applied.last(), Some(&command));
+        assert!(retained.pending.is_none());
+        assert_eq!(effects, 1);
+        assert_eq!(inbox.receive_control(&command, |_| panic!("replayed heartbeat effect")).unwrap(),
+            ProtocolDisposition::Replayed);
+        assert_eq!(store.read_run_catalog(claim.run_id.as_str()).unwrap(), before_catalog);
+        assert_eq!(store.read_resource_lease(claim.run_id.as_str(),
+            &claim.lease.resource_id, claim.lease.lease_token.as_str()).unwrap(), before_lease);
+        assert!(store.write_transaction().is_ok());
+    }
+
+    #[test]
+    fn control_rejects_start_and_stale_identity_without_effect_or_checkpoint_change() {
+        let (_directory, store, claim) = fixture();
+        let mut inbox = started_inbox(&store, &claim);
+        let before = inbox.checkpoint();
+        let mut foreign = control(&claim, WorkerCommand::Heartbeat { lease_heartbeat_sequence: 1 });
+        foreign.claim.run_id = RunId::parse("run-foreign-control").unwrap();
+        for command in [control(&claim, WorkerCommand::Start), control(&claim, WorkerCommand::Release), foreign] {
+            assert!(inbox.receive_control(&command, |_| panic!("rejected control executed")).is_err());
+            assert_eq!(inbox.checkpoint(), before);
+            assert_eq!(read_checkpoint(&store, &before), before);
+        }
+    }
+
+    #[test]
+    fn control_stop_is_applied_once_before_acknowledgement() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (_directory, store, claim) = fixture();
+        let mut inbox = started_inbox(&store, &claim);
+        let command = control(&claim, WorkerCommand::Stop { reason: "operator stop".into() });
+        let interrupted = AtomicBool::new(false);
+        let effects = AtomicUsize::new(0);
+        assert_eq!(inbox.receive_control(&command, |_| {
+            interrupted.store(true, Ordering::Release);
+            effects.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }).unwrap(), ProtocolDisposition::Accepted);
+        let retained = read_checkpoint(&store, &inbox.checkpoint());
+        assert!(interrupted.load(Ordering::Acquire));
+        assert!(retained.pending.is_none());
+        assert_eq!(retained.applied.last(), Some(&command));
+        assert_eq!(inbox.receive_control(&command, |_| panic!("replayed Stop effect")).unwrap(),
+            ProtocolDisposition::Replayed);
+        assert_eq!(effects.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn control_does_not_reconcile_an_existing_uncertain_command() {
+        let (_directory, store, claim) = fixture();
+        let mut inbox = DurableWorkerInbox::new(
+            SessionStore::open_existing(store.root()).unwrap(), claim.clone(),
+        );
+        let start = start(&claim, "uncertain-worker-start");
+        assert!(inbox.receive(&start, |_| Err(ExecutionError::Invalid("uncertain effect".into()))).is_err());
+        let before = inbox.checkpoint();
+        let command = control(&claim, WorkerCommand::Heartbeat { lease_heartbeat_sequence: 1 });
+        assert!(inbox.receive_control(&command, |_| panic!("uncertain Start was bypassed")).is_err());
+        assert_eq!(inbox.checkpoint(), before);
+        assert_eq!(read_checkpoint(&store, &before), before);
     }
 
     #[test]
