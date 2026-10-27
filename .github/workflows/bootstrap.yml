@@ -111,6 +111,9 @@ jobs:
                   f"FULLMAG_PROJECT_STORAGE_ROOT={layout['storage_root']}\n"
               )
           PY
+      - name: Run terminal Docker recovery contracts
+        run: cargo test -p fullmag-session --lib runtime_service::retained_terminal_runs::tests --no-fail-fast
+
       - name: Run accepted explicit Compute start-gate contracts
         run: |
           cargo test -p fullmag-session --lib accepted_start_gate
@@ -145,6 +148,17 @@ jobs:
 
       - name: Run disconnected mixed-P1 v2 API summary contracts
         run: cargo test -p fullmag-api --bin fullmag-api mixed_v2_summary_tests --no-fail-fast
+
+      - name: Run native container recovery capability CLI contracts
+        run: cargo test -p fullmag-cli --bin fullmag container_recovery_capabilities
+
+      - name: Verify read-only saved FDM playback and binary frame routes
+        run: |
+          cargo test --locked -p fullmag-workspace-inspect --lib
+          cargo test --locked -p fullmag-api --bin fullmag-api saved_playback_routes_return_metadata_and_revision_checked_binary_frames
+
+      - name: Run instance discovery contracts (ADR 0069)
+        run: cargo test -p fullmag-api --bin fullmag-api instance_discovery::tests --no-fail-fast
 
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
@@ -824,6 +838,8 @@ jobs:
           python -B scripts/test_docker_volume_readiness_receipt.py -v
           python -B scripts/test_docker_volume_stop_failed.py -v
           python -B scripts/test_docker_volume_activation_reconcile.py -v
+          python -B scripts/test_docker_volume_offline_reconcile.py -v
+          python -B scripts/test_docker_stopped_network.py -v
           python -B scripts/test_docker_native_failed_recreate.py -v
           python -B scripts/test_docker_retained_recovery_context.py -v
           python -B scripts/test_runtime_service_successor.py -v
@@ -843,6 +859,10 @@ jobs:
           python -B scripts/test_docker_volume_pending_continuation.py -v
           python -B scripts/test_docker_volume_pending_resume.py -v
           python -B scripts/test_docker_prestart_resume.py -v
+          python -B scripts/test_docker_volume_host_device.py -v
+          python -B scripts/test_docker_volume_wsl.py -v
+          python -B scripts/test_linux_native_host.py -v
+          python -B scripts/test_docker_dev_codegen.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_volume_checks.py -v
