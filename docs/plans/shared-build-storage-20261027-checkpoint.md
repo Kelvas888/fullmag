@@ -56,3 +56,9 @@ PR: https://github.com/MateuszZelent/fullmag/pull/285. Pierwsze CI wykryło star
 fixture cache oraz certyfikatu offline; uzupełniono wymagane pola, bez zmiany
 walidatorów. Lokalnie przeszło wszystkich 59 skryptów bramki Docker storage
 z workflow (łącznie z poprawionymi fixture). Końcowe kontrole PR pozostają w toku.
+
+Końcowa bramka Python przeszła testy storage, ale wykryła brak mirroru nowego
+skilla `design-taste-frontend`, dodanego równolegle do mastera w
+`cc91b2550767e73f3b059ff94fdff466a77e46ef`. Zsynchronizowano branch i dodano
+wejście `.github/skills` wskazujące kanoniczną implementację, bez duplikacji
+zasobów lub osłabiania kontroli.
