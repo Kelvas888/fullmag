@@ -418,6 +418,60 @@ class ProjectInventoryScopeTests(unittest.TestCase):
                 ledger_volume="group-ledger")
         return evidence, inventory, validate_network, network_name
 
+    def test_transaction_helper_authenticates_windows_bind_alias_and_access(self) -> None:
+        from copy import deepcopy
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = str(root)
+            if os.name == "nt":
+                source = "/run/desktop/mnt/host/" + root.drive[0].lower() + root.as_posix()[2:]
+            control = SimpleNamespace(project="fullmag-demo", volume="control-volume",
+                                      image=IMAGE, labels={}, identity={},
+                                      _namespace_guard=lambda value: value)
+            host_mounts = [
+                {"Type": "volume", "Source": "control-volume", "Target": "/control",
+                 "ReadOnly": False, "VolumeOptions": {"NoCopy": True}},
+                {"Type": "bind", "Source": source, "Target": "/store", "ReadOnly": True},
+                {"Type": "volume", "Source": "ledger-volume", "Target": "/ledger",
+                 "ReadOnly": True, "VolumeOptions": {"NoCopy": True}},
+            ]
+            row = {"Id": CONTAINER, "Name": "/helper", "Config": {
+                "Image": IMAGE, "Entrypoint": ["/bin/bash"],
+                "Cmd": ["-euo", "pipefail", "-c", "script"],
+                "Labels": {"com.docker.compose.project": "fullmag-demo",
+                           "com.docker.compose.service": "build-control"}},
+                "State": {"Running": True, "Pid": 10},
+                "HostConfig": {"NetworkMode": "none", "Privileged": False,
+                               "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                               "Binds": [], "Mounts": host_mounts},
+                "Mounts": [
+                    {"Destination": "/control", "Name": "control-volume", "RW": True},
+                    {"Destination": "/store", "Source": source, "RW": False},
+                    {"Destination": "/ledger", "Name": "ledger-volume", "RW": False},
+                ]}
+            def check(value):
+                with patch.object(module, "docker_capture", return_value=SimpleNamespace(
+                        stdout=json.dumps([value]).encode())), \
+                        patch("docker_compose_identity.source_labels", return_value={}):
+                    return module._inspect_transaction_helper(
+                        control, "helper", "script", root, "ledger-volume")
+            self.assertEqual(check(row), CONTAINER)
+            for location, key in (("host", "Source"), ("runtime", "Source"),
+                                  ("host", "ReadOnly"), ("runtime", "RW")):
+                changed = deepcopy(row)
+                mount = changed["HostConfig"]["Mounts"][1] if location == "host" else changed["Mounts"][1]
+                mount[key] = str(root / "foreign") if key == "Source" else not mount[key]
+                with self.subTest(location=location, key=key), self.assertRaises(BuildControlError):
+                    check(changed)
+            for bad_source in (None, "", "relative-store"):
+                for location in ("host", "runtime"):
+                    changed = deepcopy(row)
+                    mount = changed["HostConfig"]["Mounts"][1] if location == "host" else changed["Mounts"][1]
+                    mount["Source"] = bad_source
+                    with self.subTest(location=location, source=bad_source), self.assertRaises(BuildControlError):
+                        check(changed)
+
     def test_compose_pair_uses_canonical_hashed_network_for_long_project_name(self) -> None:
         project = "fullmag-worktree-" + "a" * 80
         evidence, inventory, validate_network, network_name = self._invoke_compose_pair(

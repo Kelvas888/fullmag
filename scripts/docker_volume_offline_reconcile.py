@@ -1443,6 +1443,13 @@ def _transaction_mounts(args: list[str], *, store_root: Path, ledger_volume: str
 
 def _inspect_transaction_helper(control, helper_name: str, script: str,
                                 store_root: Path, ledger_volume: str) -> str:
+    from run_managed_browser import host_path
+
+    def store_source_matches(value: object) -> bool:
+        if not isinstance(value, str) or not value or not os.path.isabs(value):
+            return False
+        return host_path(value) == store_root.resolve()
+
     rows = json.loads(docker_capture("inspect", helper_name).stdout)
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
         raise _fail("Offline transaction helper inspection is ambiguous")
@@ -1486,7 +1493,8 @@ def _inspect_transaction_helper(control, helper_name: str, script: str,
         mount = observed.get(target)
         options = mount.get("VolumeOptions") if isinstance(mount, Mapping) else None
         if (not isinstance(mount, Mapping) or mount.get("Type") != mount_type
-                or mount.get("Source") != source
+                or (not store_source_matches(mount.get("Source"))
+                    if target == "/store" else mount.get("Source") != source)
                 or bool(mount.get("ReadOnly", False)) is not readonly
                 or (mount_type == "volume" and (not isinstance(options, Mapping)
                                                    or options.get("NoCopy") is not True))):
@@ -1499,7 +1507,7 @@ def _inspect_transaction_helper(control, helper_name: str, script: str,
                  and mount.get("Destination") == target]
         if (len(found) != 1 or found[0].get("RW") is readonly
                 or (target != "/store" and found[0].get("Name") != source)
-                or (target == "/store" and found[0].get("Source") != source)):
+                or (target == "/store" and not store_source_matches(found[0].get("Source")))):
             raise _fail("Offline transaction helper runtime access differs at " + target)
     return identifier
 
