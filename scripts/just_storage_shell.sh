@@ -346,13 +346,17 @@ case "${recipe}" in
     ;;
   *"scripts/docker_volume_checks.py"*)
     volume_checks_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_checks.py\" --source-root '([^']+)'( --scope '(all|source-capture|frontend-import|frontend-antenna|frontend-visualization|frontend-tools|field-only)')?( --oracle-wheel '([^']+)')?[[:space:]]*$"
-    if [[ ! "${recipe}" =~ ${volume_checks_pattern} ]]; then
+    volume_offline_checks_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_checks.py\" --source-root '([^']+)' --offline --modules '(test_[A-Za-z0-9_]+)'[[:space:]]*$"
+    if [[ "${recipe}" =~ ${volume_offline_checks_pattern} ]]; then
+      volume_checks_args=(--source-root "${BASH_REMATCH[1]}" --offline --modules "${BASH_REMATCH[2]}")
+    elif [[ "${recipe}" =~ ${volume_checks_pattern} ]]; then
+      volume_checks_args=(--source-root "${BASH_REMATCH[1]}" --scope "${BASH_REMATCH[3]:-all}")
+      if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
+        volume_checks_args+=(--oracle-wheel "${BASH_REMATCH[5]}")
+      fi
+    else
       echo "[fullmag just] invalid volume DEV checks recipe" >&2
       exit 2
-    fi
-    volume_checks_args=(--source-root "${BASH_REMATCH[1]}" --scope "${BASH_REMATCH[3]:-all}")
-    if [[ -n "${BASH_REMATCH[5]:-}" ]]; then
-      volume_checks_args+=(--oracle-wheel "${BASH_REMATCH[5]}")
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_volume_checks.py" "${volume_checks_args[@]}"
     ;;

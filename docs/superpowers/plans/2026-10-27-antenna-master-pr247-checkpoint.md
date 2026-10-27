@@ -264,7 +264,7 @@ oraz `verification/master-merge-0e5d179d-20261027/launcher-merge-review.json`.
 
 HEAD `62f222f732bd6c44056673ad0320ff8ab9134c2e` jest wypchnięty i PR #247
 ma stan MERGEABLE. Ostatni odczyt CI: 20 success, 1 failure, 10 skipped,
-1 in progress. Poprawione rodziny Rust i Python przeszły. Jedyny zakończony
+1 in progress. Python przeszedł; cały job Rust nadal trwa, a jego krok polityki inspekcji zamkniętej pętli przeszedł. Jedyny zakończony
 błąd source-contracts to losowy fixture
 `mixed_domain_plan_digest_survives_permuted_full_request_roundtrip`:
 MeshIR serializuje mapę jakości w kolejności BTreeMap, a test szukał fragmentu
@@ -293,3 +293,71 @@ ta próba prawidłowo użyła terminal-session-preflight i drain. Dla niej braku
 obsługi tego wariantu dowodów. Potrzebne są osobny proof, exact config/container/
 history CAS, kontrola braku nowej publikacji, preview i przypięta kontynuacja.
 Nie przedstawiamy nieudanego restartu jako buildu ani działającego API.
+
+
+## Kolejny master i granice recovery terminalnego
+
+Korektę deterministycznego fixture zapisano i wypchnięto jako
+`7ae277614211434ad850702e85e9c4d9df2b2ccb`. Nowy CI tego HEAD blokuje
+konflikt z kolejnym masterem, przypiętym do
+`2fcd70b860341238fce82a67320587d446aaa38d` (helper source pinning,
+automatyczna retencja oraz attestation zapieczętowanych shared binaries).
+Integracja tej wersji jest oddzielona od aktywacji recovery lub migracji grupy.
+
+Istnieje natywny read-only co do lifecycle/publikacji dowód
+`runtime service-inspect-terminal-run`, który bierze blokady host→store,
+sprawdza terminalny katalog, lease, admission i exit receipts oraz zwraca
+`mutations_applied:false` i `solve_replayed:false`. Może potwierdzić run62d;
+nie zastępuje sprawdzenia całej grupy i dwóch held intentów. Wariant terminalnego
+prestartu wymaga ponadto grupowego no-active proof, niezmienionych held intentów
+bez start_release, rzeczywistego baseline oraz exact drain/container/config CAS.
+Nie wolno wstecznie tworzyć saved-authoring checkpointu dla próby c037.
+
+Sterownik WSL odpowiada (`nvidia-smi`: RTX3070 Laptop, driver596.21, 34MiB
+z8192MiB GPU). Po awarii WSL pokazał 13888080KiB MemAvailable; backend miał
+limit8GiB i OOMKilled=false. Te obserwacje nie dowodzą przyczyny SIGKILL hooka
+ani stanu pamięci w chwili jego zabicia. Nie zwiększono limitów, nie zmieniono
+sterowników i nie restartowano współdzielonego Dockera/WSL. Obserwacje oraz
+warianty diagnostyki zapisano w istniejącym control volume jako
+`verification/master-runtime-62f222-20261027/nvidia-prestart-diagnostics.json`.
+
+
+## Weryfikacja integracji 2fcd bez uruchamiania aplikacji
+
+Cztery konflikty rozwiązano zachowując terminal observation, device access,
+completion gate, walidację pod własnym lease oraz nowe piny helpera. Listy
+kontroli są sumą obu gałęzi; stare warianty scope/oracle pozostają.
+Przy uruchomieniu kontroli offline wykryto brak trasy przez just_storage_shell:
+istniejący CLI obsługiwał offline, lecz ścisły wrapper go nie dopuszczał.
+Nie obchodzono tej odmowy. Dodano wąską receptę
+`docker-dev-offline-check <source_root> <module>`: dokładnie jeden moduł
+`test_[A-Za-z0-9_]+`, exec strukturalnych argumentów, bez eval, z odmową
+łączenia z live scope/oracle i shell injection.
+
+Rzeczywiste wykonania nowej recepty w zarządzanych helperach tej samej grupy:
+
+| Moduł | Przypadki | Pominięte | Exit |
+|---|---:|---:|---:|
+| test_just_orphan_recovery_shell | 19 | 0 | 0 |
+| test_docker_volume_checks | 27 | 0 | 0 |
+| test_docker_startup_script | 31 | 0 | 0 |
+| test_docker_helper_source | 13 | 0 | 0 |
+| test_docker_native_failed_recreate | 64 | 0 | 0 |
+| test_docker_volume_pending_resume | 14 | 0 | 0 |
+| test_docker_volume_retained_device_lifecycle | 5 | 0 | 0 |
+| test_fullmag_docker_runtime | 124 | 3 | 0 |
+| test_docker_backend_dev | 91 | 0 | 0 |
+
+Razem 388 przypadków: 385 PASS, 3 oczekiwane skips, 0 FAIL. Każdy receipt
+potwierdza `source_inputs_stable:true`, źródło readonly i control writable.
+Helpery nie mają GPU, sieci, docker socket ani mountów danych użytkownika;
+nie uruchomiono backendu, API, natywnego buildu lub Solve.
+Dowody w control volume:
+`verification/master-runtime-62f222-20261027/offline-test_*.json`.
+Parsery Python/embedded Python/justfile, `bash -n` i diff check PASS.
+To weryfikacja kontraktów źródłowych, nie runtime qualification.
+
+Projekt recovery terminalnej sesji zapisano osobno w
+`2026-10-27-terminal-session-prestart-recovery-proposal.md`.
+Kod nowego wariantu, jego natywny proof/preview, reconcile i rzeczywisty
+managed restart pozostają do wykonania. Nie uznano planu za implementację.

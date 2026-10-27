@@ -231,7 +231,7 @@ class DockerDevelopmentShellBoundaryTests(unittest.TestCase):
 
 
 class DockerVolumeChecksShellBoundaryTests(unittest.TestCase):
-    def dispatch(self, suffix):
+    def dispatch(self, suffix, source_root='/registered/checkout'):
         source = (Path(__file__).resolve().parent / 'just_storage_shell.sh').read_text(encoding='utf8')
         body = source.split('  *"scripts/docker_volume_checks.py"*)\n', 1)[1].split('\n    ;;', 1)[0]
         with tempfile.TemporaryDirectory(prefix='fullmag-checks-shell-') as directory:
@@ -239,7 +239,7 @@ class DockerVolumeChecksShellBoundaryTests(unittest.TestCase):
             script.write_text('import json,sys; print(json.dumps(sys.argv[1:]))\n', encoding='utf8')
             program = ('set -euo pipefail\nrecipe="$RECIPE_LITERAL"\n'
                        'python_cmd="$FIXED_PYTHON"\nscript_dir="$FIXED_SCRIPTS"\n' + body)
-            recipe = 'python "/ignored/scripts/docker_volume_checks.py" --source-root \'/registered/checkout\'' + suffix
+            recipe = f'python "/ignored/scripts/docker_volume_checks.py" --source-root \'{source_root}\'' + suffix
             return subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', program],
                 env={**os.environ, 'RECIPE_LITERAL': recipe, 'FIXED_PYTHON': sys.executable,
                      'FIXED_SCRIPTS': directory}, capture_output=True, text=True, timeout=15)
@@ -252,6 +252,50 @@ class DockerVolumeChecksShellBoundaryTests(unittest.TestCase):
             result = self.dispatch(suffix)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout), ['--source-root', '/registered/checkout', '--scope', scope])
+
+    def test_offline_check_dispatches_exactly_one_module_without_live_scope(self):
+        result = self.dispatch(" --offline --modules 'test_docker_startup_script'")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [
+            '--source-root', '/registered/checkout', '--offline',
+            '--modules', 'test_docker_startup_script',
+        ])
+
+    def test_offline_source_shell_syntax_remains_literal_data(self):
+        source_root = '/selected/$(printf injected);worktree'
+        result = self.dispatch(" --offline --modules 'test_docker_startup_script'", source_root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)[1], source_root)
+
+    def test_offline_check_rejects_mixed_modes_multiple_modules_and_commands(self):
+        for suffix in [
+            " --offline --modules 'test_a' 'test_b'",
+            " --offline --modules 'test_a test_b'",
+            " --offline --modules 'docker_startup_script'",
+            " --offline --modules 'test_a.py'",
+            " --offline --modules 'test_a/escape'",
+            " --offline --modules 'test_a;printf injected'",
+            " --offline --modules 'test_a'; printf injected",
+            " --offline --modules 'test_a' --scope 'all'",
+            " --scope 'all' --offline --modules 'test_a'",
+            " --offline --modules 'test_a' --oracle-wheel '/wheel.whl'",
+            " --oracle-wheel '/wheel.whl' --offline --modules 'test_a'",
+            " --offline --modules",
+            " --offline",
+        ]:
+            with self.subTest(suffix=suffix):
+                result = self.dispatch(suffix)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(result.stdout.strip())
+
+    def test_live_oracle_wheel_dispatch_stays_literal_and_separate(self):
+        wheel = '/control/verification/$(printf injected);oracle.whl'
+        result = self.dispatch(f" --scope 'all' --oracle-wheel '{wheel}'")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [
+            '--source-root', '/registered/checkout', '--scope', 'all',
+            '--oracle-wheel', wheel,
+        ])
 
     def test_rejects_unknown_scope_and_composite_commands(self):
         for suffix in [" --scope 'unknown'", " --scope 'all'; printf injected",

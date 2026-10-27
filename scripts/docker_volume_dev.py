@@ -12,6 +12,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import shlex
 import stat
 import sys
 import time
@@ -36,6 +37,41 @@ def _session_host():
     else:
         import linux_native_host as host
     return host
+
+
+def _capture_helper_source_binding(args, selected_source):
+    from docker_dev import BASE_CONTEXT_FILES, RUNTIME_IMAGE_CONTEXT_FILES
+    import docker_helper_source as helper_source
+
+    pair = helper_source.validate_option_pair(
+        getattr(args, "helper_source_root", None),
+        getattr(args, "helper_source_commit", None),
+    )
+    if pair is None:
+        return None
+    try:
+        return helper_source.capture_current_binding(
+            pair[0], pair[1], selected_source, BASE_CONTEXT_FILES, RUNTIME_IMAGE_CONTEXT_FILES
+        )
+    except helper_source.HelperSourceError as error:
+        raise BuildControlError("Helper-source pin is invalid: " + str(error)) from error
+
+
+def _revalidate_helper_source_binding(binding, selected_source=None):
+    if binding is None:
+        return None
+    from docker_dev import BASE_CONTEXT_FILES, RUNTIME_IMAGE_CONTEXT_FILES
+    import docker_helper_source as helper_source
+
+    try:
+        return helper_source.revalidate_binding(
+            binding,
+            selected_source,
+            base_context_files=BASE_CONTEXT_FILES,
+            runtime_context_files=RUNTIME_IMAGE_CONTEXT_FILES,
+        )
+    except helper_source.HelperSourceError as error:
+        raise BuildControlError("Pinned helper source changed or is unavailable: " + str(error)) from error
 
 
 def _source_supplementary_groups(*paths):
@@ -1287,10 +1323,68 @@ def _host_ledger(control, operation, layout, selected, image, *, new_render=Fals
 
 
 
-def _startup_helper(control, selected, image):
+def _startup_helper(control, selected, image, *, helper_source_binding=None):
     """Execute host admission code only when both helper bytes match the image."""
     import fullmag_docker_runtime as runtime
+    import docker_helper_source as helper_source
     names = ("docker_startup_script.py", "fullmag_storage.py")
+    if helper_source_binding is None and callable(getattr(control, "read", None)):
+        current = control.read("development/current.json", optional=True)
+        current_inputs = current.get("inputs") if isinstance(current, Mapping) else None
+        if isinstance(current_inputs, Mapping):
+            helper_source_binding = current_inputs.get("helper_source")
+    if helper_source_binding is not None:
+        try:
+            image_documents = json.loads(docker_capture("image", "inspect", image).stdout)
+        except Exception as error:
+            raise BuildControlError("Pinned image startup-helper identity is unavailable") from error
+        if (not isinstance(image_documents, list) or len(image_documents) != 1
+                or image_documents[0].get("Id") != image):
+            raise BuildControlError("Pinned image startup-helper identity is not the exact immutable image")
+        labels = image_documents[0].get("Config", {}).get("Labels", {})
+        try:
+            expected_hashes = helper_source.startup_hashes_from_image_labels(
+                labels, helper_source_binding
+            )
+        except helper_source.HelperSourceError as error:
+            raise BuildControlError("Image startup-helper pin validation failed: " + str(error)) from error
+        verified = {}
+        for name in names:
+            path = "/opt/fullmag/" + name
+            script = (
+                "import base64,os,stat,sys\n"
+                "path=sys.argv[1]\n"
+                "fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)\n"
+                "metadata=os.fstat(fd)\n"
+                "if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4194304:\n"
+                " raise RuntimeError('startup helper is not a bounded regular file')\n"
+                "data=bytearray()\n"
+                "while True:\n"
+                " chunk=os.read(fd,65536)\n"
+                " if not chunk: break\n"
+                " data.extend(chunk)\n"
+                " if len(data)>4194304: raise RuntimeError('startup helper exceeds size bound')\n"
+                "os.close(fd)\n"
+                "print(base64.b64encode(data).decode('ascii'))\n"
+            )
+            command = "/usr/local/bin/python3 -B -c " + shlex.quote(script) + " " + shlex.quote(path)
+            arguments = control.helper_args(command)
+            try:
+                arguments[arguments.index(control.image)] = image
+            except (ValueError, AttributeError) as error:
+                raise BuildControlError("Image startup-helper reader is not bound to its immutable image") from error
+            result = bounded_capture(arguments, data=b"", timeout=90)
+            if result.returncode:
+                raise BuildControlError("Pinned image startup-helper read failed: " + name)
+            try:
+                data = base64.b64decode(result.stdout.strip(), validate=True)
+            except (ValueError, TypeError) as error:
+                raise BuildControlError("Pinned image startup-helper output is malformed: " + name) from error
+            if (len(data) > 4 * 1024 * 1024
+                    or hashlib.sha256(data).hexdigest() != expected_hashes[name]):
+                raise BuildControlError("Pinned image startup-helper bytes differ from their image labels: " + name)
+            verified[name] = (Path(path), data)
+        return runtime._exec_verified_startup_helpers(verified), expected_hashes
     command = "sha256sum " + " ".join("/opt/fullmag/" + name for name in names)
     arguments = control.helper_args(command)
     arguments[arguments.index(control.image)] = image
@@ -1663,7 +1757,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
           native_restart_metadata=None, accepted_reattach_environment=None,
           accepted_reattach_metadata=None, recreation_resume_proof=None,
           post_build_generation=None, retained_device_access=None, maintenance=None,
-          startup_diagnostic_restart=None, terminal_observation=None):
+          startup_diagnostic_restart=None, terminal_observation=None, helper_source_binding=None):
     from docker_dev import (_select_source, _compose_identity,
         _assert_no_running_fullmag, _source_git_common_directory, _workspace_state_root,
         _operator_probe_environment_from_host)
@@ -1672,6 +1766,21 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     provided_operation = operation
     if retained_device_access is not None and retained_device_access not in ("cpu", "gpu"):
         raise BuildControlError("Retained device access must be cpu or gpu")
+    retained_helper_source_binding = (
+        reuse_state.get("helper_source_binding")
+        if isinstance(reuse_state, Mapping) else None
+    )
+    if helper_source_binding is None:
+        helper_source_binding = retained_helper_source_binding
+    elif (retained_helper_source_binding is not None
+          and retained_helper_source_binding != helper_source_binding):
+        raise BuildControlError("Retained helper-source pin differs from the requested recreation")
+    if (getattr(args, "helper_source_root", None) is not None
+            or getattr(args, "helper_source_commit", None) is not None):
+        if helper_source_binding is None:
+            raise BuildControlError("Helper-source pins are supported only through managed recreation")
+    if helper_source_binding is not None:
+        _revalidate_helper_source_binding(helper_source_binding, getattr(args, "source_root", None))
     maintenance = _validate_cancellation_maintenance(maintenance)
     from docker_volume_terminal_observation import validate_context
     terminal_observation = validate_context(terminal_observation)
@@ -1728,6 +1837,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     require_host()
     host = _session_host()
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root or args.repo_root)
+    _revalidate_helper_source_binding(helper_source_binding, selected)
     validate_host_path(selected, "source checkout")
     local_volume(Path(layout["storage_root"]))
     identity = _compose_identity(layout)
@@ -1789,7 +1899,14 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     if provided_operation is None:
         toolchain = build_volume_toolchain(selected)
         control = BuildControl(identity, toolchain["inputs"]["build_args"]["FULLMAG_CUDA_BASE_IMAGE"])
-        images = build_volume_runtime_images(selected, control, toolchain)
+        helper_repo = Path(helper_source_binding["root"]) if helper_source_binding is not None else selected
+        _revalidate_helper_source_binding(helper_source_binding, selected)
+        if helper_source_binding is None:
+            images = build_volume_runtime_images(helper_repo, control, toolchain)
+        else:
+            images = build_volume_runtime_images(
+                helper_repo, control, toolchain, helper_source_binding=helper_source_binding
+            )
     else:
         control = provided_control
         toolchain, images = _validate_prepared_start_context(prepared)
@@ -1805,7 +1922,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         if args.script is not None or getattr(args, "fresh_state", False):
             raise BuildControlError("Recreation resume cannot change startup-script or session-state intent")
         _validate_recreation_resume_records(
-            args, control, selected, identity, expected_proof=recreation_resume_proof
+            args, control, selected, identity, expected_proof=recreation_resume_proof,
+            helper_source_binding=helper_source_binding,
         )
     if args.script is not None:
         if validated_accepted_reattach_environment:
@@ -1830,6 +1948,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             "attempt": args.completed_recreation_attempt,
             "terminal_sha256": args.completed_recreation_sha256,
         }
+    if helper_source_binding is not None:
+        operation_inputs["helper_source"] = helper_source_binding
     if previous_config_sha256 is not None:
         operation_inputs["previous_config_sha256"] = previous_config_sha256
     if maintenance is not None:
@@ -1864,7 +1984,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         if validated_startup_diagnostic_restart is not None and recreation_resume_proof is not None:
             leased_records = _validate_recreation_resume_records(
                 args, control, selected, identity, expected_proof=recreation_resume_proof,
-                current_operation=operation
+                current_operation=operation, helper_source_binding=helper_source_binding,
             )
             if leased_records["native_recovery_context"].get("startup_diagnostic_restart") != validated_startup_diagnostic_restart:
                 raise BuildControlError("Startup diagnostic recreation resume changed under start lease")
@@ -1881,6 +2001,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             if (current.pop("reuse_state") != reuse_state or current != expected):
                 raise BuildControlError("Completed recreation handoff changed before start")
         operation["receipt"].update(operator_probe_record)
+        if helper_source_binding is not None:
+            operation["receipt"]["helper_source"] = helper_source_binding
         if maintenance is not None:
             operation["receipt"]["unclaimed_cancellation"] = maintenance
         if validated_recovery_metadata is not None:
@@ -2026,7 +2148,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         startup = None
         if args.script is not None:
             from docker_volume_activate import _managed_activation_receipt_contract
-            startup_helper, startup_hashes = _startup_helper(control, selected, image)
+            if helper_source_binding is None:
+                startup_helper, startup_hashes = _startup_helper(control, selected, image)
+            else:
+                startup_helper, startup_hashes = _startup_helper(
+                    control, selected, image, helper_source_binding=helper_source_binding
+                )
             authorization = startup_helper.prepare(selected, args.script,
                 request_id="docker-volume-" + token, source_commit=storage.git(selected, "rev-parse", "HEAD"))
             receipt_key, receipt_path = _managed_activation_receipt_contract(
@@ -2067,8 +2194,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         environment["FULLMAG_OPERATOR_PROBE_ENVIRONMENT_SHA256"] = operator_probe_record[
             "operator_probe_environment_sha256"
         ]
+        compose_root = Path(helper_source_binding["root"]) if helper_source_binding is not None else selected
+        _revalidate_helper_source_binding(helper_source_binding, selected)
         configured = bounded_capture(docker_argv("compose",
-            "--project-name", control.project, "-f", str(selected / "compose.dev.yaml"),
+            "--project-name", control.project, "-f", str(compose_root / "compose.dev.yaml"),
             "config", "--format", "json"), env=environment, timeout=90)
         if configured.returncode or len(configured.stdout) > 1024 * 1024:
             raise BuildControlError("DEV Compose render failed: " + configured.stderr.decode("utf-8", "replace"))
@@ -2222,6 +2351,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         control.write(operation["root"] + "/compose.json", document)
         operation["receipt"].update(state="starting-services", state_root=str(state),
             frontend_volume=frontend_volume, backend_volumes=cache["volume_names"])
+        _revalidate_helper_source_binding(helper_source_binding, selected)
         _start_compose_services(control, operation, document)
         backend_id = compose_capture(document, "ps", "--all", "--quiet", "backend").decode().strip()
         frontend_id = compose_capture(document, "ps", "--all", "--quiet", "frontend").decode().strip()
@@ -2241,8 +2371,14 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                     mount["Destination"]: mount["Source"] for mount in actual.get("Mounts", [])
                     if mount["Type"] == "bind"}
             control.write(operation["root"] + "/compose.json", document)
-        _finish(control, operation, document, backend_id, frontend_id, selected, state,
-                certificate_path, certificate, cache, toolchain, image, git_common, ledger_profile, args.port)
+        if helper_source_binding is None:
+            _finish(control, operation, document, backend_id, frontend_id, selected, state,
+                    certificate_path, certificate, cache, toolchain, image, git_common,
+                    ledger_profile, args.port)
+        else:
+            _finish(control, operation, document, backend_id, frontend_id, selected, state,
+                    certificate_path, certificate, cache, toolchain, image, git_common,
+                    ledger_profile, args.port, helper_source_binding=helper_source_binding)
 
 
 
@@ -2290,7 +2426,7 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
 
 def _finish(control, operation, document, backend_id, frontend_id, selected, state,
             certificate_path, certificate, cache, toolchain, image, git_common, ledger_profile, port,
-            *, completion_gate=None):
+            *, completion_gate=None, helper_source_binding=None):
     import fullmag_docker_runtime as runtime
     token = operation["receipt"]["attempt"]
     operator_probe_record = _operator_probe_record_from_retained(operation["receipt"], document)
@@ -2432,7 +2568,12 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
         if hashlib.sha256(data).hexdigest() != startup_environment["FULLMAG_STARTUP_PROVENANCE_SHA256"]:
             raise BuildControlError("Startup authorization changed after admission")
         authorization = json.loads(data)
-        helper, hashes = _startup_helper(control, selected, image)
+        if helper_source_binding is None:
+            helper, hashes = _startup_helper(control, selected, image)
+        else:
+            helper, hashes = _startup_helper(
+                control, selected, image, helper_source_binding=helper_source_binding
+            )
         if hashes["docker_startup_script.py"] != startup_environment["FULLMAG_STARTUP_HELPER_SHA256"]:
             raise BuildControlError("Startup helper differs from retained service")
         operation["receipt"]["startup"] = runtime._wait_for_startup_ready(
@@ -2450,8 +2591,18 @@ def _finish(control, operation, document, backend_id, frontend_id, selected, sta
             "state": "consumed",
         }
     if startup_environment.get("FULLMAG_SHARED_BACKEND_STORE"):
-        from docker_volume_cache_maintenance import run_guest_maintenance
-        operation["receipt"]["cache_maintenance"] = run_guest_maintenance(operation, backend_id)
+        if startup_environment.get("FULLMAG_AUTO_CACHE_MAINTENANCE") == "1":
+            # The image-owned supervisor schedules this after its ready receipt,
+            # including Docker Desktop restarts. Never race it with a host exec.
+            operation["receipt"]["cache_maintenance"] = {
+                "schema": "fullmag.automatic-cache-maintenance-reference.v1",
+                "state": "scheduled-by-container",
+                "backend_container": backend_id,
+                "receipt": "/opt/fullmag/runtime-control/runtime-service/cache-maintenance.json",
+            }
+        else:
+            from docker_volume_cache_maintenance import run_guest_maintenance
+            operation["receipt"]["cache_maintenance"] = run_guest_maintenance(operation, backend_id)
         control.write(operation["root"] + "/cache-maintenance.json", operation["receipt"]["cache_maintenance"])
     operation["receipt"].update(state="succeeded", backend_container=backend_id,
         frontend_container=frontend_id, url="http://127.0.0.1:" + str(port),
@@ -4470,6 +4621,11 @@ def stop_idle(args):
 
 
 def recreate(args):
+    import docker_helper_source as helper_source
+    helper_source.validate_option_pair(
+        getattr(args, "helper_source_root", None),
+        getattr(args, "helper_source_commit", None),
+    )
     if getattr(args, "migrate_host_capacity", False):
         _assert_host_capacity_migration_quiescent()
     return _retained_operation(args, recreate_services=True)
@@ -4477,6 +4633,11 @@ def recreate(args):
 
 def resume_recreation(args):
     """Resume only the exact successful recreation whose app IDs are absent."""
+    import docker_helper_source as helper_source
+    helper_source.validate_option_pair(
+        getattr(args, "helper_source_root", None),
+        getattr(args, "helper_source_commit", None),
+    )
     if not re.fullmatch(r"[0-9a-f]{32}", str(getattr(args, "resume_recreation", ""))):
         raise BuildControlError("--resume-recreation requires one exact operation UUID")
     if getattr(args, "migrate_host_capacity", False):
@@ -4994,6 +5155,7 @@ def _validate_failed_prestart_successor(
     operator_probe_record,
     native_recovery_context,
     removed_container_proof,
+    helper_source_binding=None,
 ):
     """Admit only the closed start attempt that failed before publication.
 
@@ -5096,6 +5258,17 @@ def _validate_failed_prestart_successor(
     for key, expected in operator_probe_record.items():
         if successor_inputs.get(key) != expected:
             raise BuildControlError("Pre-start successor operator control differs: " + key)
+    if helper_source_binding is not None:
+        try:
+            import docker_helper_source as helper_source
+            helper_source.compare_operation_binding(
+                {"helper_source": successor_inputs.get("helper_source")},
+                helper_source_binding,
+            )
+        except helper_source.HelperSourceError as error:
+            raise BuildControlError("Pre-start successor helper-source pin differs: " + str(error)) from error
+        if current.get("helper_source") != helper_source_binding:
+            raise BuildControlError("Pre-start successor receipt helper-source pin differs")
     for key in ("image_id",) + (("toolchain_image_id",) if "toolchain_image_id" in successor_inputs else ()):
         value = successor_inputs.get(key)
         if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
@@ -5117,6 +5290,8 @@ def _validate_failed_prestart_successor(
         allowed_inputs.add("recreation_resume")
     if expected_native_restart is not None:
         allowed_inputs.add("native_failed_restart")
+    if helper_source_binding is not None:
+        allowed_inputs.add("helper_source")
     accepted_run = validated_metadata.get("accepted_run")
     if accepted_run:
         allowed_inputs.add("accepted_reattach")
@@ -5236,6 +5411,8 @@ def _validate_failed_prestart_successor(
     }
     if accepted_run:
         allowed_fields.add("accepted_reattach")
+    if helper_source_binding is not None:
+        allowed_fields.add("helper_source")
     namespace = getattr(control, "namespace", None)
     if namespace:
         allowed_fields.update({"control_namespace", "namespace_registry_sha256"})
@@ -5264,6 +5441,7 @@ def _validate_failed_prestart_successor(
 def _validate_removed_recreation_proof(
     args, control, previous, document, identity, *, operation_id, operation_raw,
     operation_terminal, retained_raw, retained, previous_raw, document_raw, operator_probe_record,
+    helper_source_binding=None,
 ):
     """Validate the retained incarnation and native proof after exact app-ID removal.
 
@@ -5276,6 +5454,15 @@ def _validate_removed_recreation_proof(
         "config_sha256": args.config_sha256,
         **operator_probe_record,
     }
+    try:
+        import docker_helper_source as helper_source
+        stored_helper_source = helper_source.compare_operation_binding(
+            operation_terminal.get("inputs"), helper_source_binding
+        )
+    except helper_source.HelperSourceError as error:
+        raise BuildControlError("Recreation helper-source pin cannot be resumed: " + str(error)) from error
+    if stored_helper_source is not None:
+        expected_operation_inputs["helper_source"] = stored_helper_source
     if (
         operation_terminal.get("schema") != "fullmag.docker-build-operation.v1"
         or operation_terminal.get("phase") != "recreate-services"
@@ -5435,7 +5622,8 @@ def _validate_removed_recreation_proof(
     return snapshot, proof, native_recovery_context
 
 
-def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None, current_operation=None):
+def _validate_recreation_resume_records(args, control, selected, identity, *, expected_proof=None,
+                                        current_operation=None, helper_source_binding=None):
     """Revalidate one completed recreation and prove its old app IDs are absent."""
 
     from docker_volume_stop_unadmitted import _control_bytes
@@ -5550,6 +5738,7 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
         operation_raw=operation_raw, operation_terminal=operation_terminal,
         retained_raw=retained_raw, retained=retained, previous_raw=previous_raw,
         document_raw=document_raw, operator_probe_record=operator_probe_record,
+        helper_source_binding=helper_source_binding,
     )
     if expected_proof is not None and proof != expected_proof:
         raise BuildControlError("Recreation resume evidence changed before the new start admission")
@@ -5568,6 +5757,7 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
             operation_terminal=operation_terminal,
             retained_raw=retained_raw,
             operator_probe_record=operator_probe_record,
+            helper_source_binding=helper_source_binding,
             native_recovery_context=native_recovery_context,
             removed_container_proof=proof,
         )
@@ -5583,8 +5773,10 @@ def _validate_recreation_resume_records(args, control, selected, identity, *, ex
     }
 
 
-def _resume_recreated_operation(args, control, selected, layout, identity):
-    records = _validate_recreation_resume_records(args, control, selected, identity)
+def _resume_recreated_operation(args, control, selected, layout, identity, *, helper_source_binding=None):
+    records = _validate_recreation_resume_records(
+        args, control, selected, identity, helper_source_binding=helper_source_binding
+    )
     previous = records["previous"]
     document = records["document"]
     operation_terminal = records["operation_terminal"]
@@ -5775,6 +5967,8 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
         "receipt": {"image_id": image},
         "operator_probe_environment_record": operator_probe_record,
     }
+    if helper_source_binding is not None:
+        reuse["helper_source_binding"] = helper_source_binding
     recovery_context.update(accepted_reattach_context)
     args.include_untracked = include_untracked_from_compose(document)
     args.gpu_access = previous["inputs"]["gpu_access_requested"]
@@ -5783,6 +5977,7 @@ def _resume_recreated_operation(args, control, selected, layout, identity):
         reuse_state=reuse,
         recreation_resume_proof=proof,
         retained_device_access=_retained_device_access(previous, document),
+        helper_source_binding=helper_source_binding,
         **recovery_context,
     )
 
@@ -6259,7 +6454,29 @@ def _retained_operation(
     """Resume one exact retained start; a frontend-only recovery never restarts the backend."""
     from docker_dev import _select_source, _compose_identity
     require_host()
+    import docker_helper_source as helper_source
+    helper_pair = helper_source.validate_option_pair(
+        getattr(args, "helper_source_root", None),
+        getattr(args, "helper_source_commit", None),
+    )
+    if helper_pair is not None and getattr(args, "recovery_authorization", None) is not None:
+        raise BuildControlError("Helper-source pins are unsupported with container recovery authorization")
+    if helper_pair is not None and not (recreate_services or resume_recreation_id is not None):
+        raise BuildControlError("Helper-source pins are supported only by recreate-volume and its resume")
+    selected_before_runtime = None
+    helper_source_binding = None
+    if helper_pair is not None:
+        from docker_development_inputs import select_checkout
+        try:
+            selected_before_runtime = select_checkout(
+                Path(args.repo_root).resolve(strict=True), args.source_root
+            ).resolve(strict=True)
+        except Exception as error:
+            raise BuildControlError("Cannot resolve the app checkout before helper pin validation: " + str(error)) from error
+        helper_source_binding = _capture_helper_source_binding(args, selected_before_runtime)
     selected, layout = _select_source(Path(args.repo_root).resolve(strict=True), args.source_root)
+    if selected_before_runtime is not None and selected_before_runtime != selected:
+        raise BuildControlError("Selected app checkout changed during helper-source validation")
     identity = _compose_identity(layout)
     from docker_build_control import toolchain_configuration
     configured = toolchain_configuration(selected, identity)
@@ -6318,7 +6535,10 @@ def _retained_operation(
             raise BuildControlError("Recreation resume requires the retained GPU access intent")
         args.gpu_access = policy
         args.include_untracked = include_untracked_from_compose(document)
-        return _resume_recreated_operation(args, control, selected, layout, identity)
+        return _resume_recreated_operation(
+            args, control, selected, layout, identity,
+            helper_source_binding=helper_source_binding,
+        )
     if recreate_services:
         requested_allowlist = getattr(args, "include_untracked", None)
         args.include_untracked = (
@@ -6847,8 +7067,14 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                         or labels.get("com.docker.compose.service") != "host-ledger-maintenance"):
                     raise BuildControlError("Recorded ledger helper identity/outcome differs")
                 helper_ids.append(helper_document["Id"])
-        with control.operation("recreate-services", {"attempt": args.attempt, "config_sha256": args.config_sha256,
-                                                      **operator_probe_record}) as operation:
+        recreate_inputs = {"attempt": args.attempt, "config_sha256": args.config_sha256,
+                           **operator_probe_record}
+        if helper_source_binding is not None:
+            recreate_inputs["helper_source"] = helper_source_binding
+        with control.operation("recreate-services", recreate_inputs) as operation:
+            if helper_source_binding is not None:
+                operation["receipt"]["helper_source"] = helper_source_binding
+                control.write(operation["root"] + "/helper-source-binding.json", helper_source_binding)
             successor_actual = ({service: json.loads(docker_text("inspect", identifier))[0]
                 for service, identifier in ids.items()} if drained_successor else actual)
             leased_recovery_context = _retained_recovery_context(
@@ -7121,6 +7347,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                                         fresh_state=fresh_state)
             operation["daemon_pending"] = True
             if actual["frontend"]["State"]["Running"]:
+                _revalidate_helper_source_binding(helper_source_binding, selected)
                 docker_capture("stop", "--time", "60", ids["frontend"], timeout=90)
             for service, identifier in ids.items():
                 observed = json.loads(docker_text("inspect", identifier))[0]
@@ -7132,6 +7359,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     or observed["State"].get("StartedAt") != actual[service]["State"].get("StartedAt")
                 ):
                     raise BuildControlError("Service restarted during fresh session: " + service)
+            _revalidate_helper_source_binding(helper_source_binding, selected)
             docker_capture("rm", *ids.values())
             if helper_ids:
                 docker_capture("rm", *helper_ids)
@@ -7164,7 +7392,8 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             proof_args.resume_recreation = operation["receipt"]["attempt"]
             try:
                 completed_recreation = _validate_recreation_resume_records(
-                    proof_args, control, selected, identity
+                    proof_args, control, selected, identity,
+                    helper_source_binding=helper_source_binding,
                 )
                 if carry_existing is None:
                     from docker_volume_post_build_generation import bind_recreate_operation
@@ -7203,9 +7432,14 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         reuse = None if fresh_state else {"state": state, "host_certificate": certificate_path,
             "owner_marker": owner_path, "receipt": {"image_id": image},
             "operator_probe_environment_record": operator_probe_record}
+        if reuse is not None and helper_source_binding is not None:
+            reuse["helper_source_binding"] = helper_source_binding
         recovery_context.update(accepted_reattach_context)
-        return start(args, reuse_state=reuse, retained_device_access=retained_device_access,
-                     terminal_observation=terminal_observation, **recovery_context)
+        return start(
+            args, reuse_state=reuse, retained_device_access=retained_device_access,
+            terminal_observation=terminal_observation, helper_source_binding=helper_source_binding,
+            **recovery_context,
+        )
     restart_backend = bool(getattr(args, "restart_backend", False))
     if restart_backend:
         if actual["backend"]["State"]["Running"]:
