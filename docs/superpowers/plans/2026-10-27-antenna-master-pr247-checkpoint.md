@@ -442,3 +442,110 @@ logów tej samej instancji. `native-prepare-observation.json` zachowuje dokładn
 ID i StartedAt. Backend i frontend są nadal stopped, owner c037 zachowuje
 lease, nie wykonano reconcile, startup ani Solve. Wynik native prepare
 i kanoniczny preview nadal wymagają oceny.
+
+
+## Zakończenie pierwszego native prepare i przyczyna odmowy adaptera
+
+Pierwszy helper
+`9af23076362959b8c874e0ec27cab7a80f14c7a5bb65d50083c8a5646ff7c2cb`
+zakończył działanie i nie istnieje już w Dockerze (zarządzane auto-rm).
+Obserwator zachował jego błąd:
+`host-bound solver lease has no exact released host row`. Kod wyjścia samego
+procesu helpera nie został bezpośrednio odczytany przed auto-rm; exit0
+obserwatora logów nie jest sukcesem dowodu. Raport końcowy:
+`verification/terminal-prestart-recovery-20261027/native-helper-first-result.json`.
+Nie powtórzono próby aplikacji ani nie zwolniono ownera c037.
+
+Adapter nie przekazał `FULLMAG_SESSION_STORAGE_PROFILE`;
+`HostResourceLedger::store_id` użył canonical-path fallback zamiast tożsamości
+Linux native. Poprawny profil wymaga także prawdziwego dowodu bieżącej mount
+namespace oraz sześciu pól środowiska. Wszystkie sześć istnieje jednoznacznie
+w actual.Config.Env zachowanego backendu. Samo dopisanie profilu nie zastępuje
+pełnego native admission. Nie zmieniono natywnej bramki ani rekordów ledgeru.
+
+Istniejący wzorzec `docker_candidate_history.py` / `linux_native_probe.run(True,
+evidence_path=...)` pozwala użyć prywatnego dowodu pod aliasem RW, z overlay
+RO wyłącznie pliku `.linux-native-probe.json`. Źródłowy certyfikat, owner,
+sentinele i oryginalny probe pozostają zachowane. Jest to plan naprawy
+adaptera; dopuszczenie tego wariantu przez rzeczywisty native CLI nadal
+NOT VERIFIED. Nie przejęto overlay kandydata, publikacji provenance ani
+NVIDIA runtime z tamtego narzędzia.
+
+Pierwszy helper miał limit 0,25 CPU i odziedziczony healthcheck aplikacji,
+który zgłaszał brak API co kilka sekund. Plan poprawki obejmuje osobny
+healthcheck wyłączony wyłącznie dla diagnostyki, limit 1 CPU i 600s obserwacji,
+przy zachowaniu pełnego hashowania. Nie zmienia limitów ani profilu backendu.
+Kontrakt nadpisania healthcheck opisują
+[Docker Compose docs](https://docs.docker.com/reference/compose-file/services/#healthcheck).
+Samo ustawienie tych parametrów nie dowodzi przyspieszenia.
+
+Po próbie ponownie porównano z rzeczywistym baseline: wszystkie 43 katalogi,
+1391 plików zapisanego runu i oba pliki odzyskanego rozwiązania są identyczne;
+writer advisory jest released. Raport `post-first-native-science-preservation.json`
+SHA256 `0a7dcf8a1ef90b68f9c7b65e43751096caf20fda538f9b09941df3a48d5f79a5`.
+Rozwiązanie odszukano po unikalnym hashu manifestu oraz sprawdzonych run_id /
+solution_set_id. Początkowy dodatkowy skrypt diagnostyczny błędnie założył,
+że API ID jest katalogiem plików; ten błędny raport zachowano jako
+`post-first-native-wrong-solution-path.json`, a nie jako dowód utraty danych.
+Właściwy katalog to `solutions/c55c330557585ca3329a08eb80fa9574302d75ebe67f98900780fba724103bf6`.
+
+
+## Drugi native prepare: prawdziwy namespace zaliczony, parser czasu wymaga poprawki
+
+Poprawka prywatnego admission ma niezależny review bez Blocker/Required
+i 29/29 interpretowanych regresji (UID65532 i odmowa UID1001).
+Produkcja SHA256 `f87e02ef48b31240de765a181c51402d7a5ad0392da7ec0bdd643f81d518661c`,
+test `3883e6c92f9810a85a189ce270d103a8ee1ee9db8fb88387783277f7fad7c779`.
+Receipt `offline-private-namespace-uid-final.json` i raport
+`private-namespace-uid-fixture-review.json` znajdują się w katalogu kontroli
+`verification/terminal-prestart-recovery-20261027/`. To dowody adaptera,
+nie zastępstwo natywnego prepare ani WebGL.
+
+Drugi prepare zakończył się po 48,345 s. Rzeczywisty probe uzyskał
+`native-inspected`; oryginalne owner/certificate/sentinel/probe pozostały
+identyczne. Dowód namespace SHA256
+`2586a8af80f8d35f0bd0bfbad08995216ed921f32536ff535939a5f692fa5a49`.
+Natywny CLI przeszedł, potem porównano store, held intents i sealed package.
+Ostateczna walidacja advisory writer odmówiła na
+`datetime.fromisoformat('2026-10-27T21:18:59.543852683+00:00')` w Pythonie3.10.
+Cały prepare pozostaje **FAILED**, mimo wcześniejszych zaliczonych kontroli.
+Helper `fullmag-terminal-proof-4fbf41ee952e4993b4602ba7c0a9d98a` nie istnieje
+(po zarządzanym auto-rm); backend/frontend nadal stopped z wcześniejszym StartedAt.
+Nie wykonano reconcile, restartu ani Solve; owner c037 zachowuje lease.
+Raport: `native-helper-second-result.json`, pełny błąd: `native-prepare-second-status.json`.
+
+Poprawka obejmuje parser nanosekund w adapterze, bez obcięcia do mikrosekund
+i bez zmiany natywnej bramki. Dokumentacja
+[Python3.10 datetime](https://docs.python.org/3.10/library/datetime.html) opisuje
+węższy zakres `fromisoformat`;
+[RFC3339](https://www.rfc-editor.org/info/rfc3339/) dopuszcza ułamek sekund.
+Samo przejście na nowy Python nie jest przyjętym rozwiązaniem: obcięcie ułamka
+mogłoby zaakceptować odwróconą kolejność znaczników w tej samej mikrosekundzie.
+
+
+## Natywny prepare po korekcie czasu — PASS
+
+Parser dokładnych nanosekund oraz regresja odwrócenia 1 ns w tej samej
+mikrosekundzie przeszły niezależny review bez Blocker/Required.
+32/32 interpretowane testy PASS, exit0, 24,695 s, source inputs stable.
+Receipt `verification/terminal-prestart-recovery-20261027/offline-writer-time-32-final.json`
+SHA256 `a62e49f24a2edf9cf6f07dcc931da981a8c8082349caa77d2b5b19259e369f0e`.
+Finalne źródła: moduł
+`50d72091be223afde66447cf8fb6e916db90028ca9058984d545c870058329a6`,
+test `15fddad60f111181bb2392f1e8ba12a15853b65d96543e5fcc2ae12a0c6055c8`.
+
+Trzeci rzeczywisty prepare uzyskał succeeded po 45,108 s. Observation
+zachowuje ten sam storage binding
+`f9628a472d4bb5be8d890065a1c5a29ebcb9db095b52fd695aa2d496d5b4415e`,
+sealed package receipt
+`441a4457c2930d742ebe3ab636a2b2af7b3cca24fde19a1b8cfb2319b1320151`,
+operator baseline i oba held intents. Brak aktywnych rezerwacji.
+Request `verification/terminal-prestart-recovery-20261027/request-third.json`
+SHA256 `34dd8aaf384a77e35edc3ab0e18102d4d080a0da7c3fe26da5da3441b9df9967`.
+Pełny wynik `native-prepare-third-status.json` w tym samym katalogu.
+Nie wykonano jeszcze reconcile, restartu ani Solve; właściciel c037 i stare
+StartedAt obu usług pozostają. Następny krok: kanoniczny preview przez
+`just docker-dev-reconcile-iteration`, potem apply i pojedyncze managed resume.
+
+Kontrola hosta potwierdziła około 69,16 GiB wolnego D:, powyżej dotychczasowej
+bramki 32 GiB. To pomiar pojemności, nie obietnica rozmiaru kolejnego buildu.

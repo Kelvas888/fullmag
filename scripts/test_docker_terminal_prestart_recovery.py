@@ -3,6 +3,8 @@ import contextlib
 import copy
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -30,7 +32,7 @@ def observation():
             "held_run_intent_sha256": {"run-held": "a" * 64},
             **{key: "b" * 64 for key in ("terminal_evidence_sha256", "runtime_config_sha256",
                "package_receipt_sha256", "provenance_sha256", "released_snapshot_sha256",
-               "recovery_store_sha256", "operator_baseline_projection_sha256")}}
+               "recovery_store_sha256", "operator_baseline_projection_sha256", "storage_binding_sha256")}}
 
 
 class TerminalContracts(unittest.TestCase):
@@ -102,15 +104,20 @@ class RetainedMounts(unittest.TestCase):
     def fixture(self):
         identity = {"project_name": "fullmag-test", "project_id": "project",
                     "worktree_id": "worktree", "checkout_kind": "worktree"}
-        control = types.SimpleNamespace(project="fullmag-test", identity=identity)
+        control = types.SimpleNamespace(project="fullmag-test", identity=identity, volume="volume-2")
         volumes = {"/host-ledger": "", "/opt/fullmag/package": "", "/opt/fullmag/control": "",
                    "/opt/fullmag/runtime-control": "runtime-control",
                    "/state/runs/docker-all/session-store/runtime-services": "runtime-control/runtime-services"}
-        binds = {"/state", "/opt/fullmag/source"}
+        binds = {"/state", "/opt/fullmag/source", "/run/fullmag/linux-native-host.json"}
         mounts = [{"Type": "volume", "Name": "volume-" + str(i), "Destination": p, "RW": True}
                   for i, p in enumerate(volumes)]
         mounts += [{"Type": "bind", "Source": "/host" + p, "Destination": p, "RW": True} for p in binds]
-        actual = {"Image": "sha256:" + "f" * 64, "Mounts": mounts, "Config": {"Labels": {
+        environment = {
+            "FULLMAG_SESSION_STORAGE_PROFILE": "linux-native-v1", "FULLMAG_DOCKER_HOST_ID": "a" * 64,
+            "FULLMAG_RUNTIME_IMAGE_ID": "sha256:" + "f" * 64, "FULLMAG_TOOLCHAIN_IMAGE_ID": "sha256:" + "e" * 64,
+            "FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev", "FULLMAG_COMPOSE_PROJECT": "fullmag-test"}
+        actual = {"Image": "sha256:" + "f" * 64, "Mounts": mounts, "Config": {
+                  "Env": [k + "=" + v for k, v in environment.items()], "Labels": {
                       "org.fullmag.source.project-id": "project", "org.fullmag.source.worktree-id": "worktree",
                       "org.fullmag.source.checkout-kind": "worktree", "org.fullmag.compose.project": "fullmag-test"}},
                   "HostConfig": {"Mounts": [{"Target": p, "VolumeOptions": {"Subpath": v}}
@@ -119,7 +126,7 @@ class RetainedMounts(unittest.TestCase):
 
     def test_exact_mount_subpaths_and_no_candidate_build_gpu_or_network(self):
         control, actual = self.fixture()
-        doc = recovery.diagnostic_document(control, actual, {})
+        doc = recovery.diagnostic_document(control, actual, {}, evidence_root="verification/terminal-prestart-recovery-20261027/probes/" + "a" * 32)
         service = doc["services"]["terminal-prestart-proof"]
         mounts = {v["target"]: v for v in service["volumes"]}
         volume_names = {mount["source"] for mount in service["volumes"] if mount["type"] == "volume"}
@@ -132,6 +139,15 @@ class RetainedMounts(unittest.TestCase):
         self.assertTrue(mounts["/opt/fullmag/package"]["read_only"])
         self.assertFalse(mounts["/state"]["read_only"])
         self.assertEqual(service["runtime"], "runc")
+        self.assertEqual(service["cpus"], 1)
+        self.assertEqual(service["healthcheck"], {"disable": True})
+        self.assertTrue(mounts["/retained-state"]["read_only"])
+        self.assertEqual(mounts["/retained-state"]["source"], mounts["/state"]["source"])
+        self.assertTrue(mounts["/state/.linux-native-probe.json"]["read_only"])
+        self.assertFalse(mounts["/evidence"]["read_only"])
+        self.assertEqual(mounts["/evidence"]["source"], mounts["/state/.linux-native-probe.json"]["source"])
+        self.assertEqual(mounts["/evidence"]["volume"]["subpath"] + "/linux-native-probe.json",
+                         mounts["/state/.linux-native-probe.json"]["volume"]["subpath"])
         self.assertEqual(service["environment"]["FULLMAG_DOCKER_DEVICE_ACCESS"], "cpu")
         self.assertEqual(service["network_mode"], "none")
         self.assertNotIn("gpus", service)
@@ -140,10 +156,45 @@ class RetainedMounts(unittest.TestCase):
         self.assertTrue(mounts["/opt/fullmag/source"]["read_only"])
         self.assertNotIn("candidate", json.dumps(service["volumes"]))
 
+    def test_retained_storage_environment_is_exact_and_never_copies_capabilities(self):
+        control, actual = self.fixture()
+        expected = recovery.retained_storage_environment(control, actual)
+        actual["Config"]["Env"].append("FULLMAG_LOCAL_COMPUTE_OPERATOR_TOKEN=private")
+        self.assertEqual(recovery.retained_storage_environment(control, actual), expected)
+        for key in recovery.STORAGE_ENVIRONMENT:
+            for replacement in (None, "foreign"):
+                with self.subTest(key=key, replacement=replacement):
+                    changed = copy.deepcopy(actual)
+                    changed["Config"]["Env"] = [item for item in changed["Config"]["Env"]
+                                               if not item.startswith(key + "=")]
+                    if replacement is not None: changed["Config"]["Env"].append(key + "=" + replacement)
+                    with self.assertRaises(BuildControlError):
+                        recovery.retained_storage_environment(control, changed)
+        actual["Config"]["Env"].append("FULLMAG_SESSION_STORAGE_PROFILE=linux-native-v1")
+        with self.assertRaises(BuildControlError):
+            recovery.retained_storage_environment(control, actual)
+
+    def test_unknown_timeout_preserves_helper_handle_and_never_returns_terminal_success(self):
+        from docker_build_control import ControlOutcomeUnknown
+        control, actual = self.fixture()
+        writes = []
+        control.write = lambda path, value: writes.append((path, copy.deepcopy(value)))
+        baseline = {"path": "verification/before.json", "run_id": "run-saved",
+                    "sha256": recovery.digest(b"{}")}
+        with patch.object(reconcile, "read_raw", return_value=b"{}"),                 patch("docker_volume_pre_ack_retry._released_snapshot", return_value={"active_count": 0}),                 patch("docker_build_control.compose_capture", side_effect=ControlOutcomeUnknown("client timeout")) as observe:
+            with self.assertRaises(ControlOutcomeUnknown):
+                recovery.build_observation(control, actual, preflight(), baseline)
+        self.assertEqual(writes[-1][1]["state"], "outcome-unknown-resources-retained")
+        self.assertTrue(writes[-1][1]["helper_name"].startswith("fullmag-terminal-proof-"))
+        self.assertNotIn("observation", writes[-1][1])
+        self.assertEqual(observe.call_args.kwargs["timeout"], 600)
+        self.assertIn("--name", observe.call_args.args)
+        self.assertEqual(sum(path.endswith("/linux-native-probe.json") for path, _ in writes), 1)
+
     def test_unsupported_released_snapshot_subpath_is_rejected(self):
         control, actual = self.fixture()
         actual["HostConfig"]["Mounts"][0]["VolumeOptions"]["Subpath"] = "foreign"
-        with self.assertRaises(BuildControlError): recovery.diagnostic_document(control, actual, {})
+        with self.assertRaises(BuildControlError): recovery.diagnostic_document(control, actual, {}, evidence_root="verification/terminal-prestart-recovery-20261027/probes/" + "a" * 32)
 
     def test_missing_duplicate_and_unsafe_volume_paths_rejected(self):
         control, actual = self.fixture()
@@ -154,7 +205,7 @@ class RetainedMounts(unittest.TestCase):
         ):
             with self.subTest(change=change):
                 value = copy.deepcopy(actual); change(value)
-                with self.assertRaises(BuildControlError): recovery.diagnostic_document(control, value, {})
+                with self.assertRaises(BuildControlError): recovery.diagnostic_document(control, value, {}, evidence_root="verification/terminal-prestart-recovery-20261027/probes/" + "a" * 32)
 
 
 class NativeProofAdapter(unittest.TestCase):
@@ -163,7 +214,31 @@ class NativeProofAdapter(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.base = Path(self.directory.name)
-        self.root = self.base / "store"; self.root.mkdir()
+        self.state = self.base / "state"; self.state.mkdir()
+        self.root = self.state / "runs/docker-all/session-store"; self.root.mkdir(parents=True)
+        self.private = self.base / "private"; self.private.mkdir()
+        self.private_probe = self.private / "linux-native-probe.json"
+        self.certificate = self.base / "certificate.json"
+        host = {"schema": "fullmag.linux-native-host.v1", "storage_profile": "linux-native-v1",
+                "role": "session", "owner_scope": "docker-linux", "owner_token": "a" * 32,
+                "engine_id": "engine", "image_id": "sha256:" + "f" * 64, "restart_verified": True}
+        sentinel = (host["owner_token"] + ":" + host["image_id"]).encode()
+        host["restart_expected_sha256"] = recovery.digest(sentinel)
+        self.certificate.write_bytes(canonical(host))
+        (self.state / ".fullmag-linux-native-owner.json").write_bytes(canonical(host))
+        (self.state / ".linux-native-sentinel").write_bytes(sentinel)
+        (self.state / ".linux-native-restart").write_bytes(sentinel)
+        (self.state / ".linux-native-probe.json").write_bytes(b"original admission probe")
+        self.probe_source_path = self.base / "linux_native_probe.py"
+        probe_source = (Path(__file__).resolve().parents[1] / "docker/all-in-one/linux_native_probe.py").read_text()
+        probe_source = probe_source.replace('Path("/state")', repr(self.state))
+        probe_source = probe_source.replace('Path("/run/fullmag/linux-native-host.json")', repr(self.certificate))
+        probe_source = probe_source.replace("PosixPath(", "Path(").replace("WindowsPath(", "Path(")
+        self.probe_source_path.write_text(probe_source)
+        self.storage_environment = {
+            "FULLMAG_SESSION_STORAGE_PROFILE": "linux-native-v1", "FULLMAG_DOCKER_HOST_ID": recovery.digest(b"engine"),
+            "FULLMAG_RUNTIME_IMAGE_ID": host["image_id"], "FULLMAG_TOOLCHAIN_IMAGE_ID": "sha256:" + "e" * 64,
+            "FULLMAG_BACKEND_CARGO_PROFILE": "backend-dev", "FULLMAG_COMPOSE_PROJECT": "fullmag-test"}
         self.config = self.base / "config.json"; self.config.write_bytes(b"configuration")
         self.provenance = self.base / "provenance.json"
         self.receipt = {"state": "succeeded", "source": {"resolved_commit": "a" * 40,
@@ -199,6 +274,7 @@ class NativeProofAdapter(unittest.TestCase):
             "recovered_solution_files": {k.removeprefix("solutions/solution/"): v for k, v in records.items()
                                         if k.startswith("solutions/solution/")}}
         self.payload = {"run_id": "run-terminal", "image_id": "sha256:" + "f" * 64,
+            "storage_environment": self.storage_environment, "storage_probe_sha256": recovery.digest(self.probe_source_path.read_bytes()),
             "held": {"run-held": recovery.digest((self.root / "runs/run-held/run_intent.json").read_bytes())},
             "history_baseline": {"path": "verification/baseline.json",
                 "sha256": recovery.digest(canonical(self.baseline))}, "history_run_id": "run-saved"}
@@ -213,7 +289,8 @@ class NativeProofAdapter(unittest.TestCase):
     def write(self, path, raw):
         target = self.root / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(raw)
 
-    def run_probe(self, callback=None):
+    def run_probe(self, callback=None, *, overlay_path=None, private_mode=0o600, private_uid=65532):
+        self.private_probe.write_bytes(b"{}"); self.private_probe.chmod(private_mode)
         fake = types.ModuleType("backend_dev")
         fake._validated_package = lambda *a, **kw: (self.receipt, self.receipt_raw, {})
         image_entrypoint = types.ModuleType("entrypoint")
@@ -222,15 +299,39 @@ class NativeProofAdapter(unittest.TestCase):
         source = source.replace('Path("/opt/fullmag/runtime-control/runtime-service/docker-all.json")', repr(self.config))
         source = source.replace('Path("/opt/fullmag/control/backend/runtime-provenance.json")', repr(self.provenance))
         source = source.replace('Path("/opt/fullmag/control")', repr(self.base / "control"))
+        source = source.replace('Path("/retained-state")', repr(self.state))
+        source = source.replace('Path("/run/fullmag/linux-native-host.json")', repr(self.certificate))
+        source = source.replace('Path("/opt/fullmag/source/docker/all-in-one/linux_native_probe.py")', repr(self.probe_source_path))
+        source = source.replace('Path("/evidence/linux-native-probe.json")', repr(self.private_probe))
+        source = source.replace('Path("/state/.linux-native-probe.json")', repr(overlay_path or self.private_probe))
+        source = source.replace('Path("/evidence/namespace-observation.json")', repr(self.private / "namespace-observation.json"))
         # Path repr needs Path in the embedded namespace, not a platform class.
         source = source.replace("PosixPath(", "Path(").replace("WindowsPath(", "Path(")
         output = io.StringIO()
+        real_run = subprocess.run
+        real_stat = Path.stat
+        class PrivateOwnerStat:
+            # Model the managed file owner independently of the CI runner UID.
+            def __init__(self, observed):
+                self.observed = observed
+                self.st_uid = private_uid
+
+            def __getattr__(self, name):
+                return getattr(self.observed, name)
+
+        def private_stat(path, *args, **kwargs):
+            observed = real_stat(path, *args, **kwargs)
+            return PrivateOwnerStat(observed) if path == self.private_probe else observed
+
         def cli(argv, **kwargs):
+            if argv[0] != "/opt/fullmag/package/bin/fullmag-bin":
+                self.assertTrue(argv[:3] == ["stat", "-f", "-c"] or argv[:2] == [sys.executable, "-c"])
+                return real_run(argv, **kwargs)
             self.assertEqual(argv[:3], ["/opt/fullmag/package/bin/fullmag-bin", "runtime", "service-inspect-terminal-run"])
             self.assertEqual(argv[-2:], ["--run-id", "run-terminal"])
             if callback: callback()
             return types.SimpleNamespace(returncode=0, stdout=json.dumps(self.native), stderr="")
-        with patch.dict(sys.modules, {"backend_dev": fake, "entrypoint": image_entrypoint}), patch.object(sys, "path", list(sys.path)),                 patch.object(sys, "argv", ["proof", json.dumps(self.payload)]),                 patch("subprocess.run", side_effect=cli), contextlib.redirect_stdout(output):
+        with patch.dict(os.environ, self.storage_environment), patch.dict(sys.modules, {"backend_dev": fake, "entrypoint": image_entrypoint}), patch.object(sys, "path", list(sys.path)),                 patch.object(sys, "argv", ["proof", json.dumps(self.payload)]),                 patch("subprocess.run", side_effect=cli), patch.object(Path, "stat", private_stat), contextlib.redirect_stdout(output):
             exec(compile(source, "<terminal-proof-fixture>", "exec"), {})
         return json.loads(output.getvalue())
 
@@ -239,6 +340,47 @@ class NativeProofAdapter(unittest.TestCase):
         self.assertEqual(value["held_run_intent_sha256"], self.payload["held"])
         self.assertEqual(value["terminal_evidence_sha256"], "a" * 64)
         self.assertEqual(value["runtime_config_sha256"], recovery.digest(b"configuration"))
+
+    def test_genuine_private_probe_preserves_original_admission_and_only_reports_volatile_namespace_locally(self):
+        original = (self.state / ".linux-native-probe.json").read_bytes()
+        first = self.run_probe()
+        second = self.run_probe()
+        self.assertEqual(first["storage_binding_sha256"], second["storage_binding_sha256"])
+        self.assertEqual((self.state / ".linux-native-probe.json").read_bytes(), original)
+        report = json.loads((self.private / "namespace-observation.json").read_bytes())
+        self.assertEqual(report["stage"], "native-inspected")
+        self.assertEqual(report["original_admission_before"], report["original_admission_after"])
+        self.assertEqual(report["private_probe"]["mount_namespace_inode"], Path("/proc/self/ns/mnt").stat().st_ino)
+        self.assertNotIn("mount_namespace_inode", first)
+        self.assertNotIn("private_probe", first)
+
+    def test_private_managed_uid_is_enforced_without_changing_the_host_file_owner(self):
+        host_uid = os.getuid()
+        accepted = self.run_probe(private_uid=65532)
+        self.assertEqual(accepted["terminal_evidence_sha256"], self.native["terminal_evidence_sha256"])
+        self.assertEqual(os.stat(self.private_probe).st_uid, host_uid)
+        with self.assertRaisesRegex(RuntimeError, "inode/owner/permissions"):
+            self.run_probe(private_uid=1001)
+        self.assertEqual(os.stat(self.private_probe).st_uid, host_uid)
+
+    def test_private_inode_permissions_and_source_pin_fail_closed(self):
+        other = self.private / "other.json"; other.write_bytes(b"{}"); other.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, "inode/owner/permissions"):
+            self.run_probe(overlay_path=other)
+        with self.assertRaisesRegex(RuntimeError, "inode/owner/permissions"):
+            self.run_probe(private_mode=0o644)
+        original = self.probe_source_path.read_bytes()
+        self.probe_source_path.write_bytes(original + b" ")
+        with self.assertRaisesRegex(RuntimeError, "source changed"): self.run_probe()
+
+    def test_original_probe_owner_sentinel_and_source_rewrites_during_native_proof_are_rejected(self):
+        for path in (self.state / ".linux-native-probe.json", self.state / ".fullmag-linux-native-owner.json",
+                     self.state / ".linux-native-sentinel", self.probe_source_path):
+            with self.subTest(path=path):
+                original = path.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "source or original storage"):
+                    self.run_probe(lambda: path.write_bytes(original + b" "))
+                path.write_bytes(original)
 
     def test_manual_gate_release_even_dangling_symlink_rejected(self):
         target = self.root / "runs/run-held/start_release.json"
@@ -282,6 +424,36 @@ class NativeProofAdapter(unittest.TestCase):
                       {**self.writer, "heartbeat_at": "2026-10-26T10:00:00Z"}):
             with self.subTest(value=value), self.assertRaises((RuntimeError, ValueError)):
                 self.run_probe(lambda: self.write("WRITER.owner.json", canonical(value)))
+
+    def test_native_nanosecond_writer_timestamps_preserve_precision_and_timezone(self):
+        cases = (
+            ("2026-10-27T21:18:59.543852682+00:00", "2026-10-27T21:18:59.543852683+00:00"),
+            ("2026-10-27T21:18:59.543852682Z", "2026-10-27T21:18:59.543852683Z"),
+            ("2026-10-27T23:18:59.543852682+02:00", "2026-10-27T21:18:59.543852683Z"),
+            ("2026-10-27T19:48:59.543852682-01:30", "2026-10-27T21:18:59.543852683Z"),
+        )
+        for acquired, heartbeat in cases:
+            with self.subTest(acquired=acquired, heartbeat=heartbeat):
+                owner = {**self.writer, "acquired_at": acquired, "heartbeat_at": heartbeat}
+                value = self.run_probe(lambda: self.write("WRITER.owner.json", canonical(owner)))
+                self.assertEqual(value["terminal_evidence_sha256"], self.native["terminal_evidence_sha256"])
+
+    def test_writer_order_reversed_within_one_microsecond_is_rejected(self):
+        owner = {**self.writer, "acquired_at": "2026-10-27T21:18:59.543852683+00:00",
+                 "heartbeat_at": "2026-10-27T21:18:59.543852682Z"}
+        with self.assertRaisesRegex(RuntimeError, "timestamps are malformed"):
+            self.run_probe(lambda: self.write("WRITER.owner.json", canonical(owner)))
+
+    def test_writer_timestamp_requires_valid_calendar_offset_and_at_most_nine_digits(self):
+        malformed = (None, 123, "2026-10-27T21:18:59.543852683",
+                     "2026-10-27T21:18:59.5438526830Z", "2026-10-27T21:18:59.Z",
+                     "2026-10-27T21:18:59+24:00", "2026-10-27T21:18:59+00:60",
+                     "2026-02-30T21:18:59Z", "2026-10-27T21:18:60Z",
+                     "2026-10-27 21:18:59Z", "2026-10-27T21:18:59Z trailing")
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "timestamps are malformed"):
+                owner = {**self.writer, "heartbeat_at": value}
+                self.run_probe(lambda: self.write("WRITER.owner.json", canonical(owner)))
 
     def test_post_native_manual_release_and_unreleased_writer_rejected(self):
         with self.assertRaises(RuntimeError):

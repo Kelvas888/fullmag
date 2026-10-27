@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from pathlib import Path, PurePosixPath
 
 from docker_build_control import BuildControlError, canonical
@@ -88,7 +89,7 @@ def prior_publication(control, request, original):
 def validate_observation(value):
     expected = {"schema", "run_id", "terminal_evidence_sha256", "runtime_config_sha256",
                 "package_receipt_sha256", "provenance_sha256", "held_run_intent_sha256",
-                "released_snapshot_sha256", "recovery_store_sha256",
+                "released_snapshot_sha256", "recovery_store_sha256", "storage_binding_sha256",
                 "operator_baseline_projection_sha256"}
     require(isinstance(value, dict) and set(value) == expected
             and value["schema"] == OBSERVATION_SCHEMA, "Terminal observation schema/keys differ")
@@ -140,7 +141,7 @@ def validate_preflight(probe):
 # The retained binary owns terminality, retry, preparation and resource evidence.
 # Python only checks raw-file preservation and never interprets numerical payloads.
 PROBE = r"""
-import datetime,hashlib,json,os,re,stat,subprocess,sys,uuid
+import calendar,datetime,hashlib,json,os,re,stat,subprocess,sys,types,uuid
 from pathlib import Path
 sys.path.insert(0,"/opt/fullmag")
 import backend_dev as backend
@@ -150,6 +151,18 @@ image_entrypoint._configure_device_access()
 request=json.loads(sys.argv[1])
 def check(ok,message):
  if not ok: raise RuntimeError(message)
+def writer_timestamp_ns(value):
+ match=re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})",value) if isinstance(value,str) else None
+ check(match is not None,"Native diagnostic writer timestamps are malformed")
+ # Preserve all native nanoseconds; datetime only validates whole calendar seconds.
+ try: local=datetime.datetime.strptime(match.group(1),"%Y-%m-%dT%H:%M:%S")
+ except ValueError as error: raise RuntimeError("Native diagnostic writer timestamps are malformed") from error
+ zone=match.group(3);offset=0
+ if zone!="Z":
+  hours,minutes=map(int,zone[1:].split(":"))
+  check(hours<24 and minutes<60,"Native diagnostic writer timestamps are malformed")
+  offset=(hours*3600+minutes*60)*(1 if zone[0]=="+" else -1)
+ return (calendar.timegm(local.timetuple())-offset)*1000000000+int((match.group(2) or "").ljust(9,"0"))
 def read(path,limit=1048576):
  fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
  try:
@@ -229,6 +242,48 @@ def history_projection(records):
  check(full and "run_catalog.json" in full and projected=={k:baseline[k] for k in required},
        "Operator baseline scientific bytes changed")
  return packed(projected)
+def admission_snapshot():
+ result={}
+ for name in (".fullmag-linux-native-owner.json",".linux-native-sentinel",".linux-native-restart",".linux-native-probe.json"):
+  path=Path("/retained-state")/name
+  metadata=path.stat()
+  result[name]={"sha256":sha(path),"identity":[metadata.st_dev,metadata.st_ino,metadata.st_mode,
+      metadata.st_uid,metadata.st_gid,metadata.st_nlink,metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns]}
+ certificate=Path("/run/fullmag/linux-native-host.json");metadata=certificate.stat()
+ result["host_certificate"]={"sha256":sha(certificate),"identity":[metadata.st_dev,metadata.st_ino,
+     metadata.st_mode,metadata.st_uid,metadata.st_gid,metadata.st_nlink,metadata.st_size,
+     metadata.st_mtime_ns,metadata.st_ctime_ns]}
+ return result
+check(all(os.environ.get(key)==value for key,value in request["storage_environment"].items()),
+      "Private storage environment differs from its retained pin")
+admission_before=admission_snapshot()
+private=Path("/evidence/linux-native-probe.json")
+overlay=Path("/state/.linux-native-probe.json")
+metadata=private.stat();bound=overlay.stat()
+check(metadata.st_uid==65532 and stat.S_IMODE(metadata.st_mode)==0o600
+      and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink==1
+      and (metadata.st_dev,metadata.st_ino)==(bound.st_dev,bound.st_ino),
+      "Private namespace evidence inode/owner/permissions differ")
+probe_path=Path("/opt/fullmag/source/docker/all-in-one/linux_native_probe.py")
+probe_source=read(probe_path,262144)
+check(hashlib.sha256(probe_source).hexdigest()==request["storage_probe_sha256"],"Storage probe source changed")
+storage_probe=types.ModuleType("terminal_linux_native_probe")
+exec(compile(probe_source,str(probe_path),"exec"),storage_probe.__dict__)
+private_evidence=storage_probe.run(True,evidence_path=private)
+check(json.loads(read(overlay))==private_evidence,"Private evidence overlay readback differs")
+check(admission_snapshot()==admission_before,"Namespace probe changed original storage admission")
+owner=json.loads(read(Path("/retained-state")/".fullmag-linux-native-owner.json"))
+storage_binding={"environment":request["storage_environment"],"probe_source_sha256":request["storage_probe_sha256"],
+ "profile":private_evidence["storage_profile"],"engine_id":owner["engine_id"],
+ "owner_token":private_evidence["owner_token"],"root_device":private_evidence["root_device"],
+ "root_inode":private_evidence["root_inode"]}
+def save_private_report(stage):
+ report={"schema":"fullmag.terminal-private-namespace-proof.v1","stage":stage,
+  "storage_probe_source_sha256":request["storage_probe_sha256"],"private_probe":private_evidence,
+  "original_admission_before":admission_before,"original_admission_after":admission_snapshot(),
+  "storage_binding_sha256":packed(storage_binding)}
+ Path("/evidence/namespace-observation.json").write_text(json.dumps(report,sort_keys=True)+"\n")
+save_private_report("namespace-probed")
 baseline_raw=read(Path("/opt/fullmag/control")/request["history_baseline"]["path"],8388608)
 check(hashlib.sha256(baseline_raw).hexdigest()==request["history_baseline"]["sha256"],"Operator baseline CAS differs")
 baseline=json.loads(baseline_raw)
@@ -272,6 +327,9 @@ check(set(value)=={"schema_version","run_id","terminal_evidence_sha256","mutatio
       and value["run_id"]==request["run_id"] and value["mutations_applied"] is False
       and value["solve_replayed"] is False,"Native terminal evidence identity differs")
 after=inventory()
+check(read(probe_path,262144)==probe_source and admission_snapshot()==admission_before,
+      "Native proof changed source or original storage admission")
+save_private_report("native-inspected")
 check(before==after and held_before==held() and configuration==read(config,65536)
       and provenance_sha==sha(provenance,8388608),"Native proof changed retained files")
 again,again_raw,_=backend._validated_package(Path("/opt/fullmag/package"),"retained terminal proof",exclude_development_control=True)
@@ -287,25 +345,55 @@ if writer.exists():
  for key in ("token","process_start_token"):
   check(isinstance(owner[key],str) and str(uuid.UUID(owner[key]))==owner[key] and uuid.UUID(owner[key]).int!=0,
         "Native diagnostic writer token is malformed")
- acquired=datetime.datetime.fromisoformat(owner["acquired_at"].replace("Z","+00:00"))
- heartbeat=datetime.datetime.fromisoformat(owner["heartbeat_at"].replace("Z","+00:00"))
- check(acquired.tzinfo is not None and heartbeat.tzinfo is not None and heartbeat>=acquired,
-       "Native diagnostic writer timestamps are malformed")
+ acquired=writer_timestamp_ns(owner["acquired_at"])
+ heartbeat=writer_timestamp_ns(owner["heartbeat_at"])
+ check(heartbeat>=acquired,"Native diagnostic writer timestamps are malformed")
 print(json.dumps({"run_id":request["run_id"],"terminal_evidence_sha256":value["terminal_evidence_sha256"],
  "runtime_config_sha256":hashlib.sha256(configuration).hexdigest(),"package_receipt_sha256":hashlib.sha256(raw).hexdigest(),
  "provenance_sha256":provenance_sha,"held_run_intent_sha256":held_before,
- "recovery_store_sha256":packed(after),"operator_baseline_projection_sha256":history_sha},sort_keys=True,separators=(",",":")))
+ "recovery_store_sha256":packed(after),"operator_baseline_projection_sha256":history_sha,
+ "storage_binding_sha256":packed(storage_binding)},sort_keys=True,separators=(",",":")))
 """
 
 
-def diagnostic_document(control, actual, payload):
+STORAGE_ENVIRONMENT = {
+    "FULLMAG_SESSION_STORAGE_PROFILE", "FULLMAG_DOCKER_HOST_ID", "FULLMAG_RUNTIME_IMAGE_ID",
+    "FULLMAG_TOOLCHAIN_IMAGE_ID", "FULLMAG_BACKEND_CARGO_PROFILE", "FULLMAG_COMPOSE_PROJECT",
+}
+
+
+def retained_storage_environment(control, actual):
+    values = {}
+    for entry in actual.get("Config", {}).get("Env", []):
+        require(isinstance(entry, str) and "=" in entry, "Malformed retained environment entry")
+        key, value = entry.split("=", 1)
+        if key in STORAGE_ENVIRONMENT:
+            require(key not in values, "Duplicate retained storage environment key")
+            values[key] = value
+    require(set(values) == STORAGE_ENVIRONMENT
+            and values["FULLMAG_SESSION_STORAGE_PROFILE"] == "linux-native-v1"
+            and values["FULLMAG_RUNTIME_IMAGE_ID"] == actual["Image"]
+            and isinstance(values["FULLMAG_DOCKER_HOST_ID"], str) and SHA.fullmatch(values["FULLMAG_DOCKER_HOST_ID"])
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", values["FULLMAG_TOOLCHAIN_IMAGE_ID"])
+            and values["FULLMAG_BACKEND_CARGO_PROFILE"] == "backend-dev"
+            and values["FULLMAG_COMPOSE_PROJECT"] == control.project,
+            "Retained Linux storage profile/engine/image/toolchain/group differs")
+    return values
+
+
+def diagnostic_document(control, actual, payload, *, evidence_root):
+
     """Clone exact retained mounts into one no-network, no-GPU Compose probe."""
     from docker_compose_identity import source_labels, validate_source_labels
     validate_source_labels(actual, control.identity)
+    storage_environment = retained_storage_environment(control, actual)
+    require(isinstance(evidence_root, str) and re.fullmatch(
+        r"verification/terminal-prestart-recovery-20261027/probes/[0-9a-f]{32}", evidence_root),
+        "Private namespace evidence requires its own bounded control scope")
     mounts = []
     allowed = {"/state", "/host-ledger", "/opt/fullmag/package", "/opt/fullmag/control",
                "/opt/fullmag/runtime-control", "/state/runs/docker-all/session-store/runtime-services",
-               "/opt/fullmag/source"}
+               "/opt/fullmag/source", "/run/fullmag/linux-native-host.json"}
     declared = actual.get("HostConfig", {}).get("Mounts", [])
     for target in sorted(allowed):
         rows = [m for m in actual.get("Mounts", []) if m.get("Destination") == target]
@@ -330,6 +418,18 @@ def diagnostic_document(control, actual, payload):
                     "Released snapshot cannot observe a volume subpath")
             mount["volume"] = {"nocopy": True, **({"subpath": subpath} if subpath else {})}
         mounts.append(mount)
+    state_alias = dict(next(m for m in mounts if m["target"] == "/state"),
+                       target="/retained-state", read_only=True)
+    control_mount = next(m for m in mounts if m["target"] == "/opt/fullmag/control")
+    require(control_mount["type"] == "volume" and control_mount["source"] == control.volume
+            and not control_mount["volume"].get("subpath"),
+            "Private namespace evidence requires the exact unnamespaced control volume")
+    mounts.extend([state_alias,
+        {"type": "volume", "source": control.volume, "target": "/evidence", "read_only": False,
+         "volume": {"nocopy": True, "subpath": evidence_root}},
+        {"type": "volume", "source": control.volume, "target": "/state/.linux-native-probe.json",
+         "read_only": True, "volume": {"nocopy": True, "subpath": evidence_root + "/linux-native-probe.json"}},
+    ])
     libraries = [entry.partition("=")[2] for entry in actual.get("Config", {}).get("Env", [])
                  if isinstance(entry, str) and entry.startswith("LD_LIBRARY_PATH=")]
     require(len(libraries) <= 1, "Ambiguous retained library path")
@@ -341,15 +441,15 @@ def diagnostic_document(control, actual, payload):
         "image": actual["Image"], "pull_policy": "never", "runtime": "runc",
         "user": "65532:65532", "network_mode": "none", "read_only": True,
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
-        "mem_limit": "256m", "pids_limit": 24, "cpus": 0.25, "labels": labels,
-        "environment": {"PYTHONDONTWRITEBYTECODE": "1", "FULLMAG_DOCKER_DEVICE_ACCESS": "cpu", "LD_LIBRARY_PATH": "/opt/fullmag/package/lib" + (":" + libraries[0] if libraries else "")},
+        "mem_limit": "256m", "pids_limit": 24, "cpus": 1, "healthcheck": {"disable": True}, "labels": labels,
+        "environment": {**storage_environment, "PYTHONDONTWRITEBYTECODE": "1", "FULLMAG_DOCKER_DEVICE_ACCESS": "cpu", "LD_LIBRARY_PATH": "/opt/fullmag/package/lib" + (":" + libraries[0] if libraries else "")},
         "volumes": mounts, "entrypoint": ["/usr/local/bin/python3", "-B", "-c"],
         "command": [PROBE, json.dumps(payload, separators=(",", ":"))],
     }}}
 
 
 def build_observation(control, actual, probe, history_baseline):
-    from docker_build_control import compose_capture
+    from docker_build_control import compose_capture, ControlOutcomeUnknown
     from docker_volume_reconcile import read_raw
     from docker_volume_pre_ack_retry import _released_snapshot
     run_id, held = validate_preflight(probe)
@@ -357,20 +457,43 @@ def build_observation(control, actual, probe, history_baseline):
     raw = read_raw(control, history_baseline["path"])
     require(digest(raw) == history_baseline["sha256"], "Operator baseline CAS differs")
     require(isinstance(json.loads(raw), dict), "Operator baseline must be an object")
+    storage_environment = retained_storage_environment(control, actual)
+    source_path = Path(__file__).resolve().parents[1] / "docker/all-in-one/linux_native_probe.py"
+    source_raw = source_path.read_bytes()
+    require(0 < len(source_raw) <= 262144, "Storage probe source exceeds its bound")
+    evidence_root = "verification/terminal-prestart-recovery-20261027/probes/" + uuid.uuid4().hex
+    helper_name = "fullmag-terminal-proof-" + evidence_root.rsplit("/", 1)[1]
     # Keep the large baseline in its existing control mount, below argv limits.
     payload = {"run_id": run_id, "image_id": actual["Image"], "held": held,
-               "history_baseline": history_baseline, "history_run_id": history_baseline["run_id"]}
-    document = diagnostic_document(control, actual, payload)
+               "history_baseline": history_baseline, "history_run_id": history_baseline["run_id"],
+               "storage_probe_sha256": digest(source_raw), "storage_environment": storage_environment}
+    document = diagnostic_document(control, actual, payload, evidence_root=evidence_root)
     before = _released_snapshot(control, actual)
     require(before.get("active_count") == 0, "A resource reservation is active")
-    result = compose_capture(document, "run", "--rm", "--no-deps", "terminal-prestart-proof", timeout=180)
+    control.write(evidence_root + "/linux-native-probe.json", {})
+    observation = {"schema": "fullmag.terminal-native-observation-attempt.v1", "state": "observing",
+                   "helper_name": helper_name, "storage_probe_source_sha256": digest(source_raw)}
+    control.write(evidence_root + "/attempt.json", observation)
+    try:
+        result = compose_capture(document, "run", "--rm", "--name", helper_name, "--no-deps",
+                                 "terminal-prestart-proof", timeout=600)
+    except ControlOutcomeUnknown as error:
+        observation["state"] = "outcome-unknown-resources-retained"
+        try:
+            control.write(evidence_root + "/attempt.json", observation)
+        except Exception:
+            error.add_note("Unknown native observation could not be persisted; helper must be inspected explicitly")
+        raise
     require(len(result) <= 1024 * 1024, "Terminal observation exceeds its bound")
     value = json.loads(result)
     after = _released_snapshot(control, actual)
     require(before == after and after.get("active_count") == 0, "Released resource evidence changed")
     value.update(schema=OBSERVATION_SCHEMA, released_snapshot_sha256=digest(canonical(after)))
     validate_observation(value)
-    require(read_raw(control, history_baseline["path"]) == raw, "Operator baseline changed during proof")
+    require(read_raw(control, history_baseline["path"]) == raw and source_path.read_bytes() == source_raw,
+            "Operator baseline or storage probe source changed during proof")
+    observation.update(state="observed", observation=value)
+    control.write(evidence_root + "/attempt.json", observation)
     return value
 
 

@@ -50,8 +50,9 @@ wskazywać tego samego ownera i dzieci.
 build_observation używa krótkiej usługi diagnostycznej we własnej grupie Compose.
 Aktualny sealed package, control/runtime-control i wybrany source są readonly.
 Nie ma candidate overlay, publikacji provenance, /build, /user-data, GPU,
-sieci ani socketu Dockera. State i ledger mają zapis wyłącznie dla istniejących
-natywnych writer guards; ich dowody nie są zmieniane. Zachowuje się dokładne
+sieci ani socketu Dockera. State i ledger mają zapis dla istniejących natywnych writer guards;
+nowy namespace probe używa ponadto własnego tymczasowego katalogu testów
+filesystemu w state i usuwa go po sprawdzeniu. Oryginalne admission nie są zmieniane. Zachowuje się dokładne
 mounty i podkatalogi wolumenów. Ponieważ probe pomija normalny entrypoint,
 wywołuje wyłącznie image-owned _configure_device_access w trybie CPU,
 zachowując istniejącą trasę biblioteki /usr/local/cuda/compat bez hardware
@@ -98,8 +99,90 @@ manual admission, zmiany podczas odczytu, malformed writer/provenance,
 publication/continuation CAS oraz kwalifikowaną nową generację.
 Stare testy v1 uruchamia się osobno tą samą receptą offline.
 
-Na etapie przygotowania nie wykonano prawdziwego native proof, reconcile,
-restartu ani Solve. Runtime proof i preview pozostają NOT VERIFIED do
-niezależnego review i osobnego zarządzanego uruchomienia. Testy Rust nie są
+Przed korektą adaptera nie uzyskano poprawnego prawdziwego native proof.
+Wynik kolejnej rzeczywistej diagnostyki opisano poniżej. Nie wykonano jeszcze
+reconcile, restartu ani Solve; preview i kwalifikacja wznowienia wymagają
+osobnego wyniku zarządzanej recepty. Testy Rust nie są
 kompilowane. Recepta just docker-dev-offline-check używa zatrzymanej własnej
 grupy, sourceRO/controlRW, bez danych użytkownika i GPU.
+
+
+## Korekta diagnostyki po pierwszej rzeczywistej odmowie
+
+Pierwszy helper diagnostyczny zakończył się odmową
+„host-bound solver lease has no exact released host row”. Nie uruchomiono
+reconcile, restartu aplikacji ani Solve. Samo skopiowanie env nie wystarcza:
+linux_native_store_identity wymaga prawdziwego probe aktualnego namespace.
+Po tej odmowie osobny odczyt root potwierdził niezmienność 43 katalogów,
+1391 plików runu i 2 plików solution; raport:
+verification/terminal-prestart-recovery-20261027/post-first-native-science-preservation.json.
+
+Nowy adapter kopiuje wyłącznie sześć dokładnych wartości retained Config.Env:
+FULLMAG_SESSION_STORAGE_PROFILE=linux-native-v1, FULLMAG_DOCKER_HOST_ID,
+FULLMAG_RUNTIME_IMAGE_ID zgodny z obrazem, FULLMAG_TOOLCHAIN_IMAGE_ID,
+FULLMAG_BACKEND_CARGO_PROFILE=backend-dev i FULLMAG_COMPOSE_PROJECT zgodny z grupą.
+Brak, duplikat lub obca wartość oznaczają odmowę; brak fallbacku do domysłów.
+
+Każdy proof ma nowy katalog control/probes/UUID, plik evidence początkowo UID65532/mode600 (publisher probe ustawia później 0644),
+RW mount /evidence i RO file-subpath overlay /state/.linux-native-probe.json
+tego samego inode. Zachowuje volume.nocopy=true i dokładne istniejące subpath.
+RO alias /retained-state pokazuje pierwotny probe, owner i oba sentinele;
+oryginalny host certificate jest readonly. Prawdziwy linux_native_probe.run(True,
+evidence_path=...) z przypiętego sourceRO tworzy evidence swojego namespace,
+bez attest/reuse_certificate/complete_preflight, candidate ani publikacji provenance.
+Oryginalne admission są porównane przed i po, włącznie z raw SHA i tożsamością
+plików. Źródło probe jest ponownie porównane po native CLI.
+
+namespace-observation.json w prywatnym control dir zapisuje pojedynczy dowód.
+Mount namespace i raw private probe SHA nie są invariantem między helperami.
+Observation porównuje tylko storage_binding_sha256 obejmujący stabilny profile,
+retained env, owner/engine/root binding i przypięte źródło. Pierwotny probe może
+legalnie obrócić się podczas późniejszego zarządzanego restartu; istniejący
+_finish kwalifikuje nowe admission. Dowody historii/native terminal/held pozostają
+dokładne i niezależne od tej rotacji.
+
+Helper nie ma API: jawne healthcheck.disable=true wyłącza odziedziczony HEALTHCHECK.
+CPU wynosi 1, poniżej budżetu własnego backendu 4; timeout obserwacji wynosi 600 s.
+Pełne dwukrotne hashowanie pakietu i historii pozostaje zachowane.
+Timeout klienta zapisuje outcome-unknown-resources-retained z nazwą dokładnego
+helpera i nie oznacza naukowego Failed/Succeeded ani zakończenia procesu.
+Przed kolejnym prawdziwym prepare wymagane są niezależny review i interpretowane
+regresje; same testy adaptera nie kwalifikują rzeczywistego namespace/store ID.
+
+
+## Precyzja natywnego czasu writer na Python 3.10
+
+Drugi rzeczywisty helper przeszedł native CLI, ponowne hashowanie pakietu
+i kontrolę niezmienności admission, a odmówił przy timestampie
+2026-10-27T21:18:59.543852683+00:00. Python 3.10 fromisoformat nie obsługuje
+tego natywnego formatu 9 cyfr. Nie jest to błąd obliczeń ani dowód aktywnego
+writer; nie zmieniono statusu runu lub zasobów.
+
+Embedded writer_timestamp_ns stosuje istniejący wzorzec repo
+docker_volume_capture_failure_reconcile._timestamp_ns: całkowite sekundy
+kalendarza i osobna frakcja 1..9 cyfr, dopełniana zerami do nanosekund.
+Obsługuje Z i jawny offset ±HH:MM z walidacją daty/czasu oraz zakresu offsetu.
+Nie akceptuje dat bez strefy, malformed wartości ani leap second.
+Porównanie heartbeat >= acquired używa całkowitych nanosekund, bez float
+i bez obcinania frakcji do mikrosekund. Regresja odwróconej kolejności o 1 ns
+wewnątrz tej samej mikrosekundy musi odmówić. Pozostałe bramki writer,
+native evidence, pakietu i historii pozostają bez zmian.
+
+
+## Wynik poprawionej diagnostyki natywnej
+
+Finalny moduł SHA256
+`50d72091be223afde66447cf8fb6e916db90028ca9058984d545c870058329a6`
+i test `15fddad60f111181bb2392f1e8ba12a15853b65d96543e5fcc2ae12a0c6055c8`
+przeszły 32/32 regresje w zarządzanym helperze własnej grupy oraz niezależny
+review bez Blocker/Required. Receipt `offline-writer-time-32-final.json`
+SHA256 `a62e49f24a2edf9cf6f07dcc931da981a8c8082349caa77d2b5b19259e369f0e`.
+
+Trzeci rzeczywisty prepare zakończył się succeeded po 45,108 s. Natywny CLI,
+private namespace, zachowanie oryginalnego admission, sealed package, historii
+i obu manual held intents przeszły pełną walidację. Raport:
+`verification/terminal-prestart-recovery-20261027/native-prepare-third-status.json`.
+Request `request-third.json` w tym samym katalogu ma SHA256
+`34dd8aaf384a77e35edc3ab0e18102d4d080a0da7c3fe26da5da3441b9df9967`.
+To diagnostyka przygotowania, nie jeszcze kanoniczny preview/apply ani
+kwalifikacja wznowienia. Nie wykonano nowego Solve.
