@@ -807,3 +807,72 @@ Raport i logi są w wolumenie kontrolnym własnej grupy, nie na hoście.
 Pełna bramka po succeeded, cold reopen, odbiór browser/WebGL oraz kwalifikacja
 naukowa nadal NOT VERIFIED. Nie uruchamiano buildu/restartu podczas obliczeń.
 Zachowano osobno wcześniejszy WIP runtime i obcy wpis indeksu.
+
+### Pełny Universe policzony; końcowa publikacja nieudana — 27.10.2026
+
+Aktualizacja zastępuje wcześniejszą obserwację running dla runu
+run-5654db21201dd6c660f7ecae78baf8588477fe2a7d90480d9d64b30e4d050080.
+Worker execution receipt ma status completed, completed_step_count=1 oraz
+zapisany closed-loop bundle CAS
+39f795b2178f12c47f7622157f298d43e65aac39582467018abe058bf6b37c7e
+(12485669 bajtów). Raport operatora potwierdza 1145/1145 targetów,
+ostatni indeks 1144 oraz 2125120 par punkt–komórka. Nie są to kroki LLG.
+
+Cała operacja trwała 7985.073250910 s (2 h 13 min 5 s), operator pola
+według raportu 7920.166107451 s. Nie przekroczono limitu 10800 s.
+Po utrwaleniu pakietu worker zakończył się exit 1 przez StoreWriterBusy:
+failure_reason wskazuje konflikt deskryptora magazynu z owner PID3784.
+Receipt wyjścia: timed_out=false, stop_requested=false. PID9549 już nie
+istnieje; dokładna rezerwacja lease-fb64569f6c104e73aa52cd397ecde008 ma
+state=released, released_at=2026-10-27T07:47:00.529944397Z.
+Task w publicznym API pozostaje failed; artifact_ids=[] i katalog anteny404.
+Nie zmieniono go ręcznie na succeeded i nie ponowiono Solve.
+
+Diagnostyczny audyt zachowanego CAS:
+- hash i długość całego pakietu oraz 22 payloadów poprawne;
+- 1145 węzłów i 6428 Tet4 bitowo zgodnych z zamrożonym Global;
+- wszystkie 3435 składowe H skończone;
+- V/J i tablice źródła zgodne bitowo z diagnostyką20;
+- H w 20 wspólnych punktach zgodne bitowo z wcześniejszą próbą.
+
+To potwierdza dane ukończonego operatora, nie publikację przez publiczne API,
+nie obraz WebGL i nie niezależną kwalifikację fizyki. Kanoniczny Rust decoder
+nie został ponownie wykonany w audycie; parser odwzorowuje protokół FMACLB01,
+a porównanie wykorzystuje istniejący compare_payloads kontrolera odbioru.
+Publiczna bramka succeeded nadal nie jest zaliczona.
+
+Dowody: verification/rt0-full-universe-20261027/terminal-bundle-audit.json,
+terminal-bundle-audit-pl.md, terminal-bundle-audit-check.py oraz
+terminal-bundle-audit-import-path-pl.md we własnym wolumenie kontrolnym.
+Istniejący odczyt receiptu/CAS umożliwia odzyskanie bez operatora numerycznego,
+ale bramki publikacji świadomie odrzucają Terminal/Failed i Released lease.
+Nie znaleziono publicznego importu samego closed-loop bundle do SolutionSet.
+Następny krok wymaga jawnej, przejrzanej operacji recovery publikacji w obecnej
+warstwie runtime-control, z zachowaniem historii Failed i pełnej tożsamości.
+Nie obchodzimy Succeeded gate, nie reaktywujemy starego claimu ani rezerwacji.
+
+### Integracja najnowszego pobranego mastera — 27.10.2026
+
+Pobrano origin/master=5c5e072314fad6d3037ee064566dd07c7757d6ca.
+Zintegrowano merge commitem 031f718f6a967b88a2fc39838a6a8f7c393f43b8,
+rodzice: 72399be1cbe7050a7abd1960ff865bb0678656d7 oraz master powyżej.
+Rozwiązano 18 konfliktów historii, zachowując 21 lokalnie zmienionych plików,
+obcy staged blob ArtifactInspectionSource.tsx i wszystkie pliki nieśledzone.
+Pięć nakładających się zmian WIP scalono osobno; nie weszły do merge commita.
+Indeks tymczasowy i kopia pierwotnego indeksu są w metadanych Git, a receipty
+i propozycje w verification/master-integration-20261027/ wolumenu kontrolnego.
+
+Regresje wykryły błąd odmowy FDM-specific selection przy jawnie authored FEM
+jeszcze przed publikacją topologii. Usunięto zależność odmowy od publikacji;
+strict tuple/generation gate nie został osłabiony. Dodano dwie regresje.
+Dostosowano stare asercje inspektora do widocznych faktów read-only oraz
+test brakujących próbek stopki do aktualnego kontraktu istniejącej sesji;
+brak sesji nadal daje pustą telemetrię, jak sprawdza oddzielna regresja.
+
+Końcowo: 248/248 testów sześciu plików pass, pnpm typecheck exit0 i ESLint
+trzech końcowo zmienionych plików exit0. Wszystko we własnym stałym frontendzie
+Docker, bez Rust unit tests i bez ponowienia zablokowanej ścieżki przeglądarki.
+Raport Vitest: /state/development/verification/master-integration-20261027-final.json
+w wolumenie frontendu. Native build scalonego mastera i poprawki Auto/null
+pozostaje do wykonania przez managed just po przygotowaniu recovery.
+Nie restartowano backendu ani nie zmieniano producenta zachowanego wyniku.

@@ -385,7 +385,12 @@ describe("FooterTelemetry", () => {
     expect(byId.rate?.value).toBe("4.2");
     expect(byId.rate?.unit).toBe("steps/s");
 
-    const emptyModel = buildFooterTelemetryModel(null, null);
+    const emptyModel = buildFooterTelemetryModel({
+      ...telemetryStatus,
+      run: null,
+      metrics: { ...telemetryStatus.metrics, steps_per_second: Number.NaN, total_steps: Number.NaN },
+      solver: { ...telemetryStatus.solver, dt: Number.NaN, max_torque_T: Number.NaN },
+    }, null);
     const emptyById = Object.fromEntries(emptyModel.metrics.map((metric) => [metric.id, metric]));
     expect(emptyById.time?.value).toBe("—");
     expect(emptyById.time?.unit).toBe("s");

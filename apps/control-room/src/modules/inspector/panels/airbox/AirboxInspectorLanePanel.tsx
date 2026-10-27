@@ -66,7 +66,7 @@ function AirboxInspectorLanePanel({
   const publishedFemMesh = lane === "fem"
     ? hasPublishedFemMeshEvidence(runtimeStatus)
     : hasPublishedFemTopologyInspectionLane(runtimeStatus);
-  const inspectionLane = lane === "unresolved" && publishedFemMesh && authoringLane === "conflict"
+  const inspectionLane = lane === "unresolved" && authoringLane === "conflict"
     ? "conflict" : lane;
   const explicitFdm = lane === "fdm";
   const domain = useDomainMetaResource({ enabled: explicitFdm });
