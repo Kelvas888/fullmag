@@ -149,6 +149,9 @@ jobs:
       - name: Run native container recovery capability CLI contracts
         run: cargo test -p fullmag-cli --bin fullmag container_recovery_capabilities
 
+      - name: Run instance discovery contracts (ADR 0069)
+        run: cargo test -p fullmag-api --bin fullmag-api instance_discovery::tests --no-fail-fast
+
       - name: Run complete session reachability and archive contracts
         run: cargo test -p fullmag-session --lib --no-fail-fast
 
