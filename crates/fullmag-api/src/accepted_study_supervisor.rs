@@ -718,6 +718,18 @@ pub(crate) fn run_supervised_accepted_worker_with_host(
             );
         }
     };
+    if !process_exit_receipt.status_success {
+        // The receipt keeps a bounded excerpt; the API log keeps the worker's
+        // full native diagnostics (bounded) for root-cause analysis.
+        let stderr = String::from_utf8_lossy(&outcome.output.stderr);
+        tracing::warn!(
+            run_id = %process_exit_receipt.run_id,
+            task_id = %process_exit_receipt.task_id,
+            receipt_id = %process_exit_receipt.receipt_id,
+            stderr = %bounded_head_and_tail(&stderr, WORKER_STDERR_LOG_EDGE_BYTES),
+            "accepted worker process failed"
+        );
+    }
     accepted_supervisor_test_fail_after_process_exit_receipt()?;
     match final_heartbeat_result {
         Ok(FinalHeartbeatReconciliation::Reconciled) => {}
@@ -2350,33 +2362,66 @@ fn worker_failure_reason(outcome: &ObservedWorkerProcess) -> String {
         return "accepted worker process exceeded its explicit timeout and was terminated".into();
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Startup and native solver diagnostics precede the actual failure. Keep
-    // the worker's explicit error chain (or the stderr tail), not just a
-    // successful initialization banner when the bounded receipt is written.
-    let failure = stderr
-        .rsplit_once("accepted worker failed:")
-        .map(|(_, failure)| failure)
-        .unwrap_or(stderr.as_ref());
-    let normalized = failure.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
     let detail = if normalized.is_empty() {
         "no worker error output".to_string()
     } else {
-        // Prefer the worker's own error report; diagnostic progress lines
-        // printed around it must not hide the failure. Otherwise keep the tail.
-        let marker = "accepted worker failed:";
-        let report = normalized.rfind(marker).map(|index| &normalized[index..]);
-        let chars = report.unwrap_or(&normalized).chars().collect::<Vec<_>>();
-        if report.is_some() {
-            chars.iter().take(1024).collect()
-        } else {
-            let start = chars.len().saturating_sub(512);
-            let tail = chars[start..].iter().collect::<String>();
-            if start > 0 { format!("...{tail}") } else { tail }
+        // Startup and native solver diagnostics precede the actual failure.
+        // Prefer the worker's own error report, then the first native abort
+        // report (MFEM/C++/Rust panic): MPI_ABORT appends a long banner after
+        // it, so a plain stderr tail loses the actual error. Otherwise keep
+        // both the head and the tail of the output.
+        let report = normalized
+            .rfind(WORKER_FAILURE_MARKER)
+            .or_else(|| {
+                NATIVE_ABORT_MARKERS
+                    .iter()
+                    .filter_map(|marker| normalized.find(marker))
+                    .min()
+            })
+            .map(|index| &normalized[index..]);
+        match report {
+            Some(report) => bounded_head(report, WORKER_FAILURE_REPORT_BYTES).to_owned(),
+            None => bounded_head_and_tail(&normalized, WORKER_FAILURE_EDGE_BYTES),
         }
     };
     // ExitStatus also preserves a Unix signal (where code() is None).
     // Stderr can contain only successful startup diagnostics after a crash.
     format!("accepted worker process failed ({}): {detail}", output.status)
+}
+
+const WORKER_FAILURE_MARKER: &str = "accepted worker failed:";
+/// Fatal-report prefixes printed by MFEM (`mfem_error`, `MFEM_VERIFY`),
+/// the C++ runtime and Rust before the process aborts.
+const NATIVE_ABORT_MARKERS: &[&str] = &[
+    "MFEM abort:",
+    "Verification failed:",
+    "terminate called",
+    "panicked at",
+];
+// The durable receipt bounds failure_reason to 4096 bytes, including the
+// status prefix and the elision marker.
+const WORKER_FAILURE_REPORT_BYTES: usize = 3072;
+const WORKER_FAILURE_EDGE_BYTES: usize = 1536;
+const WORKER_STDERR_LOG_EDGE_BYTES: usize = 32 * 1024;
+
+fn bounded_head(text: &str, limit: usize) -> &str {
+    let mut end = text.len().min(limit);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn bounded_head_and_tail(text: &str, edge: usize) -> String {
+    if text.len() <= 2 * edge {
+        return text.to_owned();
+    }
+    let mut start = text.len() - edge;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{} ... {}", bounded_head(text, edge), &text[start..])
 }
 
 fn commit_worker_command(
@@ -2574,9 +2619,59 @@ mod tests {
         };
         let reason = worker_failure_reason(&outcome);
         assert!(
-            reason.starts_with("accepted worker process failed: accepted worker failed: execute accepted worker Start"),
+            reason.starts_with("accepted worker process failed (exit status: 1): accepted worker failed: execute accepted worker Start"),
             "{reason}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_failure_reason_keeps_the_native_abort_report_before_mpi_banner() {
+        use std::os::unix::process::ExitStatusExt;
+        let banner = "[fullmag-fem] cpu runtime: poisson_solver=cg mesh_nodes=136 elements=659\n";
+        let mpi = "-----\nMPI_ABORT was invoked on rank 0 in communicator MPI_COMM_WORLD\nwith errorcode -1.\nNOTE: invoking MPI_ABORT causes Open MPI to kill all MPI processes.\n".repeat(8);
+        let stderr = format!(
+            "{banner}\n\nVerification failed: (x) is false:\n --> bad fespace\n ... in function: f\n{mpi}"
+        );
+        let outcome = ObservedWorkerProcess {
+            output: Output {
+                status: ExitStatus::from_raw(255 << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+            timed_out: false,
+            stop_requested: false,
+            process_id: 7,
+            process_start_token: None,
+            control_failure_reason: None,
+        };
+        let reason = worker_failure_reason(&outcome);
+        assert!(
+            reason.contains("): Verification failed: (x) is false: --> bad fespace"),
+            "{reason}"
+        );
+        assert!(reason.len() <= 4096, "{}", reason.len());
+        let without_report = String::from_utf8_lossy(&outcome.output.stderr)
+            .replace("Verification failed:", "error");
+        let unknown = ObservedWorkerProcess {
+            output: Output {
+                stderr: without_report.into_bytes(),
+                ..outcome.output
+            },
+            ..outcome
+        };
+        let reason = worker_failure_reason(&unknown);
+        assert!(reason.contains("[fullmag-fem] cpu runtime"), "{reason}");
+        assert!(reason.contains(" ... "), "{reason}");
+        assert!(reason.len() <= 4096, "{}", reason.len());
+    }
+
+    #[test]
+    fn bounded_output_excerpts_respect_utf8_boundaries() {
+        assert_eq!(bounded_head("ąb", 1), "");
+        assert_eq!(bounded_head("ąb", 2), "ą");
+        assert_eq!(bounded_head_and_tail("abcdef", 3), "abcdef");
+        assert_eq!(bounded_head_and_tail("ąbcdeź", 2), "ą ... ź");
     }
 
     fn temporary_store(name: &str) -> (PathBuf, SessionStore) {
