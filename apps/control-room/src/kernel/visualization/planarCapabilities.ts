@@ -20,7 +20,7 @@ export interface PlanarInspectorCapabilities {
   vectors: FieldMapCapability;
 }
 
-export type PlanarScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer";
+export type PlanarScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer" | "region";
 
 /**
  * Structured FDM grids have no mesh parts; native layers exist only for FDM

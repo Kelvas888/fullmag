@@ -674,6 +674,17 @@ fn validate_planar_visualization_patch(patch: &PlanarVisualizationPatch) -> Resu
             ));
         }
     }
+    if let Some(crate::schemas::visualization_state::PlanarViewScopeState::Region {
+        scope_id,
+        region_id,
+    }) = &patch.view_scope
+    {
+        if scope_id.trim().is_empty() || region_id.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "planar.view_scope region requires non-empty scope_id and region_id",
+            ));
+        }
+    }
     if let Some(source) = &patch.source {
         if let crate::schemas::visualization_state::PlanarSourceSelectionState::Monitor {
             monitor_id,

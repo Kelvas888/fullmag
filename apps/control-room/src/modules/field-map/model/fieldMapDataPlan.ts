@@ -6,12 +6,34 @@ import type {
 
 import { planarScopeCapability } from "./fieldMapCapabilities";
 
-export type FieldMapViewScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer";
+export type FieldMapViewScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer" | "region";
 
 /** The planar profile is the source of truth for scope identity. */
 export interface FieldMapViewScope {
   kind: FieldMapViewScopeKind;
   scope_id?: string | null;
+  /** Region within the `scope_id` object for `region` scopes. */
+  region_id?: string | null;
+}
+
+/**
+ * Query parameters of a planar view scope. The v2 contract accepts an id only
+ * for mesh_part, layer and region (object id plus `scope_region_id`);
+ * monitor_target and airbox must not receive a guessed id.
+ */
+export function planarScopeQuery(
+  viewScope: FieldMapViewScope,
+): Pick<PlanarFieldQuery, "scope_id" | "scope_kind" | "scope_region_id"> {
+  const scopeId = viewScope.kind === "mesh_part" ||
+    viewScope.kind === "layer" ||
+    viewScope.kind === "region"
+    ? viewScope.scope_id ?? undefined
+    : undefined;
+  return {
+    scope_id: scopeId,
+    scope_kind: viewScope.kind,
+    scope_region_id: viewScope.kind === "region" ? viewScope.region_id ?? undefined : undefined,
+  };
 }
 
 export type FieldMapDataPlanAvailability =
@@ -82,13 +104,7 @@ export function buildFieldMapDataPlan(
       quality: input.quality,
       resolution_x: input.resolution[0],
       resolution_y: input.resolution[1],
-      // The v2 contract only accepts an id for mesh_part and layer. In
-      // particular, monitor_target and airbox must not receive a guessed id.
-      scope_id:
-        viewScope.kind === "mesh_part" || viewScope.kind === "layer"
-          ? viewScope.scope_id ?? undefined
-          : undefined,
-      scope_kind: viewScope.kind,
+      ...planarScopeQuery(viewScope),
       snapshot_id: input.snapshotId ?? undefined,
       stage_id: input.stageId ?? undefined,
       vector_budget: needsVectors ? input.vectorBudget : 0,

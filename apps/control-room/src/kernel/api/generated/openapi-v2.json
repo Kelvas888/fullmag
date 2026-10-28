@@ -27754,6 +27754,13 @@
           "scope_kind": {
             "type": "string"
           },
+          "scope_region_id": {
+            "description": "Region within the `scope_id` object for `region` scopes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "section": {
             "oneOf": [
               {
@@ -28791,6 +28798,29 @@
             },
             "required": [
               "scope_id",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One region of a ferromagnetic object: `scope_id` is the object id.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "region"
+                ],
+                "type": "string"
+              },
+              "region_id": {
+                "type": "string"
+              },
+              "scope_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "scope_id",
+              "region_id",
               "kind"
             ],
             "type": "object"
@@ -55582,6 +55612,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -55787,6 +55826,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -56001,6 +56049,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -56271,6 +56328,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -56434,6 +56500,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -56648,6 +56723,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -56853,6 +56937,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -57078,6 +57171,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -57297,6 +57399,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -57510,6 +57621,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -57788,6 +57908,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -57959,6 +58088,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"
@@ -58181,6 +58319,15 @@
             }
           },
           {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "in": "query",
             "name": "stage_id",
             "required": false,
@@ -58394,6 +58541,15 @@
           {
             "in": "query",
             "name": "scope_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Region id within the `scope_id` object when `scope_kind=region`.",
+            "in": "query",
+            "name": "scope_region_id",
             "required": false,
             "schema": {
               "type": "string"

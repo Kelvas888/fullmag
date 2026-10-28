@@ -331,6 +331,8 @@ pub enum PlanarViewScopeState {
     Airbox,
     /// Native layer of an FDM multilayer carrier, keyed by its canonical layer id.
     Layer { scope_id: String },
+    /// One region of a ferromagnetic object: `scope_id` is the object id.
+    Region { scope_id: String, region_id: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone, Copy, PartialEq, Eq)]

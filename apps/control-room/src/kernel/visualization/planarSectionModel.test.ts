@@ -207,3 +207,36 @@ describe("continuous FEM navigation step", () => {
     expect(stepSectionFraction(0.5, fallback, 1)).toBeCloseTo(0.51, 12);
   });
 });
+
+describe("named object layers", () => {
+  it("merges realized bodies per object and maps a layer to a centred slab", async () => {
+    const { matchObjectLayer, objectLayerSlice, objectSectionLayers } = await import("./planarSectionModel");
+    const layers = objectSectionLayers([
+      { bounds_max: [1, 1, 5e-9], bounds_min: [0, 0, 0], object_id: "free", object_name: "free_layer" },
+      { bounds_max: [1, 1, 12e-9], bounds_min: [0, 0, 7e-9], object_id: "ref", object_name: "reference" },
+      { bounds_max: [2, 1, 6e-9], bounds_min: [1, 0, 1e-9], object_id: "free", object_name: "free_layer" },
+      { bounds_max: [1, 1, 3e-9], bounds_min: [0, 0, 3e-9], object_id: "flat", object_name: "flat" },
+    ], "z");
+    expect(layers).toEqual([
+      { max: 6e-9, min: 0, name: "free_layer", objectId: "free" },
+      { max: 12e-9, min: 7e-9, name: "reference", objectId: "ref" },
+    ]);
+    const geometry = {
+      layerCount: null,
+      layerSpacing: null,
+      nativeResolution: null,
+      normal: "z" as const,
+      normalExtent: 20e-9,
+      normalMax: 20e-9,
+      normalMin: 0,
+      plane: "xy" as const,
+      u: "x" as const,
+      v: "y" as const,
+    };
+    const slice = objectLayerSlice(geometry, layers[1]!);
+    expect(slice.operator).toEqual({ kind: "slab_average", thickness_m: 5e-9 });
+    expect(slice.position_fraction).toBeCloseTo(0.475, 12);
+    expect(matchObjectLayer(slice, geometry, layers)?.objectId).toBe("ref");
+    expect(matchObjectLayer({ ...slice, operator: { kind: "plane_sample" } }, geometry, layers)).toBeNull();
+  });
+});

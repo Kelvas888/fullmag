@@ -176,6 +176,10 @@ vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   useFieldCatalogResource: () => ({ data: null, error: null, status: "idle" }),
 }));
 
+vi.mock("@/kernel/resources/useGeometryRealizationResource", () => ({
+  useGeometryRealizationResource: () => ({ data: null, error: null, status: "idle" }),
+}));
+
 vi.mock("@/kernel/resources/useSessionStatus", () => ({
   useSessionStatusSelector: () => null,
 }));
