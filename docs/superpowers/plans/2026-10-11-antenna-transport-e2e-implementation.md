@@ -4945,3 +4945,55 @@ To dowód kontroli interpretowanych, nie kwalifikacji naukowej ani WebGL. Build 
 Niezależny przegląd czterech plików ścieżki oracle-wheel nie wykazał błędów wymagających poprawki. Zakres i ograniczenia zapisano w wolumenie kontrolnym jako `verification/oracle-wheel-route-20261025/review-pl.json`. Ochrona przed zwykłymi zmianami współbieżnymi nie jest izolacją od wrogiego procesu; nie deklarujemy takiej gwarancji. Źródłowa analiza replayu potwierdziła, że wymóg szczególnego raportu awarii z zakazem ponowienia przesłania ogólną gałąź Failed. Żadnego patcha recovery nie zastosowano.
 
 Stan runtime potwierdzono odczytem `/opt/fullmag/runtime-control/runtime-service/process-tree.json`: `failed_outcome_retained`, SHA256 `c1da239cd9af4422c86a1e4b14a875b268932c31096f29229737d822b4fda015`. Lista procesów nie zawiera API ani workera obliczeń.
+
+
+## Wybór próbki do pola i odpowiedzi falowej — 28.10.2026
+
+Decyzja użytkownika: odtworzyć próbkę Co/Ni z publikacji Sushruth i in.,
+[Phys. Rev. Research 2, 043203 (2020)](https://journals.aps.org/prresearch/pdf/10.1103/PhysRevResearch.2.043203).
+Jest to wybór próbki do kolejnego etapu, nie dowód jej wykonania w Fullmagu.
+Nie zastępuje zatwierdzonej pełnej pętli microstrip modelem CPW; porównanie
+geometrii CPW z publikacją pozostaje osobnym scenariuszem.
+
+### Rozdzielenie parametrów i ich pochodzenia
+
+| Zestaw | Parametry | Znaczenie |
+|---|---|---|
+| Próbka eksperymentalna, sekcja IV A | Pt(5)/Cu(2.5)/[Ni(0.6)/Co(0.2)]×21/Ni(0.6)/Cu(2.5)/Ta(2.5), grubości w nm | Suma grubości magnetycznych Ni/Co wynosi 17.4 nm; nie 20 nm z tabeli I. |
+| Próbka eksperymentalna, sekcja IV A i rys. 5 | szerokość falowodu 20 µm, alfa 0.013 (dopasowanie FMR: ±0.002), efektywne pole anizotropii 3 mT | Pole anizotropii nie jest polem zewnętrznym ani całkowitym polem efektywnym. |
+| Geometria nominalna, sekcja IV A | SiO2 30 nm, Al 90 nm, szerokość pasków 200 nm, szczelina 250 nm, odległość anten 2 µm | Odstęp izolatora od wierzchu stosu nie utożsamia się bez wyprowadzenia z odległością każdej warstwy magnetycznej od środka metalowej anteny. |
+| Model analityczny, tabela I | grubość 20 nm, mu0 Ms 0.89 T, mu0 H_eff 0.25 T, gamma/(2 pi) 30 GHz/T, alfa 0.01–0.1 | Parametry istniejącego niezależnego wzorca rys. 3; nie komplet materiału próbki eksperymentalnej. |
+| Dopasowanie rys. 6 | alfa 0.03, szerokość 180 nm, szczelina 200 nm, odstęp 80 nm, odległość 1.8 µm | Parametry dopasowania; nie nadpisują nominalnej geometrii ani wyniku FMR. |
+
+### Kolejność implementacji i dowodów
+
+1. Zachować obliczony konserwatywny prąd pełnej pętli i ocenić H na niezależnej,
+   jawnej domenie odpowiadającej objętości próbki. Samo próbkowanie pola nie
+   aktywuje LLG ani nie wymaga fikcyjnych Ms/Aex. Ustalić fizyczne zera osi,
+   położenie warstw i skończone okno obliczeniowe; nie przedstawiać rozmiaru
+   tego okna jako wartości podanej w artykule.
+2. Zweryfikować pole na tych targetach niezależnym całkowaniem oraz wykonać
+   osobną zbieżność siatki transportu. Kontrola 14 punktów opisana w nocie
+   0950 nie kwalifikuje automatycznie całej nowej objętości.
+3. Dopiero dla zakwalifikowanego źródła połączyć projekcję, stan równowagi,
+   H_perp i istniejące widmo źródła. Nie przyjmować osi z w zastępstwie
+   brakującego lub niezgodnego stanu równowagi.
+4. Dla odpowiedzi m(k,f) jawnie ustalić model warstwowy albo homogenizację,
+   pole zewnętrzne, parametry materiałowe, warunki na końcach falowodu oraz
+   wymianę. Pominięcie wymiany jest założeniem modelu analitycznego artykułu,
+   nie domyślną wartością Aex dla pełnej symulacji próbki. Potem rzeczywisty
+   Run, monitorowanie przestrzenno-czasowe i osobna analiza odpowiedzi.
+
+Bieżące punkty kodu: `crates/fullmag-plan/src/antenna_field_solve.rs::resolve_field_sampling`
+obsługuje niezależny target Object/Tet4;
+`examples/antenna_universe/fem_antenna_closed_loop_surface_benchmark.py::study`
+ma już niemagnetyczny target sampling;
+`crates/fullmag-runner/src/antenna_field_solution/closed_loop_v2.rs::require_qualified`
+nadal odmawia bazy bez receiptu naukowego.
+`scripts/reference_sushruth_2020_response.py::film_susceptibility` jest wzorcem
+analitycznym, nie wynikiem LLG ani zastępstwem pełnej próbki.
+
+Stan tego checkpointu: sprawdzono źródła oraz sekcje artykułu, zapisano wybór
+użytkownika i rozdzielono parametry. Nie dodano materiału do sceny, nie
+uruchomiono nowego Solve, nie zmieniono kwalifikacji źródła. Runtime nadal
+wymaga zakończenia kontroli recovery; wyniki i historia pozostają zachowane.
