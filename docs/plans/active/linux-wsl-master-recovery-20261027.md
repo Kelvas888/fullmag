@@ -108,3 +108,18 @@ Poprawka dodaje raw alias i jego przodków/potomków do wczesnej ochrony przed r
 Adapter drugiego zadania ma już wykonalny odczyt actual mount przez same-UID, cap-drop-ALL observer i pełne VPD83 GUID jako powiązanie VHDX, lecz nadal wymaga negatywnych testów oraz kwalifikacji całości. Nie ma zgody na stop/restart cudzych grup, a migracje pozostają na ich kolejne świadome uruchomienie.
 
 Podczas dalszych odczytów silnik Docker stał się niedostępny. Jeden odczyt `info` potwierdził brak połączenia; ten wątek nie wysłał stop/restart/down/start usług. Stare PID/incarnation/backing observations nie kwalifikują przyszłego wykonania po tej zmianie stanu. Przed runtime wymagane są świeże dowody; sesja i wyniki pozostają bez mutacji z tego zadania.
+
+## 28.10: osobny kontrakt izolowanego snapshotu
+
+Użytkownik jawnie zlecił naprawić blokadę i uruchomić mastera bez zatrzymywania
+innych grup. Wybór: ADR0073, nowa zweryfikowana kopia zamiast rozluźniania
+Windows guards. Stary store/OWNER/certyfikaty pozostają bez zmian.
+
+- [ ] Native readonly retained-snapshot validation CLI i CI (worker Luna).
+- [ ] Typed namespace receipt/resolver oraz testy (skoordynowany czat sprzątania).
+- [ ] Bezpieczna kopia danych + manifest i hostowy operator jednej grupy.
+- [ ] Podpięcie namespace, admission kopii i native gate przed API.
+- [ ] Review, wymagane CI, integracja mastera.
+- [ ] Rzeczywiste recovery/master build/start, porównanie historii i UI Airbox.
+
+To plan, nie wykonana migracja. Nie wykonano snapshotu ani nowego startu.
