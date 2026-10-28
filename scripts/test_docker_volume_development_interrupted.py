@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import docker_volume_development_interrupted as recovery
 from docker_build_control import BuildControlError, canonical
@@ -116,6 +117,15 @@ class InterruptedDevelopmentTests(unittest.TestCase):
         recovery.validate_original(self.original, self.document, self.request, self.control, self.source)
         for k, a in self.actual.items():
             recovery.validate_container(a, self.request["containers"][k], k, "own")
+
+    def test_only_fail_only_gate_recovery_is_independent_of_foreign_host_clients(self):
+        with mock.patch.object(recovery,'host_clients',side_effect=BuildControlError('foreign builder')) as scanner:
+            recovery._observe_host_clients(self.source,{'schema':recovery.GATE_FAILURE_SCHEMA},None)
+            scanner.assert_not_called()
+            for schema in (recovery.SCHEMA,recovery.RESUME_SCHEMA):
+                with self.subTest(schema=schema),self.assertRaises(BuildControlError):
+                    recovery._observe_host_clients(self.source,{'schema':schema},None)
+            self.assertEqual(scanner.call_count,2)
 
     def test_existing_schema_keeps_its_original_shape_and_exit_contract(self):
         recovery.validate_request(self.request)

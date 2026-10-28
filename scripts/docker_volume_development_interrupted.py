@@ -555,6 +555,15 @@ def _live_mount_consumes(actual, protected_volumes, protected_state_root, *, sta
                and mount.get("RW") is True for mount in actual.get("Mounts", []))
 
 
+def _observe_host_clients(source, request, helper_name):
+    # Legacy recoveries retain their host-wide observer. Fail-only gate recovery
+    # changes this group's receipt under its operation.lock; unrelated DEV
+    # clients do not consume that authority. Its private consumers and package
+    # CAS are checked again while holding the lease.
+    if helper_name is None and request['schema'] != GATE_FAILURE_SCHEMA:
+        host_clients(source)
+
+
 def observe(control, source, r, result=None, helper_name=None):
     require(not control.namespace, "Namespaced control volumes need their dedicated recovery")
     require(docker_capture("info", "--format", "{{.ID}}").stdout.decode().strip() == r["engine_id"], "Engine changed")
@@ -686,8 +695,7 @@ def observe(control, source, r, result=None, helper_name=None):
             "A live container consumes retained volumes")
     # This scanner identifies our held Docker helper as a mutating client.
     # Scan before acquiring it; canonical admissions thereafter share its flock.
-    if helper_name is None:
-        host_clients(source)
+    _observe_host_clients(source, r, helper_name)
     return raw, document
 
 
