@@ -52,6 +52,7 @@ import { FieldMapToolbar, type FieldMapToolbarQuantity } from "./components/Fiel
 import { FieldMapAuxiliaryDiagnostics } from "./components/FieldMapAuxiliaryDiagnostics";
 import { PlanarColorLegend } from "./components/PlanarColorLegend";
 import { PlanarMultisliceGrid } from "./components/PlanarMultisliceGrid";
+import { PlanarSnapshotNavigator } from "./components/PlanarSnapshotNavigator";
 import { PlanarPinnedProbe } from "./components/PlanarPinnedProbe";
 import { PlanarProfileChart } from "./components/PlanarProfileChart";
 import { quantityDisplayName } from "@/kernel/api/quantityIds";
@@ -862,6 +863,7 @@ export default function FieldMapModule() {
       />
       <header className="fm-field-map__toolbar">
         {toolbar}
+        <PlanarSnapshotNavigator status={evidence.status} />
         {ambiguousSurfaceMeta ? (
           <span className="fm-field-map__diagnostic" role="status">
             Ambiguous surface: {ambiguousSurfaceMeta.overlap_count} overlaps,{" "}
