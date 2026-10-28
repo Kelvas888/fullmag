@@ -37,9 +37,11 @@ on:
 permissions:
   contents: read
 
+# Check builds supersede each other; every manual (upload) run gets its own
+# group so it is never cancelled mid-upload.
 concurrency:
-  group: pypi-publish-${{ github.ref }}
-  cancel-in-progress: false
+  group: pypi-publish-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'check' }}
+  cancel-in-progress: true
 
 jobs:
   build:

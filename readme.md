@@ -731,8 +731,8 @@ Project coordination: **Mateusz Zelent, RPTU Kaiserslautern-Landau**.
 ## License
 
 FullMag is free software, licensed under the GNU General Public License, version 3 or (at
-your option) any later version (`GPL-3.0-or-later`). The full text is in [LICENSE](LICENSE);
-the `fullmag` Python package ships the same text.
+your option) any later version (`GPL-3.0-or-later`). The full text is in the LICENSE file at
+the repository root; the `fullmag` Python package ships the same text.
 
 ## Funding
 
