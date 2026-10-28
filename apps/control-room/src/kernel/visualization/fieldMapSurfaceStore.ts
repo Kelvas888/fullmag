@@ -50,7 +50,9 @@ function sameGeometry(
     left.layerCount === right.layerCount &&
     left.layerSpacing === right.layerSpacing &&
     left.nativeResolution?.[0] === right.nativeResolution?.[0] &&
-    left.nativeResolution?.[1] === right.nativeResolution?.[1];
+    left.nativeResolution?.[1] === right.nativeResolution?.[1] &&
+    (left.stops?.length ?? 0) === (right.stops?.length ?? 0) &&
+    (left.stops ?? []).every((stop, index) => stop === right.stops?.[index]);
 }
 
 export const fieldMapSurfaceStore = {

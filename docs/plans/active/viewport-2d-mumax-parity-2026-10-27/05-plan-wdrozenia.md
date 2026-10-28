@@ -105,3 +105,15 @@ F1 i F2 mogą iść równolegle w osobnych worktree po F0: F1 dotyka głównie `
 | F3 | średni–duży | brak | duży (nota) |
 | F4 | średni | mały | średni |
 | F5 | — | — | duży (runtime, przeglądarka) |
+
+## Stan realizacji (2026-10-28, branch `codex/viewport-2d-production-20261027`)
+
+| Etap | Stan | Uwagi |
+|---|---|---|
+| F0 | zrobione | smoke contract 11/11, preflight FDM zielony, martwe komendy zastąpione, plany oznaczone `superseded`, spec 15/UI/ledger zsynchronizowane, nota 0970 rozszerzona |
+| F1 | zrobione, smoke przeglądarkowy FDM CPU | pasek kontrolek, koło barw `hsl_direction` (2D/3D/PNG), strzałki z grotami, retencja, skróty, `meta.section`, Inspector `Live`; FEM tylko kompilacja |
+| F2 | zrobione (kompilacja, runtime FDM) | cache operatora FEM, single-flight, `spawn_blocking`, fence epoki, sonda punktowa, ekstrema zajętości, tolerancje względne; BVH odłożony do B6 (rasteryzacja per element zostaje) |
+| F3 | zrobione (kompilacja) | Hex8, Pyramid5 (zgodny z MFEM), kwadratura slab/depth dla elementów nieafinicznych |
+| F4 | zrobione (kompilacja + frontend) | przystanki płaszczyzn węzłów z certyfikatu swept; `navigation_step_m` dla siatek niestrukturalnych to 1 % rozciągłości (mediana h⊥ odłożona) |
+| F5 | częściowo | FDM CPU: smoke sesyjny PASS; FEM CPU/GPU: **BLOCKED** (patrz ledger); FDM GPU: brak zarządzanego toru; zarządzana kwalifikacja wydania: nie wykonana |
+| F6 | projekt | [06-projekt-poziomu-b.md](06-projekt-poziomu-b.md) |

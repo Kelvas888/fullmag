@@ -531,7 +531,7 @@ pub(super) fn finish_reduction(
     })
 }
 
-fn cell_value_at(field: &FdmPlanarField, point: [f64; 3]) -> Option<(u32, &[f64])> {
+pub(super) fn cell_value_at(field: &FdmPlanarField, point: [f64; 3]) -> Option<(u32, &[f64])> {
     let mut index = [0u32; 3];
     for axis in 0..3 {
         let coordinate = (point[axis] - field.origin()[axis]) / field.spacing()[axis];

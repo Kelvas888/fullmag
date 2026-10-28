@@ -62,6 +62,24 @@ kwalifikacją produkcyjną. Testy jednostkowe są napisane, ale nieuruchomione
 | Skróty `[ ] { } V X Y Z M A G`, `fit`, `reset-view`, `export-data` | browser smoke (`[ ] z a v`) | source | smoke |
 | Inspector `Live` tylko po dowodzie klatki | implemented | implemented | typecheck |
 
+## Etapy F2–F4 (2026-10-28)
+
+Zmiany skompilowane w kontenerze `backend` grupy DEV; codegen OpenAPI z
+receiptem; typecheck i ESLint frontendu zielone. Testy jednostkowe Rust i
+vitest napisane, nieuruchomione (zakaz kompilacji testów).
+
+| Element | FDM CPU | FEM CPU/GPU | Dowód |
+|---|---|---|---|
+| Cache operatora płaszczyzny FEM (wagi kształtu per piksel, gather przy nowej rewizji) | n/d | compiled | `planar_sampling/operator.rs`; test `planar_fem_plane_operator_cache_matches_direct_sampling_and_builds_once` (nieuruchomiony) |
+| Single-flight próbek, `spawn_blocking`, fence epoki sesji przed wpisem do cache | runtime (smoke FDM 2026-10-27 po zmianie) | compiled | smoke FDM run8 PASS |
+| Sonda: ewaluacja punktowa, statusy `occupied/outside/empty` bez clampu | runtime | compiled | `curl …/probe`: `outside`, `occupied` (wektor, `cell_id`), `empty` na sesji FDM |
+| Ekstrema meta tylko z pikseli zajętych | runtime | compiled | — |
+| Hex8 (trilinearny) i Pyramid5 (wymierny) z odwrotnością Newtona | n/d | compiled | testy PM-N18 napisane; **PM-N19: formuła identyczna z `mfem::LinearPyramidFiniteElement::CalcShape`** (`fem/fe/fe_fixed_order.cpp`, toolchain FullmagK0Native; różni się tylko tolerancja apeksu: 1e-6 w MFEM, 1e-12 tutaj) |
+| Slab/depth z kwadraturą elementową dla Prism6/Hex8/Pyramid5 (N-09) | n/d | compiled | test PM-N20 (`q = x·y·z` na sześcianie → 1/8) napisany |
+| Tolerancje względne w nakładce i współrzędnych barycentrycznych FEM | n/d | compiled | — |
+| Przystanki warstw FEM z certyfikatu swept (`fem_node_planes`, `layer_stops_m`) i suwak/`[ ]` na płaszczyznach węzłów | n/d | compiled + frontend | test Rust `default_section_snaps_fem_requests_to_certificate_node_planes`, vitest „FEM node-plane stops” (nieuruchomione) |
+| Smoke przeglądarkowy FEM | — | **BLOCKED** | fixture `examples/viewport_3d_mixed_topology_smoke.py` odrzucony walidacją ProblemIR niezwiązaną z 2D (`table_autosave must use every_steps`); nowy fixture `examples/viewport_2d_fem_mixed_smoke.py` nie został aktywowany: po restarcie Docker Desktop/WSL (kontenery kilku grup `Exited (255)` 2026-10-27 ~22:15 UTC) aktywacja `7a668d411d4a4ec9ae7e1aa8854149c1` ma stan `outcome-unknown-resources-retained` (HTTP 409 `session store writer is busy`), lease blokuje `up` i nowe aktywacje; ręczne zwolnienie lease jest zabronione przewodnikiem `docs/guides/docker-volume-development.md` |
+
 ## Status Language
 
 Use these messages consistently:

@@ -15,8 +15,9 @@ use crate::{
     field_render_png::{encode_direction_png, encode_scalar_png, AutoScaleMode, DIRECTION_COLORMAP},
     field_store::serialize_field_vector_binary_v2,
     planar_sampling::{
-        resolve_authored_planar_source, resolve_default_planar_source, resolve_spatial_target,
-        sample_resolved_target, Occupancy, PlanarComponent, PlanarSampleIdentity,
+        resolve_authored_planar_source, resolve_default_planar_source_with_stops,
+        resolve_spatial_target, FemNodePlaneStops,
+        evaluate_point_component, sample_resolved_target_cached, Occupancy, PlanarComponent, PlanarSampleIdentity,
         PlanarSampleResult, ResolvedPlanarSampleRequest, ResolvedPlanarSection,
         ResolvedPlanarSourceIdentity,
         ResolvedSpatialScope, ResolvedSpatialTarget, MAX_PLANAR_SAMPLE_POINTS,
@@ -506,7 +507,16 @@ async fn build_planar_field_from_source(
     let resolved_source = match &source {
         PlanarDataSource::Default => {
             let domain = super::domain::domain_meta_for_snapshot(snapshot);
-            resolve_default_planar_source(&domain, &planar_state.default_slice)?
+            let stops = snapshot
+                .fem_mesh
+                .as_ref()
+                .and_then(|mesh| mesh.build_report.as_ref())
+                .and_then(FemNodePlaneStops::from_build_report);
+            resolve_default_planar_source_with_stops(
+                &domain,
+                &planar_state.default_slice,
+                stops.as_ref(),
+            )?
         }
         PlanarDataSource::Monitor(monitor_id) => {
             let scene = snapshot
@@ -688,6 +698,15 @@ async fn build_planar_field_from_source(
             "magnitude".to_string()
         }
     });
+    // Geometry identity of the cached plane operator: everything that decides
+    // which element and weights serve a pixel, but no field values. The
+    // operator additionally verifies the carrier topology fingerprint.
+    let geometry_key = format!(
+        "planar-operator:{session_id}:{generation_id}:{scene_revision}:{target_fingerprint}:\
+         {scope_kind}:{scope_id:?}:{carrier_revision}:{resolution:?}:{frame:?}:{operator:?}:{}",
+        crate::planar_sampling::PLANAR_SAMPLER_VERSION,
+        scope_id = query.scope_id,
+    );
     let sample_token = PlanarSampleIdentity {
         session_id,
         source_kind: resolved_source.identity.source_kind.clone(),
@@ -733,13 +752,40 @@ async fn build_planar_field_from_source(
     let target = Arc::new(target);
     let sampling_target = Arc::clone(&target);
     let sampling_request = request.clone();
+    let operator_cache = Arc::clone(&state.quantity_data_plane.planar_operator_cache);
+    let fence_state = Arc::clone(state);
+    let fence_context = request_context.clone();
     let result = state
         .quantity_data_plane
         .get_or_sample_planar(&sample_token, || async move {
-            Ok(Arc::new(sample_resolved_target(
-                &sampling_target,
-                &sampling_request,
-            )?))
+            // Sampling is CPU-bound; keep it off the async executor.
+            let sampled = tokio::task::spawn_blocking(move || {
+                sample_resolved_target_cached(
+                    &sampling_target,
+                    &sampling_request,
+                    &operator_cache,
+                    &geometry_key,
+                )
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("planar sampling task failed: {error}")))??;
+            // Fence before the sample enters the shared cache, so a session
+            // switch during sampling cannot publish a stale entry.
+            {
+                let _transition = fence_state.current_live_session_transition.lock().await;
+                let current = fence_state.current_live_state.read().await;
+                let current = current
+                    .as_ref()
+                    .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+                crate::ensure_current_live_request_context(
+                    current,
+                    &fence_context,
+                    fence_state
+                        .current_live_session_epoch
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )?;
+            }
+            Ok(Arc::new(sampled))
         })
         .await?;
     {
@@ -924,46 +970,51 @@ async fn planar_probe_response(
     };
     let built = build_planar_field_from_source(state, quantity_id, source, &query).await?;
     let bounds = built.result.meta.bounds_uv_m;
-    let x = (((probe.u_m - bounds[0]) / (bounds[1] - bounds[0])
-        * built.result.meta.resolution[0] as f64)
-        .floor() as i64)
-        .clamp(0, built.result.meta.resolution[0] as i64 - 1) as u32;
-    let y = (((probe.v_m - bounds[2]) / (bounds[3] - bounds[2])
-        * built.result.meta.resolution[1] as f64)
-        .floor() as i64)
-        .clamp(0, built.result.meta.resolution[1] as i64 - 1) as u32;
-    let index = (y * built.result.meta.resolution[0] + x) as usize;
-    let occupancy = built.result.occupancy[index];
-    let source_entity_id = built.result.source_entity_ids[index];
     let frame = &built.frame;
+    // The probe is a point evaluation at the exact requested position: never
+    // clamped to the raster edge, and position and value refer to one point.
     let world_m = [
         frame.origin_m[0] + probe.u_m * frame.u_axis[0] + probe.v_m * frame.v_axis[0],
         frame.origin_m[1] + probe.u_m * frame.u_axis[1] + probe.v_m * frame.v_axis[1],
         frame.origin_m[2] + probe.u_m * frame.u_axis[2] + probe.v_m * frame.v_axis[2],
     ];
+    let inside_frame = probe.u_m >= bounds[0]
+        && probe.u_m <= bounds[1]
+        && probe.v_m >= bounds[2]
+        && probe.v_m <= bounds[3];
+    let point = if inside_frame {
+        built.target.evaluate_point(world_m)
+    } else {
+        None
+    };
+    let (scalar, vector, entity_id) = match &point {
+        Some((entity_id, values)) => {
+            let (scalar, vector) = evaluate_point_component(values, &built.request)?;
+            (scalar, vector, Some(*entity_id))
+        }
+        None => (None, None, None),
+    };
+    let occupancy = match (inside_frame, &point) {
+        (false, _) => "outside",
+        (true, None) => "empty",
+        (true, Some(_)) => "occupied",
+    };
     Ok(Json(PlanarFieldProbeResource {
         source: source_resource(&built.source),
         quantity_id: quantity_id.to_string(),
         u_m: probe.u_m,
         v_m: probe.v_m,
         world_m,
-        scalar: built.result.scalar_values[index]
-            .is_finite()
-            .then_some(built.result.scalar_values[index]),
-        vector: built
-            .result
-            .vector_values
-            .as_ref()
-            .map(|vectors| vectors[index])
-            .filter(|vector| vector.iter().all(|value| value.is_finite())),
+        scalar,
+        vector,
         cell_id: (built.source_entity_kind == "cell")
-            .then_some(source_entity_id)
+            .then_some(entity_id)
             .flatten(),
         element_id: (built.source_entity_kind == "element")
-            .then_some(source_entity_id)
+            .then_some(entity_id)
             .flatten(),
-        occupancy: occupancy_label(occupancy).to_string(),
-        sampling_method: built.result.meta.sampling_method.to_string(),
+        occupancy: occupancy.to_string(),
+        sampling_method: "point_probe".to_string(),
     }))
 }
 
@@ -1290,11 +1341,15 @@ fn meta_resource(built: &BuiltPlanarField) -> PlanarFieldMetaResource {
     let bounds = built.result.meta.bounds_uv_m;
     let base = source_base_path(built);
     let query = canonical_sample_query(built);
+    // Extrema describe occupied support only; empty bins serialized as zero
+    // (`include_air_as_zero`) must not widen the scientific range (PM-N05).
     let (scalar_min, scalar_max) = built
         .result
         .scalar_values
         .iter()
-        .filter(|value| value.is_finite())
+        .zip(&built.result.occupancy)
+        .filter(|(value, occupancy)| value.is_finite() && **occupancy != Occupancy::Empty)
+        .map(|(value, _)| value)
         .fold((None::<f64>, None::<f64>), |(min, max), value| {
             (
                 Some(min.map_or(*value, |current| current.min(*value))),
@@ -1481,6 +1536,7 @@ fn section_resource(section: &ResolvedPlanarSection) -> PlanarSectionResource {
         normal_min_m: section.normal_min_m,
         normal_max_m: section.normal_max_m,
         navigation_step_m: section.navigation_step_m,
+        layer_stops_m: section.layer_stops_m.clone(),
     }
 }
 
@@ -1520,16 +1576,6 @@ fn finite_payload(values: &[f64]) -> Vec<f64> {
         .iter()
         .map(|value| if value.is_finite() { *value } else { 0.0 })
         .collect()
-}
-
-fn occupancy_label(occupancy: Occupancy) -> &'static str {
-    match occupancy {
-        Occupancy::Occupied => "occupied",
-        Occupancy::Empty => "empty",
-        Occupancy::Partial => "partial",
-        Occupancy::UndefinedOrientation => "undefined_orientation",
-        Occupancy::OverlapAmbiguous => "overlap_ambiguous",
-    }
 }
 
 fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {

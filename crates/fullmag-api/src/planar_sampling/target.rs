@@ -44,6 +44,18 @@ pub(crate) struct ResolvedSpatialTarget {
 }
 
 impl ResolvedSpatialTarget {
+    /// Raw carrier value at a world point with the raster's own locator and
+    /// basis: containing FDM cell or FEM shape functions. `None` when the point
+    /// lies outside the selected target.
+    pub(crate) fn evaluate_point(&self, point: [f64; 3]) -> Option<(u32, Vec<f64>)> {
+        match &self.field {
+            TargetField::Fdm(field) => {
+                super::fdm::cell_value_at(field, point).map(|(cell, value)| (cell, value.to_vec()))
+            }
+            TargetField::Fem(field) => super::fem::interpolate_at(field, point),
+        }
+    }
+
     pub(crate) fn selected_entity_ids(&self) -> &[u32] {
         &self.selected_entity_ids
     }
@@ -198,6 +210,22 @@ pub(crate) fn sample_resolved_target(
     match &target.field {
         TargetField::Fdm(field) => PlanarSamplingEngine::sample_fdm(field, request),
         TargetField::Fem(field) => PlanarSamplingEngine::sample_fem(field, request),
+    }
+}
+
+/// Like [`sample_resolved_target`], but FEM plane sampling reuses a cached
+/// geometry operator keyed by `geometry_key`.
+pub(crate) fn sample_resolved_target_cached(
+    target: &ResolvedSpatialTarget,
+    request: &ResolvedPlanarSampleRequest,
+    cache: &super::PlanarOperatorCache,
+    geometry_key: &str,
+) -> Result<PlanarSampleResult, ApiError> {
+    match &target.field {
+        TargetField::Fdm(field) => PlanarSamplingEngine::sample_fdm(field, request),
+        TargetField::Fem(field) => {
+            PlanarSamplingEngine::sample_fem_cached(field, request, cache, geometry_key)
+        }
     }
 }
 
@@ -766,11 +794,14 @@ fn fem_planar_elements(
                     .try_into()
                     .map(FemPlanarElement::Prism6)
                     .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Prism6 arity is not 6")),
-                fullmag_ir::FemCellTypeIR::Pyramid5 | fullmag_ir::FemCellTypeIR::Hex8 => {
-                    Err(ApiError::unprocessable(format!(
-                        "unsupported_element_order: planar P1 sampling does not support {cell_type:?}"
-                    )))
-                }
+                fullmag_ir::FemCellTypeIR::Pyramid5 => nodes
+                    .try_into()
+                    .map(FemPlanarElement::Pyramid5)
+                    .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Pyramid5 arity is not 5")),
+                fullmag_ir::FemCellTypeIR::Hex8 => nodes
+                    .try_into()
+                    .map(FemPlanarElement::Hex8)
+                    .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Hex8 arity is not 8")),
             }
         })
         .collect()

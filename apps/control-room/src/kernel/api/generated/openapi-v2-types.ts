@@ -12057,6 +12057,8 @@ export interface components {
             layer_index?: number | null;
             /** Format: double */
             layer_spacing_m?: number | null;
+            /** @description Discrete stops along the normal (FEM node planes); empty otherwise. */
+            layer_stops_m: number[];
             /**
              * Format: double
              * @description Distance moved by one layer or navigation step along the normal.
@@ -12076,7 +12078,11 @@ export interface components {
             requested_fraction: number;
             /** Format: double */
             resolved_coordinate_m: number;
-            /** @description `fdm_cell_layers` (coordinate snapped to a cell centre) or `continuous`. */
+            /**
+             * @description `fdm_cell_layers` (snapped to a cell centre), `fem_node_planes` (on a
+             *     swept-mesh node plane), `fem_node_planes_between` (between planes) or
+             *     `continuous`.
+             */
             stops_kind: string;
         };
         /**

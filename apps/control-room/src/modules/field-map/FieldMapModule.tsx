@@ -30,7 +30,10 @@ import {
 } from "@/kernel/visualization/planarTargetPresentation";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { projectPlanarPresentationState } from "@/kernel/visualization/planarPresentationProjection";
-import { resolvePlanarSectionGeometry } from "@/kernel/visualization/planarSectionModel";
+import {
+  resolvePlanarSectionGeometry,
+  withSectionStops,
+} from "@/kernel/visualization/planarSectionModel";
 import { isDirectionColormap } from "@/shared/visualization/directionColor";
 import { FieldMapToolbar, type FieldMapToolbarQuantity } from "./components/FieldMapToolbar";
 import { PlanarColorLegend } from "./components/PlanarColorLegend";
@@ -457,11 +460,15 @@ function useFieldMapModuleController() {
     scalarIdentity: scalar.data?.etag,
     scalarStatus: scalar.status,
   });
+  const metaSection = meta.data?.section ?? null;
   const sectionGeometry = useMemo(
     () => canonicalPlanar?.source.kind === "default"
-      ? resolvePlanarSectionGeometry(domain.data, canonicalPlanar.default_slice.plane)
+      ? withSectionStops(
+          resolvePlanarSectionGeometry(domain.data, canonicalPlanar.default_slice.plane),
+          metaSection,
+        )
       : null,
-    [canonicalPlanar, domain.data],
+    [canonicalPlanar, domain.data, metaSection],
   );
   // Publish derived facts for keyboard commands and the Inspector (one owner).
   useEffect(() => {
@@ -555,6 +562,7 @@ function useFieldMapModuleController() {
     probe,
     renderModel,
     scalar,
+    metaSection,
     sectionDefaultSlice,
     setPinned,
     shownCoordinateM,
@@ -584,6 +592,7 @@ export default function FieldMapModule() {
     probe,
     renderModel,
     scalar,
+    metaSection,
     sectionDefaultSlice,
     setPinned,
     shownCoordinateM,
@@ -595,6 +604,7 @@ export default function FieldMapModule() {
     <PlanarSectionStrip
       defaultSlice={sectionDefaultSlice}
       domain={domainMeta}
+      section={metaSection}
       shownCoordinate={shownCoordinateM}
       onChange={onSectionChange}
     />

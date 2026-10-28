@@ -2,7 +2,7 @@
 
 - Data: 2026-10-27
 - Audytowana rewizja: `38ffb49bf` (`master`)
-- Status pakietu: **PROPOSED** — audyt, projekt i plan do akceptacji; implementacja nie rozpoczęta
+- Status pakietu: decyzje D2D-01…D2D-13 przyjęte poleceniem „zrealizuj wszystko zgodnie z planem” (2026-10-27); stan realizacji etapów w [05-plan-wdrozenia.md](05-plan-wdrozenia.md) i w [ledgerze statusu](../../../status/2d-slice-capabilities.md)
 - Kontynuacja: [audyt 2026-08-31](../../../audits/2026-08-31-planar-2d-fdm-fem-comsol-progress-audit.md) (v0.7), który zatrzymał się na makietach UI i otwartych decyzjach §26.3
 - Wiążące wejścia: [ADR 0020](../../../adr/0020-planar-field-map-and-monitor.md), [nota fizyczna 0970](../../../physics/0970-planar-monitor-sampling-and-projection.md), [spec 15](../../../specs/frontend-v2/15-viewport-2d-module.md), 23 decyzje zatwierdzone w §26.2 audytu z 31.08
 
@@ -21,6 +21,7 @@ Dla FDM jest to głównie praca na UI i kontrakcie odczytu (dane już leżą na 
 | [03-specyfikacja-ux-widoku-2d.md](03-specyfikacja-ux-widoku-2d.md) | Docelowe zachowanie produkcyjne: układ, kontrolki, odczyty, stany, skróty, warianty i rekomendacje dla §26.3 |
 | [04-projekt-techniczny-fem.md](04-projekt-techniczny-fem.md) | Projekt FEM: indeks przestrzenny, cache wag pikseli, Pyramid5/Hex8, warstwy FEM, airbox, sonda, budżety |
 | [05-plan-wdrozenia.md](05-plan-wdrozenia.md) | Etapy F0–F6 z zadaniami, plikami, bramkami weryfikacji i kryteriami ukończenia |
+| [06-projekt-poziomu-b.md](06-projekt-poziomu-b.md) | Projekt etapu F6: profil liniowy, multislice, streamlines, nawigator czasu, gizmo płaszczyzny, indeks przestrzenny i gather na GPU |
 | [mockups/viewport-2d-mockups.html](mockups/viewport-2d-mockups.html) | Interaktywne makiety (otwórz w przeglądarce): FDM, FEM swept Prism6, FEM Tet4, FEM mieszana; stany klatki; warianty układu; multislice; profil. Prywatna kopia online: <https://claude.ai/artifact/XbXgzAkbtHcpr3JVebHUKP> |
 
 ## Rejestr decyzji proponowanych

@@ -105,3 +105,37 @@ describe("section layer stepping", () => {
     expect(stepSectionFraction(0.995, null, 1)).toBe(1);
   });
 });
+
+describe("FEM node-plane stops", () => {
+  it("maps swept-mesh node planes to discrete layers and back", async () => {
+    const {
+      sectionLayerCount,
+      sectionLayerFraction,
+      sectionLayerIndex,
+      stepSectionFraction,
+      withSectionStops,
+    } = await import("./planarSectionModel");
+    const continuous = {
+      layerCount: null,
+      layerSpacing: null,
+      nativeResolution: null,
+      normal: "z" as const,
+      normalExtent: 20e-9,
+      normalMax: 20e-9,
+      normalMin: 0,
+      plane: "xy" as const,
+      u: "x" as const,
+      v: "y" as const,
+    };
+    const geometry = withSectionStops(continuous, {
+      layer_stops_m: [0, 5e-9, 10e-9, 15e-9, 20e-9],
+      plane: "xy",
+    })!;
+    expect(sectionLayerCount(geometry)).toBe(5);
+    expect(sectionLayerIndex(geometry, 0.48)).toBe(2);
+    expect(sectionLayerFraction(geometry, 3)).toBeCloseTo(0.75);
+    expect(stepSectionFraction(0.5, geometry, 1)).toBeCloseTo(0.75);
+    // Stops of another plane are ignored.
+    expect(withSectionStops(continuous, { layer_stops_m: [0, 1], plane: "xz" })?.stops).toBeUndefined();
+  });
+});

@@ -34,6 +34,68 @@ pub(crate) struct ResolvedPlanarSamplingSource {
 /// without discrete data layers.
 pub(crate) const CONTINUOUS_SECTION_STEP_FRACTION: f64 = 0.01;
 
+/// Node planes of a swept FEM mesh along one world axis, taken from the
+/// accepted mixed-layer topology certificate. On these planes the nodal P1
+/// field is exact, which makes them the FEM analogue of FDM cell layers.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FemNodePlaneStops {
+    pub axis: usize,
+    pub coordinates_m: Vec<f64>,
+    pub tolerance_m: f64,
+}
+
+impl FemNodePlaneStops {
+    /// Collect certificate node planes (v1 global sweep or v2 per-region
+    /// sweeps sharing one direction), sorted and de-duplicated.
+    pub(crate) fn from_build_report(report: &fullmag_ir::FemSharedDomainBuildReportIR) -> Option<Self> {
+        let mut sweeps: Vec<(&str, &[f64], f64)> = Vec::new();
+        if let Some(certificate) = report.mixed_layer_topology_certificate.as_ref() {
+            sweeps.push((
+                certificate.resolved_sweep_direction.as_str(),
+                &certificate.magnetic_plane_coordinates_m,
+                certificate.plane_tolerance_m,
+            ));
+        }
+        if let Some(certificate) = report.mixed_layer_topology_certificate_v2.as_ref() {
+            for region in &certificate.magnetic_regions {
+                if let Some(sweep) = region.exact_sweep.as_ref() {
+                    sweeps.push((
+                        sweep.sweep_direction_resolved.as_str(),
+                        &sweep.magnetic_plane_coordinates_m,
+                        sweep.plane_tolerance_m,
+                    ));
+                }
+            }
+        }
+        let axis_of = |direction: &str| match direction.trim_start_matches(['+', '-']) {
+            "x" => Some(0),
+            "y" => Some(1),
+            "z" => Some(2),
+            _ => None,
+        };
+        let axis = axis_of(sweeps.first()?.0)?;
+        if sweeps.iter().any(|(direction, _, _)| axis_of(direction) != Some(axis)) {
+            return None;
+        }
+        let tolerance_m = sweeps
+            .iter()
+            .map(|(_, _, tolerance)| *tolerance)
+            .fold(0.0_f64, f64::max);
+        let mut coordinates_m = sweeps
+            .iter()
+            .flat_map(|(_, planes, _)| planes.iter().copied())
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        coordinates_m.sort_by(f64::total_cmp);
+        coordinates_m.dedup_by(|a, b| (*a - *b).abs() <= tolerance_m);
+        (coordinates_m.len() >= 2).then_some(Self {
+            axis,
+            coordinates_m,
+            tolerance_m,
+        })
+    }
+}
+
 /// Requested vs. resolved section of the session `Default` slice. Decision 8
 /// of the 2D refactor: a snap to an FDM cell centre is never hidden.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +114,8 @@ pub(crate) struct ResolvedPlanarSection {
     pub normal_max_m: f64,
     /// Distance moved by one layer step (FDM cell) or navigation step (continuous).
     pub navigation_step_m: f64,
+    /// Discrete stops along the normal (FEM certificate node planes).
+    pub layer_stops_m: Vec<f64>,
 }
 
 struct SliceCoordinate {
@@ -133,15 +197,75 @@ fn default_slice_coordinate(
     })
 }
 
+/// Snap a continuous FEM request to the nearest certificate node plane when it
+/// lies within the certificate tolerance (or within half a plane spacing when
+/// the request came from a layer index, which always lands on a plane).
+fn snap_to_node_plane(
+    coordinate: SliceCoordinate,
+    stops: &FemNodePlaneStops,
+) -> (SliceCoordinate, Option<(u32, u32)>) {
+    let Some((index, plane)) = stops
+        .coordinates_m
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (a - coordinate.requested)
+                .abs()
+                .total_cmp(&(b - coordinate.requested).abs())
+        })
+    else {
+        return (coordinate, None);
+    };
+    let window = stops.tolerance_m.max(
+        1.0e-9 * (stops.coordinates_m[stops.coordinates_m.len() - 1] - stops.coordinates_m[0]).abs(),
+    );
+    if (plane - coordinate.requested).abs() > window {
+        return (coordinate, None);
+    }
+    (
+        SliceCoordinate {
+            requested: coordinate.requested,
+            resolved: plane,
+            layer: None,
+        },
+        Some((index as u32, stops.coordinates_m.len() as u32)),
+    )
+}
+
 fn resolved_section(
     domain: &DomainMeta,
     plane: &'static str,
     axis: usize,
     position_fraction: f64,
     coordinate: &SliceCoordinate,
+    node_planes: Option<(&FemNodePlaneStops, Option<(u32, u32)>)>,
 ) -> ResolvedPlanarSection {
     let normal_min_m = domain.bounds.min[axis];
     let normal_max_m = domain.bounds.max[axis];
+    if let Some((stops, snapped)) = node_planes {
+        let spacing = (stops.coordinates_m[stops.coordinates_m.len() - 1] - stops.coordinates_m[0])
+            / (stops.coordinates_m.len() - 1) as f64;
+        return ResolvedPlanarSection {
+            plane,
+            normal_axis: ["x", "y", "z"][axis],
+            requested_fraction: position_fraction,
+            requested_coordinate_m: coordinate.requested,
+            resolved_coordinate_m: coordinate.resolved,
+            stops_kind: if snapped.is_some() {
+                "fem_node_planes"
+            } else {
+                "fem_node_planes_between"
+            },
+            layer_index: snapped.map(|(index, _)| index),
+            layer_count: Some(stops.coordinates_m.len() as u32),
+            layer_spacing_m: Some(spacing),
+            normal_min_m,
+            normal_max_m,
+            navigation_step_m: spacing,
+            layer_stops_m: stops.coordinates_m.clone(),
+        };
+    }
     let (layer_index, layer_count, layer_spacing_m) = match coordinate.layer {
         Some((index, count, spacing)) => (Some(index), Some(count), Some(spacing)),
         None => (None, None, None),
@@ -164,11 +288,24 @@ fn resolved_section(
         normal_max_m,
         navigation_step_m: layer_spacing_m
             .unwrap_or((normal_max_m - normal_min_m) * CONTINUOUS_SECTION_STEP_FRACTION),
+        layer_stops_m: Vec::new(),
     }
 }
+#[cfg(test)]
 pub(crate) fn resolve_default_planar_source(
     domain: &DomainMeta,
     default_slice: &DefaultPlanarSliceState,
+) -> Result<ResolvedPlanarSamplingSource, ApiError> {
+    resolve_default_planar_source_with_stops(domain, default_slice, None)
+}
+
+/// `Default` source resolution with optional FEM node-plane stops of a swept
+/// mesh. When the slice normal is the sweep axis, the published section lists
+/// the node planes and a request within tolerance samples exactly on a plane.
+pub(crate) fn resolve_default_planar_source_with_stops(
+    domain: &DomainMeta,
+    default_slice: &DefaultPlanarSliceState,
+    fem_stops: Option<&FemNodePlaneStops>,
 ) -> Result<ResolvedPlanarSamplingSource, ApiError> {
     validate_default_slice(default_slice)?;
     let bounds = &domain.bounds;
@@ -204,8 +341,16 @@ pub(crate) fn resolve_default_planar_source(
         PlanarAxisPlane::Xz => ("xz", 1),
         PlanarAxisPlane::Yz => ("yz", 0),
     };
-    let coordinate = default_slice_coordinate(domain, normal_axis, q)?;
-    let section = resolved_section(domain, plane_name, normal_axis, q, &coordinate);
+    let mut coordinate = default_slice_coordinate(domain, normal_axis, q)?;
+    let node_planes = match fem_stops {
+        Some(stops) if stops.axis == normal_axis && coordinate.layer.is_none() => {
+            let (snapped, layer) = snap_to_node_plane(coordinate, stops);
+            coordinate = snapped;
+            Some((stops, layer))
+        }
+        _ => None,
+    };
+    let section = resolved_section(domain, plane_name, normal_axis, q, &coordinate, node_planes);
     let (origin_m, u_axis, v_axis, normal, preset, u_length, v_length) = match default_slice.plane {
         PlanarAxisPlane::Xy => (
             [centers[0], centers[1], coordinate.resolved],
@@ -362,7 +507,10 @@ mod tests {
         DefaultPlanarOperatorState, DefaultPlanarSliceState, PlanarAxisPlane,
     };
 
-    use super::{resolve_authored_planar_source, resolve_default_planar_source};
+    use super::{
+        resolve_authored_planar_source, resolve_default_planar_source,
+        resolve_default_planar_source_with_stops, FemNodePlaneStops,
+    };
 
     fn domain(min: [f64; 3], max: [f64; 3], generation_id: &str) -> DomainMeta {
         DomainMeta {
@@ -428,6 +576,54 @@ mod tests {
         assert!((section.resolved_coordinate_m - 26.25e-9).abs() < 1e-21);
         assert_eq!(resolved.frame.origin_m[2], section.resolved_coordinate_m);
         assert_eq!(section.navigation_step_m, 7.5e-9);
+    }
+
+    #[test]
+    fn default_section_snaps_fem_requests_to_certificate_node_planes() {
+        let mut d = domain([0.0; 3], [1.0, 1.0, 20e-9], "generation-swept");
+        d.discretization = "fem".into();
+        let stops = FemNodePlaneStops {
+            axis: 2,
+            coordinates_m: vec![0.0, 5e-9, 10e-9, 15e-9, 20e-9],
+            tolerance_m: 1e-12,
+        };
+        // Fraction of node plane 2 as the Control Room computes it.
+        let on_plane = resolve_default_planar_source_with_stops(
+            &d,
+            &slice(PlanarAxisPlane::Xy, 0.5, DefaultPlanarOperatorState::PlaneSample),
+            Some(&stops),
+        )
+        .expect("default source");
+        let section = on_plane.section.expect("section");
+        assert_eq!(section.stops_kind, "fem_node_planes");
+        assert_eq!(section.layer_index, Some(2));
+        assert_eq!(section.layer_count, Some(5));
+        assert_eq!(section.resolved_coordinate_m, 10e-9);
+        assert_eq!(on_plane.frame.origin_m[2], 10e-9);
+        assert_eq!(section.layer_stops_m.len(), 5);
+
+        let between = resolve_default_planar_source_with_stops(
+            &d,
+            &slice(PlanarAxisPlane::Xy, 0.6, DefaultPlanarOperatorState::PlaneSample),
+            Some(&stops),
+        )
+        .expect("default source")
+        .section
+        .expect("section");
+        assert_eq!(between.stops_kind, "fem_node_planes_between");
+        assert_eq!(between.layer_index, None);
+        assert_eq!(between.requested_coordinate_m, between.resolved_coordinate_m);
+
+        // A plane whose normal is not the sweep axis stays continuous.
+        let xz = resolve_default_planar_source_with_stops(
+            &d,
+            &slice(PlanarAxisPlane::Xz, 0.5, DefaultPlanarOperatorState::PlaneSample),
+            Some(&stops),
+        )
+        .expect("default source")
+        .section
+        .expect("section");
+        assert_eq!(xz.stops_kind, "continuous");
     }
 
     #[test]

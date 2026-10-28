@@ -218,6 +218,8 @@ impl FdmPlanarField {
 pub(crate) enum FemPlanarElement {
     Tet4([u32; 4]),
     Prism6([u32; 6]),
+    Pyramid5([u32; 5]),
+    Hex8([u32; 8]),
 }
 
 impl FemPlanarElement {
@@ -225,11 +227,28 @@ impl FemPlanarElement {
         match self {
             Self::Tet4(nodes) => nodes,
             Self::Prism6(nodes) => nodes,
+            Self::Pyramid5(nodes) => nodes,
+            Self::Hex8(nodes) => nodes,
         }
     }
 
     pub(super) fn edges(&self) -> &'static [(usize, usize)] {
         match self {
+            Self::Pyramid5(_) => &[(0, 1), (1, 2), (2, 3), (3, 0), (0, 4), (1, 4), (2, 4), (3, 4)],
+            Self::Hex8(_) => &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 4),
+                (0, 4),
+                (1, 5),
+                (2, 6),
+                (3, 7),
+            ],
             Self::Tet4(_) => &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)],
             Self::Prism6(_) => &[
                 (0, 1),
@@ -247,6 +266,15 @@ impl FemPlanarElement {
 
     pub(super) fn faces(&self) -> &'static [&'static [usize]] {
         match self {
+            Self::Pyramid5(_) => &[&[0, 3, 2, 1], &[0, 1, 4], &[1, 2, 4], &[2, 3, 4], &[3, 0, 4]],
+            Self::Hex8(_) => &[
+                &[0, 3, 2, 1],
+                &[4, 5, 6, 7],
+                &[0, 1, 5, 4],
+                &[1, 2, 6, 5],
+                &[2, 3, 7, 6],
+                &[3, 0, 4, 7],
+            ],
             Self::Tet4(_) => &[&[0, 2, 1], &[0, 1, 3], &[0, 3, 2], &[1, 2, 3]],
             Self::Prism6(_) => &[
                 &[0, 2, 1],
@@ -329,6 +357,13 @@ impl FemPlanarField {
     }
     pub(super) fn values(&self) -> &[f64] {
         &self.values
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shift_values_for_test(&mut self, offset: f64) {
+        for value in &mut self.values {
+            *value += offset;
+        }
     }
 
     #[cfg(test)]
@@ -418,6 +453,35 @@ impl PlanarSamplingEngine {
         Ok(result)
     }
 
+    /// FEM sampling that reuses the geometry-only plane operator of `geometry_key`
+    /// across field revisions (`eq-planar-sampling-operator`). Other operators
+    /// are not cached because their reductions are not all linear.
+    pub(crate) fn sample_fem_cached(
+        field: &FemPlanarField,
+        request: &ResolvedPlanarSampleRequest,
+        cache: &crate::planar_sampling::PlanarOperatorCache,
+        geometry_key: &str,
+    ) -> Result<PlanarSampleResult, ApiError> {
+        if !matches!(request.operator, PlanarOperatorIR::PlaneSample) {
+            return Self::sample_fem(field, request);
+        }
+        request.validate()?;
+        let frame = crate::planar_sampling::frame::ResolvedFrame::try_from_ir(&request.frame)?;
+        let fingerprint = crate::planar_sampling::operator::fem_topology_fingerprint(field);
+        let operator = cache.get_or_build(geometry_key, fingerprint, || {
+            Ok(crate::planar_sampling::fem::build_plane_operator(
+                field,
+                request,
+                &frame,
+                fingerprint,
+            ))
+        })?;
+        let mut result = crate::planar_sampling::fem::apply_plane_operator(&operator, field, request);
+        result.overlay = Some(operator.overlay.clone());
+        apply_component(&mut result, request)?;
+        Ok(result)
+    }
+
     pub(crate) fn sample_fem_compatibility_depth(
         field: &FemPlanarField,
         request: &ResolvedPlanarSampleRequest,
@@ -446,6 +510,47 @@ impl PlanarSamplingEngine {
         apply_component(&mut result, request)?;
         Ok(result)
     }
+}
+
+/// Component view of one point value, derived exactly as for raster pixels.
+/// Returns the scalar and, for three-component fields, the vector.
+pub(crate) fn evaluate_point_component(
+    values: &[f64],
+    request: &ResolvedPlanarSampleRequest,
+) -> Result<(Option<f64>, Option<[f64; 3]>), ApiError> {
+    let n_comp = values.len();
+    let magnitude = values.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let mut result = PlanarSampleResult {
+        meta: PlanarSampleMeta {
+            sampler_version: PLANAR_SAMPLER_VERSION,
+            sampling_method: "point_probe",
+            bounds_uv_m: [0.0, 1.0, 0.0, 1.0],
+            resolution: [1, 1],
+            occupied_count: 1,
+            partial_count: 0,
+            empty_count: 0,
+            occupied_measure: 0.0,
+            overlap_count: 0,
+            fold_count: 0,
+            non_injective: false,
+            basis_order: 1,
+            integration_order: 0,
+        },
+        component_values: values.to_vec(),
+        n_comp,
+        scalar_values: vec![if n_comp == 1 { values[0] } else { magnitude }],
+        vector_values: (n_comp == 3).then(|| vec![[values[0], values[1], values[2]]]),
+        occupancy: vec![Occupancy::Occupied],
+        source_entity_ids: vec![None],
+        overlay: None,
+    };
+    apply_component(&mut result, request)?;
+    let scalar = result.scalar_values.first().copied().filter(|value| value.is_finite());
+    let vector = result
+        .vector_values
+        .and_then(|vectors| vectors.first().copied())
+        .filter(|vector| vector.iter().all(|value| value.is_finite()));
+    Ok((scalar, vector))
 }
 
 fn apply_component(

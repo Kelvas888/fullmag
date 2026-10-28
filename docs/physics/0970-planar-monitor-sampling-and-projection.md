@@ -587,8 +587,8 @@ currently implemented sampling kernels execute on CPU.
 |---|---|---|---|---|---|---|
 | FDM CPU | `domain`: full rectangular carrier; `magnetic_domain`: all active cells; `region`: exact numeric membership; `object`: only conditionally correct for single-object/all-active-equivalent grids and incorrect for general multi-object grids; `mesh_part`/`airbox`: unsupported; every dynamic extent tag is unqualified because all three reuse post-target selected-mask bounds | Published cell-centred structured-grid field plus matching membership for non-domain targets; explicit extent required for authored monitors | plane, slab, depth; surface unsupported | CPU binary64 | `Default` resolves a full-domain target and axis-preset frame, then reuses these operators; it adds no qualification to the lane | managed science artifact passed only for its explicit/fixture extent; multi-object object targeting, all dynamic extent policies, default-source runtime/browser/production, and end-to-end runtime remain unqualified because the same recipe ended RED in the browser |
 | FDM GPU | Same target and dynamic-extent restrictions as FDM CPU after compatible field transport | Compatible transported cell-centred structured-grid field; source device/precision is absent from planar metadata; explicit extent required for authored monitors | plane, slab, depth; surface unsupported | CPU binary64 | `Default` is source-compatible with the same CPU sampler only; no device identity or native GPU sampler is implied | no fresh GPU-source/device proof, no correct distinct dynamic-policy proof, no multi-object object-target proof, and no native GPU sampling |
-| FEM CPU | Authored target plus optional intersecting `mesh_part`/`airbox` element scope | Complete or explicitly mapped nodal P1 field on Tet4/Prism6; Pyramid5/Hex8 reject | plane, slab, depth, `object_boundary` surface | CPU binary64 | `Default` selects `magnetic_domain` for `magnetic_only` quantities and `domain` for full-domain quantities | focused Tet4 and Prism6 numerical/target tests pass; managed FEM and browser qualification remain separate gates |
-| FEM GPU | Same target, scope, and surface rules as FEM CPU after compatible field transport | Transported nodal P1 Tet4/Prism6 field; source device/precision is absent from planar metadata | same CPU P1 postprocessor | CPU binary64 | quantity-domain-aware target selection is identical; no native GPU sampler is implied | source-compatible only until fresh managed GPU-source/browser proof |
+| FEM CPU | Authored target plus optional intersecting `mesh_part`/`airbox` element scope | Complete or explicitly mapped nodal first-order field on Tet4/Prism6/Pyramid5/Hex8 (Pyramid5 basis equality with MFEM is gate PM-N19) | plane, slab, depth, `object_boundary` surface | CPU binary64 | `Default` selects `magnetic_domain` for `magnetic_only` quantities and `domain` for full-domain quantities | focused Tet4 and Prism6 numerical/target tests pass; managed FEM and browser qualification remain separate gates |
+| FEM GPU | Same target, scope, and surface rules as FEM CPU after compatible field transport | Transported nodal first-order Tet4/Prism6/Pyramid5/Hex8 field; source device/precision is absent from planar metadata | same CPU P1 postprocessor | CPU binary64 | quantity-domain-aware target selection is identical; no native GPU sampler is implied | source-compatible only until fresh managed GPU-source/browser proof |
 
 ### FDM realization
 
@@ -674,18 +674,25 @@ N_4&=(1-r-s)\zeta,     & N_5&=r\zeta,     & N_6&=s\zeta,\\
 
 The sampler solves the isoparametric inverse map with a bounded Newton solve
 and rejects singular Jacobians or reference coordinates outside the prism.
+Hex8 and Pyramid5 use the bases of {ref}`planar-monitor-mixed-element-bases`
+with the same inversion.
 The basis has partition of unity and reproduces constant and affine physical
 fields because geometry and field use the same $N_a$.
 
-Slab/depth integration clips each native convex cell against the pixel prism.
+Slab/depth integration clips each native convex cell against the pixel prism;
+Tet4 integrates the clipped linear field exactly, Prism6, Hex8 and Pyramid5
+integrate their own basis with the clipped-element quadrature.
 The Prism6 carrier supplies two triangular and three quadrilateral faces;
 surface projection extracts those native exterior faces, clips them in
 $(u,v)$, integrates their P1 trace with physical area, and applies the requested
-visibility policy. Spatial lookup is currently a direct element traversal.
+visibility policy. Plane sampling rasterizes element by element (only pixel
+centres inside an element's bounding box are inverted) and caches the
+resulting operator per geometry identity; sub-pixel elements are evaluated in
+their own parent element, never by a scan of the whole mesh.
 
 The API admits this realization only when the flattened field has exactly
 $n_{\mathrm{comp}}$ values for every node of the complete published mesh and
-the mesh uses Tet4 or Prism6. Target and runtime scope alter element markers after loading;
+every cell is Tet4, Prism6, Pyramid5 or Hex8. Target and runtime scope alter element markers after loading;
 they do not narrow the field carrier. Moreover, all three FEM dynamic extent
 tags currently derive bounds from the complete `fem.nodes` array. Thus
 `target_bounds`, `magnetic_domain`, and `universe` resolve to the same global
@@ -968,9 +975,13 @@ Structural validation does not prove scientific correctness.
   implementing distinct target, magnetic-domain, and universe policies;
   explicit extents are required until PM-N13 passes.
 - FEM region-boundary and named-surface topology are absent.
-- FEM planar carriers support nodal P1 Tet4 and Prism6 with identity or explicit
-  local-to-global mapping. Pyramid5, Hex8, discontinuous, cell-centred, and
-  higher-order carriers reject explicitly.
+- FEM planar carriers support nodal first-order Tet4, Prism6, Pyramid5 and
+  Hex8 with identity or explicit local-to-global mapping. The Pyramid5 basis
+  is the rational first-order basis of {eq}`eq-planar-fem-pyramid5`; it is
+  identical to `mfem::LinearPyramidFiniteElement::CalcShape` of the linked
+  MFEM sources (only the apex tolerance differs), so gate PM-N19 holds at the
+  source level; a pointwise runtime comparison remains to be recorded. Discontinuous, cell-centred and higher-order carriers reject
+  explicitly.
 - FEM dynamic extents ignore target/scope markers and use all mesh nodes, so
   scoped dynamic extents are incorrect and unqualified.
 - `include_air_as_zero` currently contributes empty-bin zeros to API metadata
@@ -979,8 +990,13 @@ Structural validation does not prove scientific correctness.
 - Planar target-boundary rendering is only contract-implemented after the
   `FMCS v4` codec, route, and frontend decoder tests; it remains browser and
   runtime unqualified until the requested backend/mode evidence is captured.
-- Scale-aware clipping tolerances and a spatial index remain required for
-  production performance and scale invariance.
+- FEM plane-sampling and Newton tolerances are scale-relative; the polygon
+  clipping de-duplication distance in `geometry.rs` is still absolute
+  ($10^{-12}\,\mathrm{m}$). Plane sampling is element-driven without a
+  bounding-volume hierarchy; the cached operator removes repeated geometry
+  work across field revisions, but the first build is $O(E)$ per plane.
+- The probe is a point evaluation with `occupied`, `outside` and `empty`
+  statuses; FEM point location for the probe is a linear element scan.
 - The failed current browser smoke blocks visible-canvas, lifecycle,
   accessibility, performance, and 3D/2D preservation qualification.
 - The session-resolved `Default` source is contract-only until its typed state,

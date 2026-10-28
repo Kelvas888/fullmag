@@ -4,17 +4,20 @@ import { useState } from "react";
 
 import type {
   DomainMetaResource,
+  PlanarFieldMetaResource,
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
 import {
   formatSectionLength,
-  fractionFromLayerIndex,
   fullThicknessSlabOperator,
-  layerIndexFromFraction,
   resolvePlanarSectionGeometry,
   resolvedSectionCoordinate,
+  sectionLayerCount,
+  sectionLayerFraction,
+  sectionLayerIndex,
   sectionReduction,
   stepSectionFraction,
+  withSectionStops,
   type PlanarSectionPlane,
   type PlanarSectionReduction,
 } from "@/kernel/visualization/planarSectionModel";
@@ -39,27 +42,31 @@ const FRACTION_STEPS = 1000;
 export function PlanarSectionStrip({
   defaultSlice,
   domain,
+  section = null,
   shownCoordinate = null,
   onChange,
 }: {
   defaultSlice: DefaultSlice;
   domain: DomainMetaResource | null | undefined;
+  /** Backend section of the current sample; supplies FEM node-plane stops. */
+  section?: PlanarFieldMetaResource["section"] | null;
   /** Normal coordinate of the frame currently on screen (may lag a new request). */
   shownCoordinate?: number | null;
   onChange: (next: DefaultSlice) => void;
 }) {
   const plane = defaultSlice.plane as PlanarSectionPlane;
-  const geometry = resolvePlanarSectionGeometry(domain, plane);
+  const geometry = withSectionStops(resolvePlanarSectionGeometry(domain, plane), section);
   const reduction = sectionReduction(defaultSlice.operator, geometry);
-  const layerCount = geometry?.layerCount ?? null;
+  const layerCount = sectionLayerCount(geometry);
+  const layerNoun = geometry?.stops ? "node plane" : "layer";
   const [draft, setDraft] = useState<{ key: string; value: number } | null>(null);
   const draftKey = `${plane}:${layerCount ?? "continuous"}`;
-  const committedStep = layerCount !== null
-    ? layerIndexFromFraction(defaultSlice.position_fraction, layerCount)
+  const committedStep = layerCount !== null && geometry
+    ? sectionLayerIndex(geometry, defaultSlice.position_fraction) ?? 0
     : Math.round(defaultSlice.position_fraction * FRACTION_STEPS);
   const step = draft?.key === draftKey ? draft.value : committedStep;
-  const fraction = layerCount !== null
-    ? fractionFromLayerIndex(step, layerCount)
+  const fraction = layerCount !== null && geometry
+    ? sectionLayerFraction(geometry, step)
     : step / FRACTION_STEPS;
   const coordinate = geometry ? resolvedSectionCoordinate(geometry, fraction) : null;
   const axis = geometry?.normal ?? (plane === "xy" ? "z" : plane === "xz" ? "y" : "x");
@@ -71,8 +78,8 @@ export function PlanarSectionStrip({
     setDraft(null);
     if (draft.value === committedStep) return;
     change({
-      position_fraction: layerCount !== null
-        ? fractionFromLayerIndex(draft.value, layerCount)
+      position_fraction: layerCount !== null && geometry
+        ? sectionLayerFraction(geometry, draft.value)
         : draft.value / FRACTION_STEPS,
     });
   };
@@ -145,7 +152,7 @@ export function PlanarSectionStrip({
           <input
             aria-label={layerCount !== null ? `Layer along ${axis}` : `Position along ${axis}`}
             aria-valuetext={`${axis} = ${formatSectionLength(coordinate ?? Number.NaN)}${
-              layerCount !== null ? `, layer ${step} of ${layerCount}` : ""
+              layerCount !== null ? `, ${layerNoun} ${step} of ${layerCount}` : ""
             }`}
             className="fm-field-map__section-slider"
             disabled={geometry === null || (layerCount !== null && layerCount < 2)}
@@ -177,7 +184,7 @@ export function PlanarSectionStrip({
               ? `showing ${axis} = ${formatSectionLength(shownCoordinate)} · loading `
               : `${axis}: `}
             {formatSectionLength(coordinate ?? Number.NaN)}
-            {layerCount !== null ? ` · layer ${step} / ${layerCount - 1}` : ""}
+            {layerCount !== null ? ` · ${layerNoun} ${step} / ${layerCount - 1}` : ""}
           </span>
         </>
       )}

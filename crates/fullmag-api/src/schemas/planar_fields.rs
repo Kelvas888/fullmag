@@ -146,7 +146,9 @@ pub struct PlanarSectionResource {
     pub requested_fraction: f64,
     pub requested_coordinate_m: f64,
     pub resolved_coordinate_m: f64,
-    /// `fdm_cell_layers` (coordinate snapped to a cell centre) or `continuous`.
+    /// `fdm_cell_layers` (snapped to a cell centre), `fem_node_planes` (on a
+    /// swept-mesh node plane), `fem_node_planes_between` (between planes) or
+    /// `continuous`.
     pub stops_kind: String,
     pub layer_index: Option<u32>,
     pub layer_count: Option<u32>,
@@ -155,6 +157,8 @@ pub struct PlanarSectionResource {
     pub normal_max_m: f64,
     /// Distance moved by one layer or navigation step along the normal.
     pub navigation_step_m: f64,
+    /// Discrete stops along the normal (FEM node planes); empty otherwise.
+    pub layer_stops_m: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

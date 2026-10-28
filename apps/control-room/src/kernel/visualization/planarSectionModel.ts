@@ -44,6 +44,51 @@ export interface PlanarSectionGeometry {
   layerSpacing: number | null;
   /** Native FDM cell counts along u and v; null for unstructured domains. */
   nativeResolution: readonly [number, number] | null;
+  /**
+   * Discrete node-plane coordinates of a swept FEM mesh along the normal
+   * (from the sample metadata section); null when the section is continuous.
+   */
+  stops?: readonly number[] | null;
+}
+
+/** Attach FEM node-plane stops published by the backend section. */
+export function withSectionStops(
+  geometry: PlanarSectionGeometry | null,
+  section: { plane: string; layer_stops_m?: number[] | null } | null | undefined,
+): PlanarSectionGeometry | null {
+  if (!geometry || geometry.layerCount !== null) return geometry;
+  const stops = section?.plane === geometry.plane ? section.layer_stops_m ?? [] : [];
+  return stops.length >= 2 ? { ...geometry, stops } : geometry;
+}
+
+/** Number of discrete layers (FDM cells or FEM node planes), or null if continuous. */
+export function sectionLayerCount(geometry: PlanarSectionGeometry | null): number | null {
+  if (!geometry) return null;
+  return geometry.stops?.length ?? geometry.layerCount;
+}
+
+/** Discrete layer index for a position fraction (nearest node plane for FEM). */
+export function sectionLayerIndex(geometry: PlanarSectionGeometry, fraction: number): number | null {
+  if (geometry.stops?.length) {
+    const coordinate = geometry.normalMin + clampFraction(fraction) * geometry.normalExtent;
+    let best = 0;
+    geometry.stops.forEach((stop, index) => {
+      if (Math.abs(stop - coordinate) < Math.abs(geometry.stops![best]! - coordinate)) best = index;
+    });
+    return best;
+  }
+  return geometry.layerCount !== null ? layerIndexFromFraction(fraction, geometry.layerCount) : null;
+}
+
+/** Position fraction that resolves to exactly layer `index`. */
+export function sectionLayerFraction(geometry: PlanarSectionGeometry, index: number): number {
+  if (geometry.stops?.length) {
+    const clamped = Math.min(Math.max(Math.round(index), 0), geometry.stops.length - 1);
+    return clampFraction((geometry.stops[clamped]! - geometry.normalMin) / geometry.normalExtent);
+  }
+  return geometry.layerCount !== null
+    ? fractionFromLayerIndex(index, geometry.layerCount)
+    : clampFraction(index);
 }
 
 export function planarSectionAxes(plane: PlanarSectionPlane) {
@@ -115,6 +160,9 @@ export function resolvedSectionCoordinate(
   geometry: PlanarSectionGeometry,
   fraction: number,
 ): number {
+  if (geometry.stops?.length) {
+    return geometry.stops[sectionLayerIndex(geometry, fraction) ?? 0]!;
+  }
   if (geometry.layerCount !== null && geometry.layerSpacing !== null) {
     const index = layerIndexFromFraction(fraction, geometry.layerCount);
     return geometry.normalMin + (index + 0.5) * geometry.layerSpacing;
@@ -215,9 +263,10 @@ export function stepSectionFraction(
   geometry: PlanarSectionGeometry | null,
   delta: number,
 ): number {
-  if (geometry?.layerCount != null) {
-    const index = layerIndexFromFraction(fraction, geometry.layerCount);
-    return fractionFromLayerIndex(index + Math.round(delta), geometry.layerCount);
+  const count = sectionLayerCount(geometry);
+  if (geometry && count !== null) {
+    const index = sectionLayerIndex(geometry, fraction) ?? 0;
+    return sectionLayerFraction(geometry, index + Math.round(delta));
   }
   return clampFraction(clampFraction(fraction) + delta * CONTINUOUS_SECTION_STEP);
 }
