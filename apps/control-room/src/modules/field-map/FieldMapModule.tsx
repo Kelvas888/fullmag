@@ -702,6 +702,8 @@ function useFieldMapModuleController() {
     toolbarQuantities,
     vectors,
     visualization,
+    multislice,
+    multisliceClientComponent: clientComponents ? displayComponent : null,
   };
 }
 
@@ -736,6 +738,8 @@ export default function FieldMapModule() {
     toolbarQuantities,
     vectors,
     visualization,
+    multislice,
+    multisliceClientComponent,
   } = useFieldMapModuleController();
   const sectionStrip = sectionDefaultSlice ? (
     <PlanarSectionStrip
@@ -869,7 +873,7 @@ export default function FieldMapModule() {
         {multislice ? (
           <PlanarMultisliceGrid
             baseQuery={plan.query}
-            clientComponent={clientComponents ? displayComponent : null}
+            clientComponent={multisliceClientComponent}
             colorByDirection={renderModel.directionVectors !== null}
             colormap={renderModel.colormap ?? presentationPlanar.colormap}
             positionFractions={multislice.position_fractions}

@@ -3,14 +3,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { decodeFieldVector } from "@/kernel/api/codecs";
-import type { PlanarFieldQuery } from "@/kernel/api/apiTypes";
+import type { PlanarFieldQuery, PlanarFieldSource } from "@/kernel/api/apiTypes";
 import {
   planarFieldQueryFromMeta,
   usePlanarFieldMetaResource,
   usePlanarMaskResource,
   usePlanarScalarResource,
   usePlanarVectorResource,
-  type PlanarFieldSource,
 } from "@/kernel/resources/planarFieldResources";
 
 import {
@@ -190,7 +189,9 @@ function PlanarMultislicePanel({
   const coordinate = meta.data?.section?.resolved_coordinate_m;
   const error = meta.status === "error"
     ? meta.error?.message
-    : canonical && !canonical.ok ? canonical.error : scalar.status === "error" ? scalar.error?.message : null;
+    : canonical && !canonical.ok
+      ? String(canonical.error instanceof Error ? canonical.error.message : canonical.error)
+      : scalar.status === "error" ? scalar.error?.message : null;
   const state = error ? "error" : values && sharedRange ? "ready" : "loading";
   return (
     <figure
