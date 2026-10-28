@@ -157,6 +157,12 @@ pub struct PlanarSectionResource {
     pub normal_max_m: f64,
     /// Distance moved by one layer or navigation step along the normal.
     pub navigation_step_m: f64,
+    /// `fdm_cell`, `fem_node_plane_spacing`, `median_element_height` (median
+    /// normal extent of the cut FEM elements; a navigation aid, not a data
+    /// layer) or `extent_fraction`.
+    pub navigation_step_kind: String,
+    /// Target elements cut by the sampled FEM plane, when known.
+    pub cut_element_count: Option<u32>,
     /// Discrete stops along the normal (FEM node planes); empty otherwise.
     pub layer_stops_m: Vec<f64>,
 }

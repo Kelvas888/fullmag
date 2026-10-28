@@ -78,4 +78,38 @@ describe("planar inspector capabilities", () => {
       }).vectors,
     ).toEqual({ enabled: false, reasonCode: "quantity_not_vector" });
   });
+
+  it.each(["fdm", "fem"])("shows %s Airbox capabilities only after the backend resolves the carrier", (discretization) => {
+    const descriptor = { available: true, boundaryClassification: "exact", codec: "fmcs.v4" };
+    const pending = resolvePlanarInspectorCapabilities({
+      descriptor: null,
+      discretization,
+      metaAvailable: false,
+      quantity,
+      scopeKind: "airbox",
+    });
+    expect(pending.raster).toEqual({ enabled: false, reasonCode: "airbox_carrier_unresolved" });
+    expect(pending.vectors).toEqual({ enabled: false, reasonCode: "airbox_carrier_unresolved" });
+
+    const rejected = resolvePlanarInspectorCapabilities({
+      descriptor: null,
+      discretization,
+      metaAvailable: false,
+      metaErrorCode: "planar_scope_unavailable",
+      quantity,
+      scopeKind: "airbox",
+    });
+    expect(rejected.raster).toEqual({ enabled: false, reasonCode: "planar_scope_unavailable" });
+
+    const resolved = resolvePlanarInspectorCapabilities({
+      descriptor,
+      discretization,
+      metaAvailable: true,
+      occupancyAvailable: true,
+      quantity,
+      scopeKind: "airbox",
+    });
+    expect(resolved.raster.enabled).toBe(true);
+    expect(resolved.vectors.enabled).toBe(true);
+  });
 });

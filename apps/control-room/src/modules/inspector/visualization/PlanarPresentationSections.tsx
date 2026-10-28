@@ -39,7 +39,8 @@ function reason(capability: FieldMapCapability): string | undefined {
     case "fem_layer_scope_not_supported": return "Native layer scope requires an FDM multilayer carrier.";
     case "quantity_not_vector": return "The selected scalar quantity has no vector components.";
     case "quantity_not_spatial": return "The selected quantity is not spatially sampleable.";
-    default: return "Unavailable";
+    case "airbox_carrier_unresolved": return "Waiting for the backend to resolve the Airbox carrier.";
+    default: return capability.reasonCode ? `Unavailable: ${capability.reasonCode}` : "Unavailable";
   }
 }
 

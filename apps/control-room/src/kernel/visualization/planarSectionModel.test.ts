@@ -174,3 +174,36 @@ describe("FEM node-plane stops", () => {
     expect(stepSectionFraction(fractionOf(20e-9), geometry, 1)).toBeCloseTo(fractionOf(20e-9), 12);
   });
 });
+
+describe("continuous FEM navigation step", () => {
+  it("steps by the published median element height and ignores other step kinds", async () => {
+    const { stepSectionFraction, withSectionStops } = await import("./planarSectionModel");
+    const continuous = {
+      layerCount: null,
+      layerSpacing: null,
+      nativeResolution: null,
+      normal: "z" as const,
+      normalExtent: 80e-9,
+      normalMax: 40e-9,
+      normalMin: -40e-9,
+      plane: "xy" as const,
+      u: "x" as const,
+      v: "y" as const,
+    };
+    const geometry = withSectionStops(continuous, {
+      navigation_step_kind: "median_element_height",
+      navigation_step_m: 4e-9,
+      plane: "xy",
+    })!;
+    expect(geometry.navigationStepM).toBe(4e-9);
+    expect(stepSectionFraction(0.5, geometry, 1)).toBeCloseTo(0.55, 12);
+    expect(stepSectionFraction(0.5, geometry, -2)).toBeCloseTo(0.4, 12);
+    const fallback = withSectionStops(continuous, {
+      navigation_step_kind: "extent_fraction",
+      navigation_step_m: 0.8e-9,
+      plane: "xy",
+    })!;
+    expect(fallback.navigationStepM).toBeUndefined();
+    expect(stepSectionFraction(0.5, fallback, 1)).toBeCloseTo(0.51, 12);
+  });
+});

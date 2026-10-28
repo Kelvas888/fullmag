@@ -14,8 +14,8 @@ use super::operator::{
     fem_topology_fingerprint, FemPlaneOperator, FemPlanePixel, MAX_PLANE_OPERATOR_NODES,
 };
 use super::{
-    FemPlanarElement, FemPlanarField, PlanarCompatibilityReduction, PlanarSampleResult,
-    ResolvedPlanarSampleRequest,
+    FemPlanarElement, FemPlanarField, FemSectionExtent, PlanarCompatibilityReduction,
+    PlanarSampleResult, ResolvedPlanarSampleRequest,
 };
 use super::{
     PlanarMeshOverlay, PlanarOverlayPolygon, PlanarOverlaySegment, PlanarOverlaySegmentKind,
@@ -276,6 +276,7 @@ pub(super) fn build_plane_operator(
     let pixel_count = request.resolution[0] as usize * request.resolution[1] as usize;
     let mut claimed = vec![false; pixel_count];
     let mut pixels = Vec::new();
+    let mut cut_extents = Vec::new();
     let du = (frame.bounds[1] - frame.bounds[0]) / request.resolution[0] as f64;
     let dv = (frame.bounds[3] - frame.bounds[2]) / request.resolution[1] as f64;
     for (element_index, element) in field.elements().iter().enumerate() {
@@ -302,6 +303,7 @@ pub(super) fn build_plane_operator(
         if n_min > 0.0 || n_max < 0.0 {
             continue;
         }
+        cut_extents.push(n_max - n_min);
         let u_min = projected
             .iter()
             .map(|point| point[0])
@@ -393,7 +395,27 @@ pub(super) fn build_plane_operator(
         topology_fingerprint,
         pixels,
         overlay,
+        section_extent: section_extent(cut_extents),
     }
+}
+
+/// Median normal extent of the cut elements (`eq-planar-navigation-step`).
+pub(super) fn section_extent(mut extents: Vec<f64>) -> Option<FemSectionExtent> {
+    extents.retain(|extent| extent.is_finite() && *extent > 0.0);
+    if extents.is_empty() {
+        return None;
+    }
+    extents.sort_unstable_by(f64::total_cmp);
+    let middle = extents.len() / 2;
+    let median = if extents.len() % 2 == 0 {
+        0.5 * (extents[middle - 1] + extents[middle])
+    } else {
+        extents[middle]
+    };
+    Some(FemSectionExtent {
+        cut_element_count: u32::try_from(extents.len()).unwrap_or(u32::MAX),
+        normal_extent_median_m: median,
+    })
 }
 
 fn plane_pixel(
@@ -470,6 +492,7 @@ pub(super) fn apply_plane_operator(
         occupancy,
         source_entity_ids,
         overlay: None,
+        section_extent: operator.section_extent,
     }
 }
 

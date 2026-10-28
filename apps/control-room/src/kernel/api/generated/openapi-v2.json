@@ -28477,6 +28477,15 @@
       "PlanarSectionResource": {
         "description": "Requested vs. resolved position of the session `Default` slice along its\nnormal. A snap to an FDM cell centre is published, never hidden.",
         "properties": {
+          "cut_element_count": {
+            "description": "Target elements cut by the sampled FEM plane, when known.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "layer_count": {
             "format": "int32",
             "minimum": 0,
@@ -28507,6 +28516,10 @@
               "type": "number"
             },
             "type": "array"
+          },
+          "navigation_step_kind": {
+            "description": "`fdm_cell`, `fem_node_plane_spacing`, `median_element_height` (median\nnormal extent of the cut FEM elements; a navigation aid, not a data\nlayer) or `extent_fraction`.",
+            "type": "string"
           },
           "navigation_step_m": {
             "description": "Distance moved by one layer or navigation step along the normal.",
@@ -28556,6 +28569,7 @@
           "normal_min_m",
           "normal_max_m",
           "navigation_step_m",
+          "navigation_step_kind",
           "layer_stops_m"
         ],
         "type": "object"

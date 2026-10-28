@@ -52,16 +52,32 @@ export interface PlanarSectionGeometry {
    * (from the sample metadata section); null when the section is continuous.
    */
   stops?: readonly number[] | null;
+  /**
+   * Navigation step of a continuous FEM section: the median normal extent of
+   * the elements cut by the current plane (`eq-planar-navigation-step`). A
+   * navigation aid, not a data layer.
+   */
+  navigationStepM?: number | null;
 }
 
-/** Attach FEM node-plane stops published by the backend section. */
+/** Attach FEM node-plane stops or the continuous navigation step published by the backend section. */
 export function withSectionStops(
   geometry: PlanarSectionGeometry | null,
-  section: { plane: string; layer_stops_m?: number[] | null } | null | undefined,
+  section: {
+    layer_stops_m?: number[] | null;
+    navigation_step_kind?: string | null;
+    navigation_step_m?: number | null;
+    plane: string;
+  } | null | undefined,
 ): PlanarSectionGeometry | null {
-  if (!geometry || geometry.layerCount !== null) return geometry;
-  const stops = section?.plane === geometry.plane ? section.layer_stops_m ?? [] : [];
-  return stops.length >= 2 ? { ...geometry, stops } : geometry;
+  if (!geometry || geometry.layerCount !== null || section?.plane !== geometry.plane) return geometry;
+  const stops = section.layer_stops_m ?? [];
+  if (stops.length >= 2) return { ...geometry, stops };
+  const step = section.navigation_step_m;
+  return section.navigation_step_kind === "median_element_height" &&
+    typeof step === "number" && Number.isFinite(step) && step > 0
+    ? { ...geometry, navigationStepM: step }
+    : geometry;
 }
 
 /** Number of discrete layers (FDM cells or FEM node planes), or null if continuous. */
@@ -304,5 +320,8 @@ export function stepSectionFraction(
     const index = sectionLayerIndex(geometry, fraction) ?? 0;
     return sectionLayerFraction(geometry, index + steps);
   }
-  return clampFraction(clampFraction(fraction) + delta * CONTINUOUS_SECTION_STEP);
+  const step = geometry?.navigationStepM && geometry.normalExtent > 0
+    ? geometry.navigationStepM / geometry.normalExtent
+    : CONTINUOUS_SECTION_STEP;
+  return clampFraction(clampFraction(fraction) + delta * step);
 }

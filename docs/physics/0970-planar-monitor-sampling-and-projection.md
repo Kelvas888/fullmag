@@ -302,6 +302,7 @@ exceed $10^{-12}$ times the maximum raster vector norm receive
 | $k$ | FDM cell-layer index along the normal | $1$ |
 | $N_n$ | FDM cell count along the normal | $1$ |
 | $h_n$ | FDM cell edge along the normal | $\mathrm{m}$ |
+| $h_\perp$ | Navigation step of a continuous FEM section: median normal extent of the cut target elements | $\mathrm{m}$ |
 | $\pi$ | Circle constant | $1$ |
 
 `[q]` denotes the canonical SI unit of the selected source quantity. Unit
@@ -817,10 +818,37 @@ k=\min\!\left(N_n-1,\ \max\!\left(0,\lceil\phi N_n\rceil-1\right)\right),\qquad
 p_n^{\mathrm{res}}=b_{\min}+\left(k+\tfrac12\right)h_n .
 ```
 
-`stops_kind` is `fdm_cell_layers` when {eq}`eq-planar-default-layer` applies
-and `continuous` otherwise; `navigation_step_m` is $h_n$ or one hundredth of
-the normal extent. The user interface shows $p_n^{\mathrm{req}}$ and
-$p_n^{\mathrm{res}}$ together and never hides the snap.
+On a swept FEM mesh whose mixed-layer topology certificate lists the magnetic
+node-plane coordinates $z_0<\dots<z_{L}$ along the sweep axis, and when the
+section normal is that axis, the request snaps to the nearest plane
+$z_k$ only within a relative window
+$|z_k-p_n^{\mathrm{req}}|\le\max(\varepsilon_{\mathrm{cert}},10^{-9}(z_L-z_0))$.
+Outside the window the plane is sampled at $p_n^{\mathrm{req}}$ itself, which
+is legal because the Prism6 interpolant is linear along the sweep within each
+layer. A node plane is a geometric stop, not a data layer: the sampled field on
+$z_k$ is the nodal trace, and between planes it is the element interpolant.
+
+On other FEM meshes the section is continuous. Its navigation step is the
+median normal extent of the elements cut by the current plane,
+
+```{math}
+:label: eq-planar-navigation-step
+h_\perp=\operatorname{median}\{\max_a n_a-\min_a n_a : e\in\mathcal T,\ \min_a n_a\le p_n^{\mathrm{res}}\le\max_a n_a\},
+```
+
+where $\mathcal T$ is the sampled target and $n_a=(\mathbf x_a-\mathbf o)\cdot\mathbf n$ are the projected element
+vertices. $h_\perp$ is a navigation aid that depends on the current plane; it
+does not define layers and does not enter any sampled value. It is computed in
+the geometry pass of the cached `plane_sample` operator and published with the
+number of cut elements; when no operator was built (slab and depth operators,
+or no cut element) the step stays one hundredth of the normal extent.
+
+`stops_kind` is `fdm_cell_layers` when {eq}`eq-planar-default-layer` applies,
+`fem_node_planes` or `fem_node_planes_between` on a certified swept mesh, and
+`continuous` otherwise; `navigation_step_m` is $h_n$, the mean node-plane
+spacing, $h_\perp$, or one hundredth of the normal extent, and
+`navigation_step_kind` names which. The user interface shows
+$p_n^{\mathrm{req}}$ and $p_n^{\mathrm{res}}$ together and never hides the snap.
 
 (planar-monitor-probe-evaluation)=
 ### Probe evaluation
@@ -922,6 +950,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N20 | Prism6/Hex8/Pyramid5 slab of the element interpolant ($q=\xi\tau$) | integral exact to quadrature tolerance; linear clipping fails this gate |
 | PM-N21 | probe on the raster edge, outside the frame and outside the target | `occupied`, `outside` and `empty` respectively; no clamped value |
 | PM-N22 | default section on even/odd FDM grids at $\phi\in\{0,0.5,1\}$ | published $k$ and $p_n^{\mathrm{res}}$ follow {eq}`eq-planar-default-layer`; requested coordinate preserved |
+| PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |
 | PM-D02 | default position validation | `position_fraction` is finite and in $[0,1]$; resolved `position_m` is finite and inside the selected normal bounds |
 | PM-D03 | default/authored sampler parity | after source resolution, both source identities use the same interpolation and measure-weighted reduction; source provenance remains distinct |

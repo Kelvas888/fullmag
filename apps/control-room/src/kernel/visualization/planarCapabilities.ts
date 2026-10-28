@@ -24,8 +24,10 @@ export type PlanarScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer
 
 /**
  * Structured FDM grids have no mesh parts; native layers exist only for FDM
- * multilayer carriers. The Airbox scope is resolved by the backend carrier
- * (FDM Airbox cells or FEM airbox elements) and fails there with its exact reason.
+ * multilayer carriers. The Airbox scope is requested so the backend can
+ * resolve its carrier (FDM Airbox cells or FEM airbox elements); it fails
+ * there with its exact reason. Presented capabilities wait for that result
+ * (`resolvePlanarInspectorCapabilities`).
  */
 export function planarScopeCapability(input: {
   discretization: string | null | undefined;
@@ -71,6 +73,8 @@ export function resolvePlanarInspectorCapabilities(input: {
   descriptor: PlanarMeshOverlayDescriptor | null | undefined;
   discretization: string | null | undefined;
   metaAvailable?: boolean;
+  /** Exact backend reason when the planar metadata request failed. */
+  metaErrorCode?: string | null;
   occupancyAvailable?: boolean;
   quantity: {
     available: boolean;
@@ -83,10 +87,19 @@ export function resolvePlanarInspectorCapabilities(input: {
   const spatial =
     quantityAvailable &&
     input.quantity?.location?.trim().toLowerCase() !== "global";
-  const scope = planarScopeCapability({
+  const metaAvailable = input.metaAvailable ?? false;
+  const requestedScope = planarScopeCapability({
     discretization: input.discretization,
     scopeKind: input.scopeKind,
   });
+  // P1-04: the backend resolves the Airbox carrier (FDM Airbox cells or FEM
+  // airbox elements) per quantity. Its sample metadata is the single
+  // capability source, so nothing is shown as supported before it resolves.
+  const scope: FieldMapCapability = requestedScope.enabled &&
+    input.scopeKind === "airbox" &&
+    !metaAvailable
+    ? { enabled: false, reasonCode: input.metaErrorCode ?? "airbox_carrier_unresolved" }
+    : requestedScope;
   const descriptor = input.descriptor;
   const meshOverlayAvailable =
     spatial &&
@@ -99,7 +112,6 @@ export function resolvePlanarInspectorCapabilities(input: {
     spatial: spatial && scope.enabled,
     vectorComponents: input.quantity?.components ?? 0,
   });
-  const metaAvailable = input.metaAvailable ?? false;
   const bounds = spatial && scope.enabled && metaAvailable
     ? { enabled: true, reasonCode: null }
     : {
@@ -140,13 +152,16 @@ export function resolvePlanarInspectorCapabilities(input: {
                     : "boundaries_not_exact",
         };
 
+  // A disabled scope is the exact reason for every carrier-dependent layer.
+  const scoped = (capability: FieldMapCapability): FieldMapCapability =>
+    scope.enabled ? capability : { enabled: false, reasonCode: scope.reasonCode };
   return {
     boundaries,
     bounds,
-    contours: base.contours,
-    mesh: base.mesh,
+    contours: scoped(base.contours),
+    mesh: scoped(base.mesh),
     points,
-    raster: base.contours,
-    vectors: base.vectors,
+    raster: scoped(base.contours),
+    vectors: scoped(base.vectors),
   };
 }

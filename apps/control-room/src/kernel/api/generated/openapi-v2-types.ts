@@ -12099,6 +12099,11 @@ export interface components {
          *     normal. A snap to an FDM cell centre is published, never hidden.
          */
         PlanarSectionResource: {
+            /**
+             * Format: int32
+             * @description Target elements cut by the sampled FEM plane, when known.
+             */
+            cut_element_count?: number | null;
             /** Format: int32 */
             layer_count?: number | null;
             /** Format: int32 */
@@ -12107,6 +12112,12 @@ export interface components {
             layer_spacing_m?: number | null;
             /** @description Discrete stops along the normal (FEM node planes); empty otherwise. */
             layer_stops_m: number[];
+            /**
+             * @description `fdm_cell`, `fem_node_plane_spacing`, `median_element_height` (median
+             *     normal extent of the cut FEM elements; a navigation aid, not a data
+             *     layer) or `extent_fraction`.
+             */
+            navigation_step_kind: string;
             /**
              * Format: double
              * @description Distance moved by one layer or navigation step along the normal.

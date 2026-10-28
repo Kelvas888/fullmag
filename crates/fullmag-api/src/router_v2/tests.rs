@@ -18580,7 +18580,7 @@ async fn planar_field_resources_publish_meta_binary_probe_png_and_etag() {
     assert_eq!(meta_json["scene_revision"], SCENE_REVISION.to_string());
     assert_eq!(meta_json["mesh_revision"], MESH_REVISION.to_string());
     assert_eq!(meta_json["field_revision"], FIELD_REVISION.to_string());
-    assert_eq!(meta_json["schema_version"], "planar_sample_meta.v5");
+    assert_eq!(meta_json["schema_version"], "planar_sample_meta.v6");
     assert_eq!(meta_json["mesh_overlay_descriptor"]["available"], true);
     assert_eq!(
         meta_json["mesh_overlay_descriptor"]["boundary_classification"],
@@ -46038,7 +46038,7 @@ async fn planar_default_meta_publishes_source_and_offset_domain_frame() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let meta = body_json(response).await;
-    assert_eq!(meta["schema_version"], "planar_sample_meta.v5");
+    assert_eq!(meta["schema_version"], "planar_sample_meta.v6");
     assert_eq!(meta["source"]["kind"], "default");
     assert!(meta["source"]["default_slice_hash"].is_string());
     assert!(meta["source"]["default_slice_revision"].is_string());
