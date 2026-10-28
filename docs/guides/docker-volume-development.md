@@ -208,6 +208,40 @@ lease `iteration` i przed zatrzymaniem którejkolwiek usługi; błąd tej kontro
 zostawia grupę działającą i nie tworzy próby. Grupa bez kwarantanny namespace
 ma `BuildControl.namespace == ""` i używa subpath `runtime-control`.
 
+#### Początkowy start odrzucony z powodu wyczerpanej puli sieci
+
+Błąd Dockera `all predefined address pools have been fully subnetted` może
+wystąpić przed utworzeniem obu usług. Zachowany helper i receipt
+`outcome-unknown-resources-retained` nie są zgodą na ponowne `up` ani ręczne
+usunięcie `active`. Najpierw sprawdź właścicieli sieci; nie stosuj globalnego
+`network prune` i nie usuwaj sieci grup z zachowanymi kontenerami lub recovery.
+Usunięcie osieroconej sieci innego zadania wymaga odrębnej autoryzacji.
+
+Dla wyłącznie początkowej próby, bez wcześniejszego udanego deploymentu,
+recepta `docker-dev-reconcile-network-failure` potwierdza nieudany start.
+Przyjmuje wybrany checkout, dokładny attempt, hashe oryginalnego `receipt.json`
+i `compose.json` oraz ID silnika Docker. Domyślnie wykonuje tylko preview:
+
+```text
+just docker-dev-reconcile-network-failure <source> <attempt> <receipt-sha256> <compose-sha256> <engine-id>
+```
+
+Po sprawdzeniu dowodów końcowy argument `true` wykonuje failure-only CAS.
+Wymagane są: dokładny błąd puli, brak usług (także zatrzymanych) i sieci tej
+próby oraz zgodny oryginalny helper z potwierdzonym `LOGGED`, nadal trzymający
+`operation.lock`. Pełny spis kontenerów wyklucza obcych konsumentów wolumenu
+kontrolnego i checkoutu tej grupy. Dowody są ponownie sprawdzane przed publikacją.
+Ta początkowa procedura failure-only jest lokalna dla grupy (ADR 0067); nie
+wymaga zatrzymania procesów innych grup. Starsze procedury odzyskiwania
+BuildKit zachowują własne, globalne kontrole.
+Adapter zachowuje oryginalny receipt i dowód, nie publikuje sukcesu ani
+`verified`, nie uruchamia usług i nie usuwa danych. Wyłącznie oryginalny helper
+zwalnia swój marker `active` po odebraniu terminalnego wyniku. Nieznany wynik
+publikacji wymaga odczytu zachowanych dowodów; nie ponawiaj mutacji w ciemno.
+Dopiero potwierdzony terminal i zwolnienie helpera pozwalają na nowy start
+standardową receptą. Ta procedura nie służy do odzyskiwania zatrzymanego
+mastera z istniejącą sesją.
+
 #### Odzyskanie grupy zablokowanej w `iteration`
 
 Przed poprawką z 21.10.2026 idle restart grupy bez namespace (`""`) zatrzymywał

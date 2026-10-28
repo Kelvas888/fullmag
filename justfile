@@ -110,6 +110,10 @@ docker-dev-reconcile-iteration request request_sha256 source_root port="3197" pr
 docker-dev-reconcile-development request request_sha256 source_root apply="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_development_interrupted.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
 
+# Failure-only recovery for an initial Compose rejection before either service exists.
+docker-dev-reconcile-network-failure source_root attempt receipt_sha256 compose_sha256 engine_id apply="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_volume_network_failure_reconcile.py" --source-root {{quote(source_root)}} --attempt {{quote(attempt)}} --receipt-sha256 {{quote(receipt_sha256)}} --compose-sha256 {{quote(compose_sha256)}} --engine-id {{quote(engine_id)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
+
 # Confirm one exact post-reboot resume failure; never start services or change native ownership.
 docker-dev-reconcile-resume request request_sha256 source_root apply="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_development_interrupted.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
