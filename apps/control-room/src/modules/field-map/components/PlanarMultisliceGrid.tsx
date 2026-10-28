@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import { decodeFieldVector } from "@/kernel/api/codecs";
 import type { PlanarFieldQuery, PlanarFieldSource } from "@/kernel/api/apiTypes";
@@ -201,16 +201,22 @@ function PlanarMultislicePanel({
       data-multislice-sample-token={meta.data?.sample_token ?? ""}
       data-multislice-state={state}
     >
-      <canvas
-        aria-label={`Slice at ${(fraction * 100).toFixed(1)}% of the domain`}
-        className="fm-field-map__multislice-canvas"
-        ref={canvasRef}
-        role="img"
-        // Keep the physical u:v aspect of the sample, as the single view does.
-        style={uMin !== undefined && uMax !== undefined && vMin !== undefined && vMax !== undefined && vMax > vMin
-          ? { aspectRatio: `${uMax - uMin} / ${vMax - vMin}` }
-          : undefined}
-      />
+      <div className="fm-field-map__multislice-plot">
+        <div
+          className="fm-field-map__multislice-stack"
+          // Keep the physical u:v aspect of the sample, as the single view does.
+          style={uMin !== undefined && uMax !== undefined && vMin !== undefined && vMax !== undefined && vMax > vMin
+            ? ({ "--fm-planar-aspect": String((uMax - uMin) / (vMax - vMin)) } as CSSProperties)
+            : undefined}
+        >
+          <canvas
+            aria-label={`Slice at ${(fraction * 100).toFixed(1)}% of the domain`}
+            className="fm-field-map__multislice-canvas"
+            ref={canvasRef}
+            role="img"
+          />
+        </div>
+      </div>
       <figcaption className="fm-field-map__multislice-caption">
         {meta.data?.section?.normal_axis ?? "n"} ={" "}
         {coordinate === undefined ? "…" : `${(coordinate * 1e9).toFixed(2)} nm`}
