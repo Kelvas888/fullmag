@@ -92,14 +92,23 @@ type Listener = () => void;
  * The Inspector panel that owns a monitor draft. 3D handles propose frame
  * changes through it, so the draft keeps a single owner and one apply path.
  */
+export interface PlanarMonitorFrameProposal {
+  origin_m?: readonly [number, number, number];
+  normal?: readonly [number, number, number];
+  u_axis?: readonly [number, number, number];
+  v_axis?: readonly [number, number, number];
+}
+
 export interface PlanarMonitorDraftEditor {
   monitorId: string;
-  proposeOrigin: (originM: readonly [number, number, number]) => void;
+  proposeFrame: (frame: PlanarMonitorFrameProposal) => void;
 }
 
 let preview: PlanarMonitorFramePreview | null = null;
 let draftPreview: PlanarMonitorDraft | null = null;
 let draftEditor: PlanarMonitorDraftEditor | null = null;
+/** Next 3D click on an object face sets the edited frame (pick-from-face). */
+let pickFaceArmed = false;
 const listeners = new Set<Listener>();
 
 export const planarMonitorFramePreviewStore = {
@@ -140,6 +149,14 @@ export const planarMonitorFramePreviewStore = {
   getDraftEditorMonitorId() {
     return draftEditor?.monitorId ?? null;
   },
+  getPickFaceArmed() {
+    return pickFaceArmed && draftEditor !== null;
+  },
+  setPickFaceArmed(armed: boolean) {
+    if (pickFaceArmed === armed) return;
+    pickFaceArmed = armed;
+    emit();
+  },
   /** Registers the draft owner; returns the matching unregister. */
   registerDraftEditor(editor: PlanarMonitorDraftEditor) {
     draftEditor = editor;
@@ -147,16 +164,29 @@ export const planarMonitorFramePreviewStore = {
     return () => {
       if (draftEditor !== editor) return;
       draftEditor = null;
+      pickFaceArmed = false;
       emit();
     };
   },
   /** Proposes a new frame origin to the owning editor; false when none owns `monitorId`. */
   proposeDraftOrigin(monitorId: string, originM: readonly [number, number, number]) {
+    return this.proposeDraftFrame(monitorId, { origin_m: originM });
+  },
+  /** Proposes frame changes to the owning editor; false when none owns `monitorId`. */
+  proposeDraftFrame(monitorId: string, frame: PlanarMonitorFrameProposal) {
     if (draftEditor?.monitorId !== monitorId) return false;
-    draftEditor.proposeOrigin(originM);
+    draftEditor.proposeFrame(frame);
     return true;
   },
 };
+
+export function usePlanarMonitorPickFaceArmed(): boolean {
+  return useSyncExternalStore(
+    planarMonitorFramePreviewStore.subscribe,
+    planarMonitorFramePreviewStore.getPickFaceArmed,
+    planarMonitorFramePreviewStore.getPickFaceArmed,
+  );
+}
 
 export function usePlanarMonitorDraftEditorId(): string | null {
   return useSyncExternalStore(
