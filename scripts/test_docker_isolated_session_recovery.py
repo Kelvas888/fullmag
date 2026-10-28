@@ -111,4 +111,40 @@ class SnapshotActivationTests(unittest.TestCase):
         with self.assertRaises(BuildControlError):
             namespace.assert_namespace_activation(control,'new-request')
 
+class SnapshotPlaceholderTests(unittest.TestCase):
+    def fixture(self, root):
+        import docker_volume_dev as dev
+        path=root/'linux-native-host.json';path.write_bytes(b'')
+        snapshot={'source_root':'/source/master','destination_state_root':str(root)}
+        previous={'state':'failed-confirmed','control_namespace':'namespaces/test',
+                  'namespace_registry_sha256':'a'*64,'inputs':{'source_root':'/source/master'},
+                  'error':'runtime-control control namespace is nonempty without its owner marker'}
+        control=mock.Mock(namespace='namespaces/test',namespace_registry_sha256='a'*64)
+        control.read.return_value=previous;control.read_bytes.return_value=None
+        return dev,path,snapshot,previous,control
+
+    def test_known_cache_failure_retains_empty_placeholder_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);dev,path,snapshot,previous,control=self.fixture(root)
+            before=path.stat()
+            dev._snapshot_certificate_placeholder(control,root,path,snapshot)
+            after=path.stat()
+            self.assertEqual((before.st_ino,before.st_mtime_ns,before.st_ctime_ns),
+                             (after.st_ino,after.st_mtime_ns,after.st_ctime_ns))
+            self.assertEqual(path.read_bytes(),b'')
+
+    def test_foreign_or_already_admitted_placeholder_is_never_adopted(self):
+        for mutation in ('nonempty','owner','native','unknown','different_namespace'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as folder:
+                root=Path(folder);dev,path,snapshot,previous,control=self.fixture(root)
+                if mutation=='nonempty':path.write_bytes(b'{}')
+                elif mutation=='owner':(root/recovery.host.OWNER_NAME).write_bytes(b'owner')
+                elif mutation=='native':control.read_bytes.return_value=b'{}'
+                elif mutation=='unknown':previous['state']='unknown'
+                else:previous['control_namespace']='foreign'
+                before=path.read_bytes()
+                with self.assertRaises((RuntimeError,OSError,ValueError)):
+                    dev._snapshot_certificate_placeholder(control,root,path,snapshot)
+                self.assertEqual(path.read_bytes(),before)
+
 if __name__=='__main__':unittest.main()
