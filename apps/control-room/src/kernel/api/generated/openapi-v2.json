@@ -28281,6 +28281,10 @@
           "raster": {
             "type": "boolean"
           },
+          "streamlines": {
+            "description": "In-plane streamlines of the vector raster (presentation only, note 0970\n`eq-planar-streamlines`); absent in state persisted before the layer.",
+            "type": "boolean"
+          },
           "vectors": {
             "type": "boolean"
           }

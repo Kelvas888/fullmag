@@ -2465,7 +2465,10 @@ fn target_requests_spatial_observation(settings: &VisualizationResolvedTargetSet
 fn planar_requests_spatial_observation(planar: &PlanarVisualizationState) -> bool {
     planar.visible
         && !planar.quantity_id.trim().is_empty()
-        && (planar.layers.raster || planar.layers.contours || planar.layers.vectors)
+        && (planar.layers.raster
+            || planar.layers.contours
+            || planar.layers.vectors
+            || planar.layers.streamlines)
 }
 
 const MAX_VISUALIZATION_RESTORE_WARNINGS: usize = 16;

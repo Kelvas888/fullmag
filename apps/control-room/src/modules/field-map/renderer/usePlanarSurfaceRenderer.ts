@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   planarRasterChecksum,
@@ -15,6 +15,8 @@ import {
   partitionPlanarMeshSegments,
   type PlanarRenderer,
 } from "./planarRenderer";
+import type { PlanarStreamlines } from "./planarStreamlines";
+import { usePlanarStreamlines } from "./usePlanarStreamlines";
 
 export function usePlanarSurfaceRenderer(
   model: FieldMapRenderModel,
@@ -43,6 +45,7 @@ export function usePlanarSurfaceRenderer(
     glyphCount: number;
     mesh: ReturnType<typeof decodePlanarMeshOverlayForDescriptor> | null;
   }>({ axisPointer: null, contours: [], glyphCount: 0, mesh: null });
+  const streamlinesRef = useRef<PlanarStreamlines | null>(null);
   const [plotSize, setPlotSize] = useState({ height: 0, width: 0 });
   const rangeMin = model.range?.min;
   const rangeMax = model.range?.max;
@@ -50,6 +53,17 @@ export function usePlanarSurfaceRenderer(
   useEffect(() => {
     modelRef.current = model;
   }, [model]);
+
+  usePlanarStreamlines(model, useCallback((result: PlanarStreamlines | null) => {
+    streamlinesRef.current = result;
+    const overlayCanvas = overlayRef.current;
+    if (overlayCanvas) {
+      // Smoke evidence: how many lines the overlay holds and whether a budget cut them.
+      overlayCanvas.dataset.streamlineCount = String(result?.lineCount ?? 0);
+      overlayCanvas.dataset.streamlineTruncated = String(result?.truncated ?? false);
+    }
+    drawOverlayRef.current();
+  }, []));
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -137,6 +151,7 @@ export function usePlanarSurfaceRenderer(
         meshViewport: current.viewport,
         samplePoints: current.samplePoints,
         pointStyle: current.pointStyle,
+        streamlines: current.layers.streamlines ? streamlinesRef.current : null,
         // Over a direction-coloured raster, orientation-coloured arrows would
         // repeat the raster colour; draw them dark instead, as mumax3 does.
         vectorColorMode: current.directionVectors && current.vectorStyle.colorMode === "orientation"

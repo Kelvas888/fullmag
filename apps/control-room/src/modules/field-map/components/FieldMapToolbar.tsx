@@ -149,6 +149,17 @@ export function FieldMapToolbar({
           Arrows
         </Button>
         <Button
+          aria-pressed={planar.layers.streamlines ?? false}
+          disabled={!vectorQuantity}
+          size="sm"
+          title="In-plane streamlines of the vector field (presentation)"
+          type="button"
+          variant={planar.layers.streamlines ? "primary" : "ghost"}
+          onClick={() => onPatch({ layers: { ...planar.layers, streamlines: !planar.layers.streamlines } })}
+        >
+          Lines
+        </Button>
+        <Button
           aria-keyshortcuts="G"
           aria-pressed={planar.layers.mesh}
           size="sm"

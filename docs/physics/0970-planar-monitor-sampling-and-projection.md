@@ -910,6 +910,42 @@ cells is applied. Points outside the frame are `outside`, points outside the
 sampled target are `empty`, and neither carries a value. A profile is a derived
 resource of one sample (`sample_token`); it never resamples the raster.
 
+### In-plane streamlines (presentation)
+
+Streamlines are a presentation of the in-plane projection of one vector
+sample; they are not 3D trajectories, not field lines of $\mathbf B$, and not
+a resampling. Let $\mathbf w_{ij}=(\mathbf q_{ij}\cdot\mathbf e_u,\,
+\mathbf q_{ij}\cdot\mathbf e_v)$ be the frame components of the published
+vector raster at pixel centre $(u_i,v_j)$. The continuous direction field is
+the bilinear interpolant of $\mathbf w$ between the four surrounding pixel
+centres, and a streamline is the curve $\mathbf x(s)$ in $(u,v)$ with
+
+```{math}
+:label: eq-planar-streamlines
+\frac{\mathrm d\mathbf x}{\mathrm ds}=\frac{\tilde{\mathbf w}(\mathbf x)}{\lVert\tilde{\mathbf w}(\mathbf x)\rVert},\qquad
+\tilde{\mathbf w}(\mathbf x)=\sum_{a=1}^{4}\lambda_a(\mathbf x)\,\mathbf w_a ,
+```
+
+integrated by classical RK4 in physical length with the step
+$h=\tfrac12\min(\Delta u,\Delta v)$. Integration runs in both directions from
+a seed and stops when a corner pixel of the interpolation cell is not
+renderable (empty, outside or masked), when $\lVert\tilde{\mathbf w}\rVert<
+\varepsilon\max_{ij}\lVert\mathbf w_{ij}\rVert$ with $\varepsilon=10^{-3}$
+(out-of-plane or vanishing projection), when the curve leaves the sample
+bounds, when it comes closer than $d_\mathrm{test}=\tfrac12 d_\mathrm{sep}$
+to another accepted line, or when the per-line point budget is reached.
+Seeds follow Jobard and Lefer [4]: candidates at
+distance $d_\mathrm{sep}$ on both sides of accepted lines, then a fixed
+row-major lattice of pitch $d_\mathrm{sep}$; a seed is accepted only at
+distance $\ge d_\mathrm{sep}$ from every accepted point. The order is fixed,
+so the same sample gives the same lines. Line and point counts are bounded;
+reaching a bound marks the result truncated instead of dropping lines
+silently. The FDM raster is piecewise constant per cell; the bilinear
+interpolant is a presentation device for drawing a continuous curve and is
+not used for any value, probe or export. Streamlines live in the browser
+worker on the vector raster of the displayed sample and are recomputed for a
+new `sample_token`; they never enter the sampling query or its identity.
+
 (planar-monitor-implementation-mapping)=
 ## Implementation mapping
 
@@ -1000,6 +1036,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
 | PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
 | PM-N25 | line profile through an affine FEM field across several elements, and through an FDM field | FEM values equal the affine field at uniform and face-crossing points within $10^{-12}$ relative; every in-plane element-face crossing is present; FDM values equal the containing cell values; outside/empty points carry no value |
+| PM-N26 | in-plane streamlines on a uniform field, a vortex raster and a masked raster | uniform field gives straight parallel lines along $\mathbf w$ within $10^{-9}$ of the pixel pitch; vortex lines close or stay within the disk; no point lies in a non-renderable cell; repeated runs are identical; budget overflow is reported as truncated |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |
 | PM-D02 | default position validation | `position_fraction` is finite and in $[0,1]$; resolved `position_m` is finite and inside the selected normal bounds |
 | PM-D03 | default/authored sampler parity | after source resolution, both source identities use the same interpolation and measure-weighted reduction; source provenance remains distinct |
@@ -1101,6 +1138,9 @@ Structural validation does not prove scientific correctness.
 3. I. E. Sutherland and G. W. Hodgman, “Reentrant polygon clipping,”
    *Communications of the ACM* 17(1), 1974,
    [doi:10.1145/360767.360802](https://doi.org/10.1145/360767.360802).
+4. B. Jobard and W. Lefer, “Creating evenly-spaced streamlines of arbitrary
+   density,” in *Visualization in Scientific Computing '97*, Springer, 1997,
+   pp. 43–55, [doi:10.1007/978-3-7091-6876-9_5](https://doi.org/10.1007/978-3-7091-6876-9_5).
 
 (planar-monitor-source-code-index)=
 ## Source-code index

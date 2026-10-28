@@ -303,6 +303,17 @@
       "sources": [
         "line-profile"
       ]
+    },
+    {
+      "id": "eq-planar-streamlines",
+      "symbols": [
+        "eu",
+        "ev",
+        "uvs"
+      ],
+      "sources": [
+        "planar-streamlines"
+      ]
     }
   ],
   "symbols": [
@@ -771,6 +782,13 @@
       "symbol": "planar_profile_response",
       "responsibility": "Line profile of one planar sample: uniform and FEM face-crossing arc lengths, point evaluation with the probe locator and basis.",
       "evidence_status": "implemented-compiled-unit-tests-not-run"
+    },
+    {
+      "id": "planar-streamlines",
+      "path": "apps/control-room/src/modules/field-map/renderer/planarStreamlines.ts",
+      "symbol": "tracePlanarStreamlines",
+      "responsibility": "In-plane streamline presentation: bilinear direction field, RK4 in physical length, Jobard-Lefer seeding, deterministic order and bounded budgets.",
+      "evidence_status": "implemented-unit-tests-not-run"
     }
   ],
   "public_api": {

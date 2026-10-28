@@ -386,6 +386,10 @@ pub struct PlanarLayerState {
     pub points: bool,
     pub vectors: bool,
     pub probes: bool,
+    /// In-plane streamlines of the vector raster (presentation only, note 0970
+    /// `eq-planar-streamlines`); absent in state persisted before the layer.
+    #[serde(default)]
+    pub streamlines: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone, PartialEq)]
@@ -462,6 +466,7 @@ pub(crate) fn default_planar_visualization_state() -> PlanarVisualizationState {
             points: false,
             vectors: false,
             probes: true,
+            streamlines: false,
         },
         wireframe_style: PlanarWireframeStyleState {
             color: "var(--fm-border-strong)".to_string(),
