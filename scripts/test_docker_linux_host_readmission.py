@@ -144,6 +144,27 @@ def _snapshot():
                         "filesystem_uuid": REQUEST["filesystem_uuid"]}}
 
 
+class TerminalMetadataTests(unittest.TestCase):
+    def test_failed_terminal_requires_explicit_allowed_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            identity={'source_root':'/repo','project_id':'project','worktree_id':'master',
+                      'checkout_kind':'main'}
+            inputs={'source_root':'/repo','source_project_id':'project','source_worktree_id':'master',
+                    'source_checkout_kind':'main','image_id':REQUEST['old_image_id']}
+            compose={'name':REQUEST['compose_project'],'services':{'backend':{},'frontend':{}}}
+            request=dict(REQUEST,compose_config_sha256=hashlib.sha256(_raw(compose)).hexdigest())
+            terminal={'schema':'fullmag.docker-build-operation.v1','phase':'development',
+                      'state':'failed-confirmed','attempt':request['development_attempt'],
+                      'compose_project':request['compose_project'],'config_sha256':request['compose_config_sha256'],
+                      'backend_container':request['backend_container_id'],
+                      'frontend_container':request['frontend_container_id'],'inputs':inputs,'state_root':folder}
+            args=(SimpleNamespace(project=request['compose_project']),request,identity,
+                  _raw(terminal),_raw(compose),{'runtime_root':folder})
+            with self.assertRaises(ValueError):
+                readmission._validate_terminal_and_compose(*args)
+            self.assertEqual(readmission._validate_terminal_and_compose(*args,
+                allowed_terminal_states=('succeeded','failed-confirmed'))[2],Path(folder))
+
 class EngineIdentityTests(unittest.TestCase):
     def test_engine_info_id_is_opaque_while_raw_identity_remains_exact(self):
         identifiers = [

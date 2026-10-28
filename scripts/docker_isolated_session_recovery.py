@@ -47,7 +47,7 @@ def _once(control, relative, raw):
         raise BuildControlError('Isolated snapshot evidence readback differs: '+relative)
 
 
-def _successor_admission_pins(control, pins, terminal_raw):
+def _successor_admission_pins(control, pins, terminal_raw, *, context=None, compose=None, state=None):
     """Require a completed prior admission; preserve its immutable authority."""
     from docker_control_namespace import assert_namespace_activation
     native_path='isolated-snapshot/native-validation.json'
@@ -55,20 +55,57 @@ def _successor_admission_pins(control, pins, terminal_raw):
     assert_namespace_activation(control)
     if control.read_bytes(native_path)!=native_raw:
         raise BuildControlError('Successor snapshot native admission changed during validation')
-    terminal=json.loads(terminal_raw)
+    terminal=retained._parse_object(terminal_raw,'successor development terminal receipt')
     expected={'schema':'fullmag.docker-build-operation.v1','phase':'development',
-              'state':'succeeded','attempt':pins['development_attempt'],
+              'attempt':pins['development_attempt'],
               'config_sha256':pins['compose_config_sha256'],
               'backend_container':pins['backend_container_id'],
               'frontend_container':pins['frontend_container_id'],
               'control_namespace':control.namespace,
               'namespace_registry_sha256':control.namespace_registry_sha256}
-    if any(terminal.get(key)!=value for key,value in expected.items()):
+    if (terminal.get('state') not in ('succeeded','failed-confirmed')
+            or any(terminal.get(key)!=value for key,value in expected.items())):
         raise BuildControlError('Successor snapshot requires the exact admitted predecessor')
     result={}
     for path in ('development/current.json','development/verified.json'):
         raw=control.read_bytes(path)
-        if raw!=terminal_raw:
+        if path=='development/verified.json' and terminal['state']=='failed-confirmed':
+            if context is None or compose is None or state is None:
+                raise BuildControlError('Failed successor requires the validated source state and Compose context')
+            verified=retained._parse_object(raw,'successor verified development receipt')
+            previous=dict(pins)
+            fields=(('development_attempt','attempt',retained._ATTEMPT),
+                    ('backend_container_id','backend_container',retained._CONTAINER_ID),
+                    ('frontend_container_id','frontend_container',retained._CONTAINER_ID))
+            for target,source,pattern in fields:
+                value=verified.get(source)
+                if not isinstance(value,str) or pattern.fullmatch(value) is None:
+                    raise BuildControlError('Successor verified predecessor has malformed '+source)
+                previous[target]=value
+            previous['compose_config_sha256']=retained._sha(verified.get('config_sha256'),'verified Compose digest')
+            inputs=verified.get('inputs')
+            image=inputs.get('image_id') if isinstance(inputs,dict) else None
+            if not isinstance(image,str) or retained._IMAGE_ID.fullmatch(image) is None:
+                raise BuildControlError('Successor verified predecessor has malformed image')
+            previous['old_image_id']=image
+            if (previous['development_attempt']==pins['development_attempt']
+                    or previous['backend_container_id']==previous['frontend_container_id']
+                    or verified.get('control_namespace')!=control.namespace
+                    or verified.get('namespace_registry_sha256')!=control.namespace_registry_sha256):
+                raise BuildControlError('Successor verified predecessor namespace or service pins differ')
+            terminal_path,compose_path=retained._terminal_paths(previous['development_attempt'])
+            previous_terminal=retained._read_control(control,terminal_path)
+            previous_compose=retained._read_control(control,compose_path)
+            if raw!=previous_terminal:
+                raise BuildControlError('Successor verified pointer differs from its immutable terminal')
+            _,validated_compose,validated_state=retained._validate_terminal_and_compose(
+                control,previous,context['identity'],previous_terminal,previous_compose,context['layout'])
+            if (validated_state!=state
+                    or _data_root(validated_compose,context['layout'])!=_data_root(compose,context['layout'])):
+                raise BuildControlError('Successor verified predecessor state or user-data root differs')
+            result[control.namespace+'/'+terminal_path]=previous_terminal
+            result[control.namespace+'/'+compose_path]=previous_compose
+        elif raw!=terminal_raw:
             raise BuildControlError('Successor snapshot predecessor pointer differs: '+path)
         result[control.namespace+'/'+path]=raw
     result[control.namespace+'/'+native_path]=native_raw
@@ -207,8 +244,10 @@ def recover(args):
     token=args.recovery_id; root='namespace-recovery/'+token; namespace='namespaces/'+token
     terminal_rel,compose_rel=retained._terminal_paths(pins['development_attempt'])
     terminal_raw=retained._read_control(control,terminal_rel); compose_raw=retained._read_control(control,compose_rel)
-    terminal,compose,state=retained._validate_terminal_and_compose(control,pins,context['identity'],terminal_raw,compose_raw,context['layout'])
-    admission_pins=_successor_admission_pins(control,pins,terminal_raw) if successor else {}
+    terminal,compose,state=retained._validate_terminal_and_compose(control,pins,context['identity'],terminal_raw,compose_raw,context['layout'],
+        allowed_terminal_states=('succeeded','failed-confirmed') if successor else ('succeeded',))
+    admission_pins=(_successor_admission_pins(control,pins,terminal_raw,context=context,compose=compose,state=state)
+                    if successor else {})
     runtime=retained._read_runtime_records(control,pins)
     if digest(host.read_owned_regular(state/host.CERTIFICATE_NAME))!=pins['expected_certificate_sha256'] or digest(host.read_owned_regular(state/host.OWNER_NAME))!=pins['expected_owner_sha256']:
         raise BuildControlError('Original host admission bytes changed')

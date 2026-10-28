@@ -753,12 +753,20 @@ ponowne użycie pierwotnego `start.json` przywróciłoby wcześniejszy model.
 `docker-dev-recover-isolated` przyjmuje ostatni argument `successor_snapshot=true`
 (CLI: `--successor-snapshot`). Domyślnie nadal odmawia wyboru innego recovery ID.
 
-Ścieżka successor wymaga natywnego admission poprzednika oraz identycznych
-`development/current.json`, `verified.json` i przypiętego terminalnego receiptu
-udanego startu. Sprawdza namespace, registry, attempt, konfigurację i dokładne
+Ścieżka successor wymaga natywnego admission poprzednika oraz zgodności
+`development/current.json` z przypiętym terminalnym receiptem. Zwykły udany start
+wymaga identycznego `verified.json`. Po potwierdzonej awarii kolejnego startu
+(`failed-confirmed`) verified musi wskazywać swój wcześniejszy, niezmienny
+terminal udanego startu i Compose, w tym samym namespace oraz z tymi samymi
+katalogami state i user-data. Obie pary dokumentów pozostają przypięte do CAS;
+awaria nie jest przedstawiana jako udany start ani dowód braku OWNER.
+Ścieżka sprawdza namespace, registry, attempt, konfigurację i dokładne
 kontenery, po czym wykonuje dotychczasowe kontrole wszystkich runów, ledgeru,
 blokad OWNER/WRITER i spójności SQLite. Kopiuje bieżące dane do nowej namespace;
 oryginały, poprzedni registry i `start.json` pozostają zachowane. Piny admission
 są ponownie sprawdzane przy publikacji. Podgląd niczego nie uruchamia, a apply
 nie odtwarza Solve ani nie kończy runów. Nowy start nadal przechodzi osobną
 natywną bramkę. Operacja dotyczy wyłącznie przypiętej, zatrzymanej grupy mastera.
+Nowy snapshot ma odrębną generację prywatnego ledgeru, wyprowadzoną z recovery ID;
+stary ledger pozostaje zachowany. Kontrole readmission poza tą jawną ścieżką
+nadal wymagają udanego terminalnego receiptu.

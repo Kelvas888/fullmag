@@ -281,7 +281,8 @@ def _terminal_paths(attempt):
     return root + "/terminal.json", root + "/compose.json"
 
 
-def _validate_terminal_and_compose(control, request, identity, raw_terminal, raw_compose, layout):
+def _validate_terminal_and_compose(control, request, identity, raw_terminal, raw_compose, layout,
+                                   *, allowed_terminal_states=("succeeded",)):
     terminal = _parse_object(raw_terminal, "retained development terminal receipt")
     compose = _parse_object(raw_compose, "retained Compose document")
     inputs = terminal.get("inputs")
@@ -295,7 +296,7 @@ def _validate_terminal_and_compose(control, request, identity, raw_terminal, raw
     }
     if (terminal.get("schema") != "fullmag.docker-build-operation.v1"
             or terminal.get("phase") != "development"
-            or terminal.get("state") != "succeeded"
+            or terminal.get("state") not in allowed_terminal_states
             or terminal.get("attempt") != request["development_attempt"]
             or terminal.get("compose_project") != control.project
             or terminal.get("config_sha256") != request["compose_config_sha256"]

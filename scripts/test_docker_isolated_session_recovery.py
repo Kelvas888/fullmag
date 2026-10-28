@@ -11,6 +11,108 @@ from docker_build_control import BuildControlError, canonical
 
 
 class SuccessorAdmissionTests(unittest.TestCase):
+    def failed_fixture(self, folder):
+        root=Path(folder); state=root/'runtime/state'; state.mkdir(parents=True)
+        user=root/'user-data/current'; user.mkdir(parents=True)
+        control=mock.Mock(project='fullmag-master',namespace='namespaces/'+'a'*32,
+                          namespace_registry_sha256='b'*64)
+        identity={'source_root':'/repo','project_id':'project','worktree_id':'master',
+                  'checkout_kind':'main'}
+        compose={'name':control.project,'services':{'backend':{'volumes':[
+            {'type':'bind','source':str(user),'target':'/user-data'}]},'frontend':{}}}
+        pins={'development_attempt':'c'*32,'compose_config_sha256':recovery.digest(canonical(compose)),
+              'backend_container_id':'e'*64,'frontend_container_id':'f'*64,
+              'old_image_id':'sha256:'+'1'*64}
+        current={'schema':'fullmag.docker-build-operation.v1','phase':'development',
+            'state':'failed-confirmed','attempt':pins['development_attempt'],
+            'compose_project':control.project,'config_sha256':pins['compose_config_sha256'],
+            'backend_container':pins['backend_container_id'],'frontend_container':pins['frontend_container_id'],
+            'control_namespace':control.namespace,'namespace_registry_sha256':control.namespace_registry_sha256,
+            'state_root':str(state),'image_id':pins['old_image_id'],
+            'inputs':dict(identity,source_project_id=identity['project_id'],
+                source_worktree_id=identity['worktree_id'],source_checkout_kind=identity['checkout_kind'],
+                image_id=pins['old_image_id'])}
+        verified=dict(current,state='succeeded',attempt='2'*32,backend_container='3'*64,
+                      frontend_container='4'*64,image_id='sha256:'+'5'*64,
+                      inputs=dict(current['inputs'],image_id='sha256:'+'5'*64))
+        documents={'development/current.json':canonical(current),
+                   'development/verified.json':canonical(verified),
+                   'isolated-snapshot/native-validation.json':b'validated-native-proof'}
+        for receipt in (current,verified):
+            terminal_path,compose_path=recovery.retained._terminal_paths(receipt['attempt'])
+            documents[terminal_path]=canonical(receipt);documents[compose_path]=canonical(compose)
+        control.read_bytes.side_effect=lambda path,**kwargs: documents[path]
+        context={'identity':identity,'layout':{'runtime_root':str(root/'runtime'),'storage_root':str(root)}}
+        return control,pins,current,verified,documents,context,compose,state
+
+    def test_failed_current_pins_its_successful_verified_predecessor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            control,pins,current,verified,documents,context,compose,state=self.failed_fixture(folder)
+            with mock.patch('docker_control_namespace.assert_namespace_activation'):
+                result=recovery._successor_admission_pins(control,pins,canonical(current),
+                    context=context,compose=compose,state=state)
+            expected={control.namespace+'/'+path:raw for path,raw in documents.items()}
+            terminal_path,compose_path=recovery.retained._terminal_paths(current['attempt'])
+            result.update({control.namespace+'/'+terminal_path:canonical(current),
+                           control.namespace+'/'+compose_path:canonical(compose)})
+            self.assertEqual(result,expected)
+            with self.assertRaises(ValueError):
+                recovery.retained._validate_terminal_and_compose(control,pins,context['identity'],
+                    canonical(current),canonical(compose),context['layout'])
+
+    def test_failed_current_rejects_unrelated_or_changed_predecessor(self):
+        mutations=('current','verified','namespace','registry','source','state_root','user_data',
+                   'terminal','compose','attempt','same_attempt','config','backend','frontend','image','verified_state')
+        for field in mutations:
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as folder:
+                control,pins,current,verified,documents,context,compose,state=self.failed_fixture(folder)
+                terminal_path,compose_path=recovery.retained._terminal_paths(verified['attempt'])
+                if field=='current': documents['development/current.json']=canonical(dict(current,state='starting'))
+                elif field=='verified': documents['development/verified.json']=b'[]'
+                elif field=='namespace': verified['control_namespace']='namespaces/'+'9'*32
+                elif field=='registry': verified['namespace_registry_sha256']='9'*64
+                elif field=='source': verified['inputs']['source_root']='/different'
+                elif field=='state_root':
+                    other=state.parent/'other';other.mkdir();verified['state_root']=str(other)
+                elif field=='user_data':
+                    other=Path(folder)/'user-data/other';other.mkdir()
+                    old=json.loads(canonical(compose));old['services']['backend']['volumes'][0]['source']=str(other)
+                    documents[compose_path]=canonical(old);verified['config_sha256']=recovery.digest(canonical(old))
+                elif field=='terminal': documents[terminal_path]=canonical(dict(verified,state='starting'))
+                elif field=='compose': documents[compose_path]=b'{}'
+                elif field=='attempt': verified['attempt']='../escape'
+                elif field=='same_attempt': verified['attempt']=current['attempt']
+                elif field=='config': verified['config_sha256']=None
+                elif field=='backend': verified['backend_container']=False
+                elif field=='frontend': verified['frontend_container']='wrong'
+                elif field=='image': verified['inputs']['image_id']=None
+                elif field=='verified_state': verified['state']='failed-confirmed'
+                if field not in ('verified','terminal'):
+                    documents['development/verified.json']=canonical(verified)
+                if field not in ('terminal','attempt'):
+                    documents[terminal_path]=canonical(verified)
+                with mock.patch('docker_control_namespace.assert_namespace_activation'):
+                    with self.assertRaises((BuildControlError,ValueError)):
+                        recovery._successor_admission_pins(control,pins,canonical(current),
+                            context=context,compose=compose,state=state)
+
+    def test_failed_current_requires_exact_terminal_metadata(self):
+        for field in ('state','source','project','config','backend','frontend','image','state_root'):
+            with self.subTest(field=field),tempfile.TemporaryDirectory() as folder:
+                control,pins,current,_,_,context,compose,state=self.failed_fixture(folder)
+                if field=='state': current['state']=['failed-confirmed']
+                elif field=='source': current['inputs']['source_root']='/other'
+                elif field=='project': current['compose_project']='other'
+                elif field=='config': current['config_sha256']='9'*64
+                elif field=='backend': current['backend_container']='9'*64
+                elif field=='frontend': current['frontend_container']='9'*64
+                elif field=='image': current['inputs']['image_id']='sha256:'+'9'*64
+                elif field=='state_root': current['state_root']='/outside'
+                with self.assertRaises((ValueError,recovery.storage.StorageError)):
+                    recovery.retained._validate_terminal_and_compose(control,pins,context['identity'],
+                        canonical(current),canonical(compose),context['layout'],
+                        allowed_terminal_states=('succeeded','failed-confirmed'))
+
     def fixture(self):
         control=mock.Mock(namespace='namespaces/'+'a'*32,
                           namespace_registry_sha256='b'*64)
