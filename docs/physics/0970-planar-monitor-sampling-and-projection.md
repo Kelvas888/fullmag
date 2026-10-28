@@ -946,6 +946,26 @@ not used for any value, probe or export. Streamlines live in the browser
 worker on the vector raster of the displayed sample and are recomputed for a
 new `sample_token`; they never enter the sampling query or its identity.
 
+### Multislice panels
+
+A multislice view shows $N\in\{2,3,4\}$ samples of the `Default` source that
+differ only in the position fraction $\phi_k$ along the current plane normal.
+Each panel resolves its section exactly as the single default section does
+({ref}`planar-monitor-default-section`) with $\phi_k$ in place of the session
+fraction, so the published coordinate, the FDM layer of
+{eq}`eq-planar-default-layer` and the FEM node-plane stop follow the same rules,
+and the panel carries its own `sample_token`. The override is a query
+parameter (`position_fraction`) of the sampling request, valid only for the
+`Default` source; the source hash, and with it the sample identity, is
+computed from the overridden slice, so panels never share or alias a cached
+operator or a field gather. Plane, operator, quantity, component, view scope,
+resolution and palette are common to all panels. The colour range is common
+too: in `auto` mode it is the union of the occupied extrema of all panels,
+$[\min_k q^{\min}_k,\max_k q^{\max}_k]$ of the per-panel extrema over
+renderable samples (the same reduction as the single view); `symmetric` uses
+$a=\max_k\max(|q^{\min}_k|,|q^{\max}_k|)$ and `manual` applies unchanged. Multislice is presentation: it does not alter any panel's values,
+and a panel whose sample fails shows its own error without hiding the others.
+
 (planar-monitor-implementation-mapping)=
 ## Implementation mapping
 
@@ -1037,6 +1057,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
 | PM-N25 | line profile through an affine FEM field across several elements, and through an FDM field | FEM values equal the affine field at uniform and face-crossing points within $10^{-12}$ relative; every in-plane element-face crossing is present; FDM values equal the containing cell values; outside/empty points carry no value |
 | PM-N26 | in-plane streamlines on a uniform field, a vortex raster and a masked raster | uniform field gives straight parallel lines along $\mathbf w$ within $10^{-9}$ of the pixel pitch; vortex lines close or stay within the disk; no point lies in a non-renderable cell; repeated runs are identical; budget overflow is reported as truncated |
+| PM-N27 | multislice of an FDM stack at $\phi\in\{0.25,0.5,0.75\}$ and of an FEM film | each panel equals the single default section at the same $\phi$ (same resolved coordinate and bitwise-equal raster); the panels' sample tokens differ; the auto range is the union of the panels' renderable extrema; a monitor source with `position_fraction` is rejected |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |
 | PM-D02 | default position validation | `position_fraction` is finite and in $[0,1]$; resolved `position_m` is finite and inside the selected normal bounds |
 | PM-D03 | default/authored sampler parity | after source resolution, both source identities use the same interpolation and measure-weighted reduction; source provenance remains distinct |

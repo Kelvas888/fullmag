@@ -28539,6 +28539,27 @@
           }
         ]
       },
+      "PlanarMultisliceState": {
+        "additionalProperties": false,
+        "description": "Multislice presentation (F6 B2, note 0970 § Multislice panels): panels of\nthe Default source at fixed position fractions along the current plane\nnormal, sharing quantity, component, colour range and palette. Each panel\nis its own sample (`position_fraction` query override).",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "position_fractions": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "position_fractions"
+        ],
+        "type": "object"
+      },
       "PlanarOperatorSchema": {
         "oneOf": [
           {
@@ -29202,6 +29223,16 @@
               }
             ]
           },
+          "multislice": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanarMultisliceState"
+              }
+            ]
+          },
           "point_style": {
             "oneOf": [
               {
@@ -29342,6 +29373,9 @@
           },
           "layers": {
             "$ref": "#/components/schemas/PlanarLayerState"
+          },
+          "multislice": {
+            "$ref": "#/components/schemas/PlanarMultisliceState"
           },
           "point_style": {
             "$ref": "#/components/schemas/PlanarPointStyleState"
@@ -56215,6 +56249,16 @@
             }
           },
           {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
             "in": "query",
             "name": "expected_scene_revision",
             "required": false,
@@ -56432,6 +56476,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -56655,6 +56709,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -57362,6 +57426,16 @@
             }
           },
           {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
             "in": "query",
             "name": "expected_scene_revision",
             "required": false,
@@ -57576,6 +57650,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -57796,6 +57880,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -58027,6 +58121,16 @@
             }
           },
           {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
             "in": "query",
             "name": "expected_scene_revision",
             "required": false,
@@ -58255,6 +58359,16 @@
             }
           },
           {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
             "in": "query",
             "name": "expected_scene_revision",
             "required": false,
@@ -58480,6 +58594,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -59211,6 +59335,16 @@
             }
           },
           {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
             "in": "query",
             "name": "expected_scene_revision",
             "required": false,
@@ -59433,6 +59567,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {
@@ -59661,6 +59805,16 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Default source only: position fraction along the plane normal for this\nrequest instead of the session's `default_slice.position_fraction`\n(multislice panels, note 0970). The source hash, and with it the sample\nidentity, follows the overridden slice.",
+            "in": "query",
+            "name": "position_fraction",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
             }
           },
           {

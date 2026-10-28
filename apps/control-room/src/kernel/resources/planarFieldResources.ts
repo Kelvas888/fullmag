@@ -275,7 +275,19 @@ function planarFieldQueryFromMetaLink(link: string): PlanarFieldQuery {
     scope_region_id: url.searchParams.get("scope_region_id") ?? undefined,
     snapshot_id: url.searchParams.get("snapshot_id") ?? undefined,
     stage_id: url.searchParams.get("stage_id") ?? undefined,
+    ...positionFractionFromLink(url),
   });
+}
+
+/** Multislice panels carry their slice position in the canonical links. */
+function positionFractionFromLink(url: URL): { position_fraction?: number } {
+  const raw = url.searchParams.get("position_fraction");
+  if (raw === null) return {};
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error("Canonical planar metadata link has invalid position_fraction");
+  }
+  return { position_fraction: value };
 }
 
 function requireCanonicalU64(value: string, name: string): string {
@@ -714,6 +726,7 @@ function useStablePlanarFieldQuery(query: PlanarFieldQuery): PlanarFieldQuery {
       expected_source_revision: query.expected_source_revision,
       expected_scene_revision: query.expected_scene_revision,
         include_mesh: query.include_mesh,
+        position_fraction: query.position_fraction,
         quality: query.quality,
         resolution_x: query.resolution_x,
         resolution_y: query.resolution_y,
@@ -734,6 +747,7 @@ function useStablePlanarFieldQuery(query: PlanarFieldQuery): PlanarFieldQuery {
       query.expected_source_revision,
       query.expected_scene_revision,
       query.include_mesh,
+      query.position_fraction,
       query.quality,
       query.resolution_x,
       query.resolution_y,

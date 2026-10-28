@@ -12149,6 +12149,16 @@ export interface components {
             object_id: string;
             region_id: string;
         };
+        /**
+         * @description Multislice presentation (F6 B2, note 0970 § Multislice panels): panels of
+         *     the Default source at fixed position fractions along the current plane
+         *     normal, sharing quantity, component, colour range and palette. Each panel
+         *     is its own sample (`position_fraction` query override).
+         */
+        PlanarMultisliceState: {
+            enabled: boolean;
+            position_fractions: number[];
+        };
         PlanarOperatorSchema: {
             /** @enum {string} */
             kind: "plane_sample";
@@ -12350,6 +12360,7 @@ export interface components {
             display_unit?: string | null;
             interaction?: null | components["schemas"]["PlanarInteractionState"];
             layers?: null | components["schemas"]["PlanarLayerState"];
+            multislice?: null | components["schemas"]["PlanarMultisliceState"];
             point_style?: null | components["schemas"]["PlanarPointStyleState"];
             quality?: null | components["schemas"]["PlanarRenderQuality"];
             quantity_id?: string | null;
@@ -12372,6 +12383,7 @@ export interface components {
             display_unit?: string | null;
             interaction: components["schemas"]["PlanarInteractionState"];
             layers: components["schemas"]["PlanarLayerState"];
+            multislice?: components["schemas"]["PlanarMultisliceState"];
             point_style: components["schemas"]["PlanarPointStyleState"];
             quality: components["schemas"]["PlanarRenderQuality"];
             quantity_id: string;
@@ -22998,6 +23010,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23084,6 +23103,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23177,6 +23203,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23431,6 +23464,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23510,6 +23550,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23596,6 +23643,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23682,6 +23736,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23769,6 +23830,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -23856,6 +23924,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -24113,6 +24188,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -24193,6 +24275,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;
@@ -24280,6 +24369,13 @@ export interface operations {
                 quality?: string;
                 vector_budget?: number;
                 include_mesh?: boolean;
+                /**
+                 * @description Default source only: position fraction along the plane normal for this
+                 *     request instead of the session's `default_slice.position_fraction`
+                 *     (multislice panels, note 0970). The source hash, and with it the sample
+                 *     identity, follows the overridden slice.
+                 */
+                position_fraction?: number;
                 expected_scene_revision?: string;
                 expected_monitor_revision?: string;
                 expected_source_revision?: string;

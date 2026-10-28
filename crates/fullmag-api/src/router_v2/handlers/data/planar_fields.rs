@@ -84,6 +84,8 @@ struct BuiltPlanarField {
     scope_kind: String,
     scope_id: Option<String>,
     scope_region_id: Option<String>,
+    /// Default-source position override (multislice panel), echoed into links.
+    position_fraction: Option<f64>,
     etag: String,
     sample_token: String,
 }
@@ -517,11 +519,17 @@ async fn build_planar_field_from_source(
                 .as_ref()
                 .and_then(|mesh| mesh.build_report.as_ref())
                 .and_then(FemNodePlaneStops::from_build_report);
-            resolve_default_planar_source_with_stops(
-                &domain,
-                &planar_state.default_slice,
-                stops.as_ref(),
-            )?
+            let mut default_slice = planar_state.default_slice.clone();
+            if let Some(position_fraction) = query.position_fraction {
+                // Multislice panel: same plane and operator, its own position.
+                default_slice.position_fraction = position_fraction;
+            }
+            resolve_default_planar_source_with_stops(&domain, &default_slice, stops.as_ref())?
+        }
+        PlanarDataSource::Monitor(_) if query.position_fraction.is_some() => {
+            return Err(ApiError::bad_request(
+                "planar_position_fraction_requires_default_source: position_fraction applies only to the default source",
+            ));
         }
         PlanarDataSource::Monitor(monitor_id) => {
             let scene = snapshot
@@ -850,6 +858,7 @@ async fn build_planar_field_from_source(
         scope_kind,
         scope_id: query.scope_id.clone(),
         scope_region_id: query.scope_region_id.clone(),
+        position_fraction: query.position_fraction,
         etag,
         sample_token,
     })
@@ -983,6 +992,7 @@ async fn planar_probe_response(
         expected_mesh_revision: probe.expected_mesh_revision,
         expected_carrier_revision: probe.expected_carrier_revision,
         expected_field_revision: probe.expected_field_revision,
+        position_fraction: None,
     };
     let built = build_planar_field_from_source(state, quantity_id, source, &query).await?;
     let bounds = built.result.meta.bounds_uv_m;
@@ -1524,6 +1534,10 @@ fn canonical_sample_query(built: &BuiltPlanarField) -> String {
     }
     if let Some(scope_region_id) = &built.scope_region_id {
         entries.push(("scope_region_id", scope_region_id.clone()));
+    }
+    if let Some(position_fraction) = built.position_fraction {
+        // Shortest round-trip decimal, so the link names the same slice.
+        entries.push(("position_fraction", position_fraction.to_string()));
     }
     if let Some(stage_id) = &built.stage_id {
         entries.push(("stage_id", stage_id.clone()));
