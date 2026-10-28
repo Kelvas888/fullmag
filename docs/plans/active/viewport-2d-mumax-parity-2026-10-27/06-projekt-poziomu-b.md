@@ -32,6 +32,8 @@ Status: **zrobione** (2026-10-28). Odstępstwo: odpowiedź JSON (jak sonda), nie
 
 ## B3. Streamlines
 
+Status: **zrobione** (2026-10-28). Nota 0970 § In-plane streamlines (presentation), `eq-planar-streamlines`, bramka PM-N26. Warstwa `streamlines` w `visualization/state.planar.layers` (pole addytywne `serde(default)`, bez migracji schematu); przełączniki „Lines” w pasku 2D i „Streamlines” w Inspectorze. Odstępstwo: linie są monochromatyczne (kolor stylu wektorów, ciemne nad kołem barw) z grotem w połowie linii; kolorowanie |v∥| z legendą nie jest zrobione.
+
 | Aspekt | Projekt |
 |---|---|
 | Numeryka | całkowanie RK4 w płaszczyźnie (składowe u,v) z krokiem ≤ ½ piksela, interpolacja dwuliniowa rastra wektorowego, zatrzymanie na masce i przy |v∥| < ε; seeding jednorodny z odrzucaniem kolizji (Jobard–Lefer) |
