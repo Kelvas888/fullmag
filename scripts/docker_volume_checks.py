@@ -441,7 +441,7 @@ def main():
     parser.add_argument('--offline', action='store_true', help='Run interpreted checks in a private group helper when backend is stopped')
     parser.add_argument('--initial-attempt', help='Pinned pre-service development attempt for offline checks')
     parser.add_argument('--modules', nargs='+', help='Explicit unittest modules (offline mode only)')
-    parser.add_argument('--scope', choices=('all', 'source-capture', 'frontend-import', 'frontend-antenna', 'frontend-visualization', 'frontend-tools', 'field-only', 'network-failure', 'frontend-telemetry', 'frontend-telemetry-focused'), default='all')
+    parser.add_argument('--scope', choices=('all', 'source-capture', 'frontend-import', 'frontend-antenna', 'frontend-visualization', 'frontend-tools', 'field-only', 'network-failure', 'empty-authoring', 'frontend-telemetry', 'frontend-telemetry-focused'), default='all')
     args = parser.parse_args()
     if args.initial_attempt is not None and not args.offline:
         raise BuildControlError('--initial-attempt requires --offline')
@@ -501,14 +501,16 @@ if sys.argv[1] == 'frontend-tools':
     command = [sys.executable, '-B', '-m', 'unittest', 'test_docker_dev_codegen', 'test_docker_volume_checks', 'test_docker_volume_frontend_recovery', 'test_docker_volume_dev_runtime_state', 'test_docker_volume_receipts', 'test_docker_dev_browser_qa']
 if sys.argv[1] == 'network-failure':
     command = [sys.executable, '-B', '-m', 'unittest', 'test_docker_volume_network_failure_reconcile', 'test_docker_volume_checks']
+if sys.argv[1] == 'empty-authoring':
+    command = [sys.executable, '-B', '-m', 'unittest', 'test_docker_volume_receipts', 'test_docker_saved_authoring_history', 'test_docker_preclaim_cancelled_restart', 'test_docker_volume_prestart_recovery', 'test_docker_volume_checks']
 if sys.argv[1] == 'field-only':
     environment.update(PYTHONPATH='/opt/fullmag/source/packages/fullmag-py/src', FULLMAG_TEST_TEMP_ROOT='/build/verification-tmp')
     result = subprocess.call([sys.executable, '-B', '-m', 'unittest', 'discover',
         '-s', '/opt/fullmag/source/packages/fullmag-py/tests', '-p', 'test_antenna_field_only_nonmagnetic.py', '-v'],
         cwd='/opt/fullmag/source', env=environment)
 else:
-    result = subprocess.call(command,cwd='/opt/fullmag/source/scripts',env=environment) if sys.argv[1] in ('all', 'frontend-tools', 'network-failure') else 0
-if result == 0 and sys.argv[1] not in ('field-only', 'frontend-tools', 'network-failure'):
+    result = subprocess.call(command,cwd='/opt/fullmag/source/scripts',env=environment) if sys.argv[1] in ('all', 'frontend-tools', 'network-failure', 'empty-authoring') else 0
+if result == 0 and sys.argv[1] not in ('field-only', 'frontend-tools', 'network-failure', 'empty-authoring'):
     result = subprocess.call([sys.executable, '-B', '/opt/fullmag/source/scripts/verify_accepted_source_scene_capture.py',
                               '--fullmag-root', '/opt/fullmag/source/packages/fullmag-py/src/fullmag',
                               '--output-dir', '/build/verification-tmp'], env=environment)
@@ -525,7 +527,8 @@ sys.exit(result)
              'stdout':result.stdout.decode('utf-8','replace'), 'stderr':result.stderr.decode('utf-8','replace')}
     if oracle_dependency is not None:
         receipt['oracle_dependency'] = oracle_dependency
-    control.write('verification/interpreted-network-failure-checks.json' if args.scope == 'network-failure' else
+    control.write('verification/interpreted-empty-authoring-checks.json' if args.scope == 'empty-authoring' else
+                  'verification/interpreted-network-failure-checks.json' if args.scope == 'network-failure' else
                   'verification/interpreted-frontend-tools-checks.json' if args.scope == 'frontend-tools' else
                   'verification/interpreted-checks.json' if args.scope == 'all' else
                   'verification/interpreted-field-only-checks.json' if args.scope == 'field-only' else

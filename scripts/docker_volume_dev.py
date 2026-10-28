@@ -4213,6 +4213,7 @@ def _retained_startup_enabled(container):
 
 
 _SAVED_AUTHORING_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+_SAVED_EMPTY_AUTHORING_RESTART_SCHEMA = 'fullmag.saved-empty-authoring-restart.v1'
 
 
 _SAVED_AUTHORING_SCENE_FIELDS = (
@@ -4248,6 +4249,11 @@ def _saved_authoring_document(raw):
 
 
 def _saved_authoring_validate_request(request, *, project, attempt, config_sha256, selected):
+    empty_authoring = isinstance(request, dict) and request.get('schema') == _SAVED_EMPTY_AUTHORING_RESTART_SCHEMA
+    if empty_authoring:
+        _saved_authoring_require(not any(key in request for key in (
+            'cancelled_preclaim', 'historical_preclaim', 'retained_run_catalogs')),
+            'empty authoring checkpoint cannot include run-history extensions')
     cancelled = preclaim_restart.validate_checkpoint(request)
     historical = preclaim_restart.validate_historical_checkpoint(request)
     retained = retained_history.validate_retained_catalogs(request)
@@ -4256,7 +4262,8 @@ def _saved_authoring_validate_request(request, *, project, attempt, config_sha25
         'package', 'service_owner_sha256'} | ({'cancelled_preclaim'} if cancelled else set())
         | ({'historical_preclaim'} if historical else set())
         | ({'retained_run_catalogs'} if retained is not None else set())), 'checkpoint fields differ')
-    _saved_authoring_require(request['schema'] in {'fullmag.saved-authoring-restart.v1', preclaim_restart.SCHEMA}
+    _saved_authoring_require(request['schema'] in {'fullmag.saved-authoring-restart.v1', preclaim_restart.SCHEMA,
+                                                    _SAVED_EMPTY_AUTHORING_RESTART_SCHEMA}
         and request['compose_project'] == project and request['attempt'] == attempt
         and request['config_sha256'] == config_sha256
         and request['source_root'] == str(selected)
@@ -4268,8 +4275,16 @@ def _saved_authoring_validate_request(request, *, project, attempt, config_sha25
     session = request['session']
     _saved_authoring_require(isinstance(session, dict) and set(session) == {'api_instance_id', 'session_id',
         'session_epoch', 'request_scope_epoch', 'source_kind'}, 'session pins differ')
-    for value in (*session.values(), archive['path'], archive['project_id'], archive['source_entry']):
+    for value in (*session.values(), archive['path'], archive['project_id']):
         _saved_authoring_require(isinstance(value, str) and value and len(value) < 4096, 'missing identity pin')
+    _saved_authoring_require((archive['source_entry'] is None) == (archive['source_sha256'] is None),
+        'source entry and digest must be both present or both absent')
+    if empty_authoring:
+        _saved_authoring_require(archive['source_entry'] is None and archive['source_sha256'] is None,
+            'empty authoring source pins must be explicitly null')
+    else:
+        _saved_authoring_require(isinstance(archive['source_entry'], str) and archive['source_entry']
+            and len(archive['source_entry']) < 4096, 'missing identity pin')
     epoch_pattern = re.escape(session['session_id']) + r'@[0-9]+'
     if cancelled and 'stop_command_id' in cancelled:
         epoch_pattern += r':tombstone:[0-9]+'
@@ -4281,11 +4296,16 @@ def _saved_authoring_validate_request(request, *, project, attempt, config_sha25
     _saved_authoring_require(0 < archive['bytes'] <= _SAVED_AUTHORING_MAX_ARCHIVE_BYTES, 'archive size exceeds checkpoint budget')
     _saved_authoring_require(isinstance(request['package'], dict) and set(request['package']) ==
         {'provenance_sha256', 'source_snapshot_sha256'}, 'package source pins differ')
-    _saved_authoring_require(session['source_kind'] == 'ui_authoring'
-        and (archive['source_entry'] == 'project/source/script.py'
-             or re.fullmatch(r'project/source-history/[0-9a-f]{64}\.py', archive['source_entry'])),
-        'UI authoring/source archive binding differs')
-    hashes = [archive[k] for k in ('sha256', 'scene_sha256', 'source_sha256')]
+    _saved_authoring_require(session['source_kind'] == 'ui_authoring', 'UI authoring source kind differs')
+    if empty_authoring:
+        _saved_authoring_require(archive['source_entry'] is None, 'empty UI authoring cannot bind a source file')
+    else:
+        _saved_authoring_require(archive['source_entry'] == 'project/source/script.py'
+            or re.fullmatch(r'project/source-history/[0-9a-f]{64}\.py', archive['source_entry']),
+            'UI authoring/source archive binding differs')
+    hashes = [archive[k] for k in ('sha256', 'scene_sha256')]
+    if not empty_authoring:
+        hashes.append(archive['source_sha256'])
     hashes += [request['service_owner_sha256'], *request['package'].values()]
     _saved_authoring_require(all(isinstance(v, str) and re.fullmatch('[0-9a-f]{64}', v) for v in hashes), 'invalid digest pin')
     _saved_authoring_require(isinstance(request['containers'], dict) and set(request['containers']) ==
@@ -4315,6 +4335,11 @@ def _saved_authoring_validate_services(request, actual, *, quiesced=False):
 
 def _saved_authoring_validate_archive(raw, pin):
     _saved_authoring_require(len(raw) == pin['bytes'] and _saved_authoring_sha(raw) == pin['sha256'], 'saved Windows archive changed')
+    source_entry = pin.get('source_entry')
+    source_sha256 = pin.get('source_sha256')
+    source_less = source_entry is None and source_sha256 is None
+    _saved_authoring_require((source_entry is None) == (source_sha256 is None),
+        'source entry and digest must be both present or both absent')
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         entries = archive.infolist()
         _saved_authoring_require(0 < len(entries) <= 8192 and sum(e.file_size for e in entries) <= _SAVED_AUTHORING_MAX_ARCHIVE_BYTES,
@@ -4337,23 +4362,32 @@ def _saved_authoring_validate_archive(raw, pin):
             and manifest.get('scene') == 'project/scene_document.json', 'runtime-free project manifest required')
         allowed = {'manifest/project.json', 'project/definition.json', 'project/scene_document.json'}
         source = manifest.get('source')
-        if source is not None:
+        if source_less:
+            _saved_authoring_require(source is None, 'empty UI authoring must not contain a source script')
+        elif source is not None:
             _saved_authoring_require(source in ('project/source.py', 'project/source/script.py'), 'unexpected authoring source path')
             allowed.add(source)
         assets = manifest.get('assets')
         opaque = manifest.get('opaque_documents')
         _saved_authoring_require(isinstance(assets, list) and isinstance(opaque, list), 'manifest lists missing')
+        if source_less:
+            _saved_authoring_require(assets == [], 'empty UI authoring cannot contain unbound assets')
         for asset in assets:
             _saved_authoring_require(isinstance(asset, dict) and isinstance(asset.get('path'), str)
                 and asset['path'].startswith('assets/'), 'unexpected asset path')
             allowed.add(asset['path'])
         for name in opaque:
-            _saved_authoring_require(isinstance(name, str) and (name in {'project/provenance.json',
-                'project/source/script.py', 'project/source/script.json'}
-                or re.fullmatch(r'project/source-history/[0-9a-f]{64}\.py', name)),
-                'non-authoring opaque document is not admissible')
+            if source_less:
+                _saved_authoring_require(isinstance(name, str) and name == 'project/provenance.json',
+                    'empty UI authoring cannot contain source files, metadata, or history')
+            else:
+                _saved_authoring_require(isinstance(name, str) and (name in {'project/provenance.json',
+                    'project/source/script.py', 'project/source/script.json'}
+                    or re.fullmatch(r'project/source-history/[0-9a-f]{64}\.py', name)),
+                    'non-authoring opaque document is not admissible')
             allowed.add(name)
-        _saved_authoring_require(set(names) == allowed and pin['source_entry'] in allowed, 'archive contains missing/extra runtime entries')
+        _saved_authoring_require(set(names) == allowed and (source_less or source_entry in allowed),
+            'archive contains missing/extra runtime entries')
         definition = _saved_authoring_document(archive.read('project/definition.json'))
         scene = _saved_authoring_document(archive.read('project/scene_document.json'))
         _saved_authoring_require(definition.get('schema') == 'fullmag.project.v1'
@@ -4362,11 +4396,25 @@ def _saved_authoring_validate_archive(raw, pin):
             and definition.get('scene') == scene and scene.get('version') == 'scene.v2'
             and scene.get('revision') == pin['scene_revision']
             and _saved_authoring_sha(canonical(scene)) == pin['scene_sha256'], 'saved project/revision/scene differs')
-        _saved_authoring_require(_saved_authoring_sha(archive.read(pin['source_entry'])) == pin['source_sha256'], 'preserved authoring source differs')
+        if source_less:
+            nested_scene = scene.get('scene')
+            _saved_authoring_require(isinstance(nested_scene, dict)
+                and nested_scene.get('source_of_truth') == 'ui'
+                and ('objects' not in scene or scene['objects'] == []),
+                'empty UI authoring scene must have UI source of truth and no objects')
+        else:
+            _saved_authoring_require(_saved_authoring_sha(archive.read(source_entry)) == source_sha256,
+                'preserved authoring source differs')
         if 'project/provenance.json' in allowed:
-            _saved_authoring_require(_saved_authoring_document(archive.read('project/provenance.json')).get('runs') == [], 'archive retains runtime runs')
-        if 'project/source/script.json' in allowed:
-            _saved_authoring_require(_saved_authoring_document(archive.read('project/source/script.json')).get('sha256') == pin['source_sha256'],
+            provenance = _saved_authoring_document(archive.read('project/provenance.json'))
+            _saved_authoring_require(provenance.get('runs') == [], 'archive retains runtime runs')
+            if source_less:
+                _saved_authoring_require(provenance.get('history', []) == []
+                    and provenance.get('authors', []) == []
+                    and set(provenance).issubset({'authors', 'history', 'runs'}),
+                    'empty UI authoring provenance retains source metadata or history')
+        if not source_less and 'project/source/script.json' in allowed:
+            _saved_authoring_require(_saved_authoring_document(archive.read('project/source/script.json')).get('sha256') == source_sha256,
                     'source metadata digest differs')
     return scene
 
