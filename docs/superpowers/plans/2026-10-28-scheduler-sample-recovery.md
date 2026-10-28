@@ -49,11 +49,11 @@ przed startem workera; `docs/specs/native-runtime-service-v1.md`;
 
 - [x] Zidentyfikować wyzerowanie przyczyny w `host_runtime` i brak deferral
   w `accepted_study_supervisor`; zachować wcześniejsze receipty błędu.
-- [ ] Dodać regresje Rust dla chwilowego braku próbki, odroczenia po retry,
+- [x] Dodać regresje Rust dla chwilowego braku próbki, odroczenia po retry,
   ponownego odczytu i niezmienionej fatalności konfliktów tożsamości.
-- [ ] Poprawić `crates/fullmag-runtime-control/src/host_runtime.rs` i
+- [x] Poprawić `crates/fullmag-runtime-control/src/host_runtime.rs` i
   `crates/fullmag-api/src/accepted_study_supervisor.rs`; przypiąć testy w CI.
-- [ ] Dodać managed wrapper natywnego no-spawn cancellation, jego Python
+- [x] Dodać managed wrapper natywnego no-spawn cancellation, jego Python
   regresje, receptę just i dokumentację istniejącego operatora. Przed apply
   ponownie sprawdzić rzeczywiste piny i wszystkie chronione dane runów.
 - [ ] Wykonać jedną kontrolowaną cancellation; potwierdzić `Cancelled`,
@@ -70,3 +70,18 @@ przed startem workera; `docs/specs/native-runtime-service-v1.md`;
   kontenery, wykonać kwalifikowaną retencję i dokończyć cykl worktree.
   Jeżeli aplikacja blokuje usunięcie primary checkoutu, użyć wspieranego
   surviving checkoutu albo zapisać precyzyjną blokadę bez force.
+
+## Checkpoint źródeł i kontroli
+
+- `18ac614fc1d9ff37541837567768664e1b68ed94`: typed sample error oraz deferral,
+  cztery regresje przypięte w CI; lokalnie nie kompilowano testów Rust.
+- Wrapper operatora, osobny dowód Linux i finalizer historycznego loader error:
+  175 lekkich regresji Python PASS (9 + 10 + 35 + 45 + 64 + 12).
+- Pierwsze wywołanie operatora zatrzymał loader przed wykonaniem native;
+  unknown receipt i request zachowane. Kontrolowane 86 plików / 324022 B
+  pozostaje byte-identical; dokładny probe owner/config/claim/lease/gate także.
+- Kanoniczne środowisko CPU ABI + `ldd` przechodzi w działającym backendzie.
+  Odczytowy helper z przypiętego obrazu potwierdził właściwe binarium.
+- Managed preview reconciliacji: PASS, 12 plików target runu, inventory
+  `acb6ddc2a1841193a511ff4c1a4e2807ad5e3fc33f401ba6cba94cd107df5e09`.
+  Na tym checkpointcie apply, przebudowa i końcowy render pozostają niewykonane.
