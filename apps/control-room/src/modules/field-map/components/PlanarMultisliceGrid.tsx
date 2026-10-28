@@ -205,6 +205,10 @@ function PlanarMultislicePanel({
         className="fm-field-map__multislice-canvas"
         ref={canvasRef}
         role="img"
+        // Keep the physical u:v aspect of the sample, as the single view does.
+        style={uMin !== undefined && uMax !== undefined && vMin !== undefined && vMax !== undefined && vMax > vMin
+          ? { aspectRatio: `${uMax - uMin} / ${vMax - vMin}` }
+          : undefined}
       />
       <figcaption className="fm-field-map__multislice-caption">
         {meta.data?.section?.normal_axis ?? "n"} ={" "}
