@@ -146,10 +146,15 @@ export function PlanarMonitorNormalHandle({
         onPointerCancel={() => finish(false)}
         onLostPointerCapture={() => finish(true)}
       >
+        {/* Pick target wider than the drawn shaft, so a few-pixel arrow stays grabbable. */}
+        <cylinderGeometry args={[length * 0.16, length * 0.16, length * 1.3, 12]} />
+        <meshBasicMaterial depthTest={false} depthWrite={false} opacity={0} transparent />
+      </mesh>
+      <mesh position={[0, length / 2, 0]} raycast={() => null}>
         <cylinderGeometry args={[length * 0.04, length * 0.04, length, 12]} />
         <meshBasicMaterial color={colors.accent} depthTest={false} />
       </mesh>
-      <mesh position={[0, length + length * 0.12, 0]}>
+      <mesh position={[0, length + length * 0.12, 0]} raycast={() => null}>
         <coneGeometry args={[length * 0.1, length * 0.24, 16]} />
         <meshBasicMaterial color={colors.accent} depthTest={false} />
       </mesh>
