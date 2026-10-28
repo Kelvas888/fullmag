@@ -258,8 +258,9 @@ fn attach_fem_crossover_decision_to_provenance(
 mod tests {
     use super::{
         attach_fem_crossover_decision_to_provenance, attach_resolved_fallback_to_provenance,
-        cached_display_refresh_due, cpu_execution_provenance, display_refresh_due,
-        normalize_runtime_context_signature, should_materialize_terminal_fields,
+        build_grid_preview_field, cached_display_refresh_due, cpu_execution_provenance,
+        display_refresh_due, full_resolution_preview_request, normalize_runtime_context_signature,
+        observation_preview_quantities_for, should_materialize_terminal_fields,
         InteractiveFdmPreviewRuntime, InteractiveFdmPreviewRuntimeInner,
     };
     use crate::dispatch::FdmEngine;
