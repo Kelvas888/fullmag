@@ -21,7 +21,7 @@ def file_id(number):
 
 def descendants():
     return {"schema": isolation.INVENTORY_SCHEMA, "entries": 0, "directories": 0, "files": 0,
-            "sha256": isolation._sha(b""), "reparse_points": 0, "file_links": [],
+            "sha256": isolation._sha(b""), "reparse_points": 0, "links": [],
             "max_entries": isolation.MAX_DESCENDANT_ENTRIES, "budget_ms": isolation.DESCENDANT_BUDGET_MS}
 
 
@@ -82,7 +82,7 @@ def proof():
                 "mapping": {"path": "/mnt/d/git/fullmag/storage", "roundtrip": SOURCE,
                             "mount": {"target": "/mnt/d", "source": "D:\\", "fstype": "9p", "fsroot": "/"},
                             "device": 111, "inode": 555, "mode": stat.S_IFDIR | 0o755, "nlink": 1},
-                "native": native(), "contained_file_links": []}
+                "native": native(), "contained_links": []}
     return {"schema": isolation.SCHEMA, "decision": "disjoint", "container_id": FOREIGN,
             "source_sha256": isolation._sha(SOURCE.encode()), "context": context,
             "provider_sha256": isolation._sha(isolation.WINDOWS_PROVIDER.encode()),
@@ -93,13 +93,13 @@ def file_link_fixture():
     value = native()
     inventory = value["candidate"]["descendants"]
     inventory.update(entries=3, directories=1, files=2, reparse_points=1,
-                     file_links=[{"path": r"lib\alias.so", "tag": "0xa000001d"}])
+                     links=[{"path": r"lib\alias.so", "tag": "0xa000001d", "kind": "file"}])
     mapping = proof()["before"]["mapping"]
-    hop = {"path": "lib/alias.so", "target": "alias.so.0", "device": mapping["device"],
+    hop = {"path": "lib/alias.so", "native_entry_kind": "file", "target": "alias.so.0", "device": mapping["device"],
            "inode": 123, "mode": stat.S_IFLNK | 0o777}
     final = {"path": "lib/alias.so.0", "device": mapping["device"],
              "inode": 124, "mode": stat.S_IFREG | 0o644}
-    return value, mapping, [{"path": r"lib\alias.so", "hops": [hop], "final": final}]
+    return value, mapping, [{"path": r"lib\alias.so", "native_entry_kind": "file", "target_kind": "file", "hops": [hop], "final": final}]
 
 
 class WindowsIsolationTests(unittest.TestCase):
@@ -211,22 +211,22 @@ class WindowsIsolationTests(unittest.TestCase):
         value, mapping, evidence = file_link_fixture()
         self.check_native(value)
         self.assertEqual(value["candidate"]["descendants"]["reparse_points"], 1)
-        self.assertIs(isolation._validate_file_link_evidence(evidence, mapping, value), evidence)
+        self.assertIs(isolation._validate_link_evidence(evidence, mapping, value), evidence)
 
     def test_relative_file_link_targets_reject_absolute_unc_drive_backslash_and_parent_escape(self):
         for target in ("/etc/passwd", "../elsewhere", "lib/../elsewhere", "C:elsewhere",
                        r"\\server\share", r"other\target", "bad\ntarget"):
             with self.subTest(target=target), self.assertRaises(BuildControlError):
-                isolation._relative_link_target(target)
+                isolation._resolve_link_target("alias.so", target)
 
     def test_unknown_native_file_reparse_tag_or_link_inventory_overflow_is_refused(self):
         value, _, _ = file_link_fixture()
-        value["candidate"]["descendants"]["file_links"][0]["tag"] = "0xa0000003"
+        value["candidate"]["descendants"]["links"][0]["tag"] = "0xa0000003"
         with self.assertRaisesRegex(BuildControlError, "tag"):
             self.check_native(value)
         value, _, _ = file_link_fixture()
         inventory = value["candidate"]["descendants"]
-        inventory["file_links"] *= isolation.MAX_RELATIVE_FILE_LINKS + 1
+        inventory["links"] *= isolation.MAX_RELATIVE_LINKS + 1
         with self.assertRaisesRegex(BuildControlError, "fixed bound"):
             self.check_native(value)
 
@@ -235,9 +235,9 @@ class WindowsIsolationTests(unittest.TestCase):
         evidence[0]["hops"].append(dict(evidence[0]["hops"][0], path="lib/alias.so.0", target="final.so"))
         evidence[0]["final"]["path"] = "lib/final.so"
         with self.assertRaisesRegex(BuildControlError, "native LX_SYMLINK"):
-            isolation._validate_file_link_evidence(evidence, mapping, value)
+            isolation._validate_link_evidence(evidence, mapping, value)
         with self.assertRaisesRegex(BuildControlError, "exact native inventory"):
-            isolation._validate_file_link_evidence([], mapping, value)
+            isolation._validate_link_evidence([], mapping, value)
 
     def test_file_link_hop_bound_directory_target_and_cross_device_target_are_refused(self):
         for change in ("hops", "directory", "device"):
@@ -249,7 +249,7 @@ class WindowsIsolationTests(unittest.TestCase):
             else:
                 evidence[0]["final"]["device"] += 1
             with self.subTest(change=change), self.assertRaises(BuildControlError):
-                isolation._validate_file_link_evidence(evidence, mapping, value)
+                isolation._validate_link_evidence(evidence, mapping, value)
 
     def test_linux_file_link_qualification_rereads_raw_target_and_lstat_identity(self):
         value, mapping, expected = file_link_fixture()
@@ -261,7 +261,7 @@ class WindowsIsolationTests(unittest.TestCase):
              mock.patch.object(isolation, "_link_parent_directories"), \
              mock.patch.object(isolation.os, "readlink", return_value="alias.so.0") as readlink, \
              mock.patch.object(isolation.time, "monotonic", return_value=0):
-            self.assertEqual(isolation._qualify_file_links(mapping, value), expected)
+            self.assertEqual(isolation._qualify_links(mapping, value), expected)
             self.assertEqual(readlink.call_count, 2)
             self.assertEqual(lstat.call_count, 4)
 
@@ -274,13 +274,105 @@ class WindowsIsolationTests(unittest.TestCase):
              mock.patch.object(isolation.os, "readlink", side_effect=["alias.so.0", "changed.so"]), \
              mock.patch.object(isolation.time, "monotonic", return_value=0):
             with self.assertRaisesRegex(BuildControlError, "drifted"):
-                isolation._qualify_file_links(mapping, value)
+                isolation._qualify_links(mapping, value)
         with mock.patch.object(isolation, "_file_identity", return_value=identity), \
              mock.patch.object(isolation, "_link_parent_directories"), \
              mock.patch.object(isolation.os, "readlink", return_value="alias.so"), \
              mock.patch.object(isolation.time, "monotonic", return_value=0):
             with self.assertRaisesRegex(BuildControlError, "cycle"):
-                isolation._qualify_file_links(mapping, value)
+                isolation._qualify_links(mapping, value)
+
+    def test_contained_lx_directory_link_qualifies_without_following_windows_reparse(self):
+        value, mapping, evidence = file_link_fixture()
+        inventory = value["candidate"]["descendants"]
+        inventory.update(directories=2, files=1)
+        inventory["links"][0]["kind"] = "directory"
+        evidence[0]["native_entry_kind"] = "directory"
+        evidence[0]["hops"][0]["native_entry_kind"] = "directory"
+        evidence[0]["target_kind"] = "directory"
+        evidence[0]["final"]["mode"] = stat.S_IFDIR | 0o755
+        self.check_native(value)
+        isolation._validate_link_evidence(evidence, mapping, value)
+        hop, final = evidence[0]["hops"][0], evidence[0]["final"]
+        def identity(path):
+            pin = hop if str(path).endswith("/alias.so") else final
+            return {key: pin[key] for key in ("device", "inode", "mode")}
+        with mock.patch.object(isolation, "_file_identity", side_effect=identity), \
+             mock.patch.object(isolation, "_link_parent_directories"), \
+             mock.patch.object(isolation.os, "readlink", return_value="alias.so.0"):
+            self.assertEqual(isolation._qualify_links(mapping, value), evidence)
+
+    def test_file_attributed_lx_can_have_a_qualified_contained_directory_target(self):
+        value, mapping, evidence = file_link_fixture()
+        evidence[0]["target_kind"] = "directory"
+        evidence[0]["final"]["mode"] = stat.S_IFDIR | 0o755
+        isolation._validate_link_evidence(evidence, mapping, value)
+        hop, final = evidence[0]["hops"][0], evidence[0]["final"]
+        def identity(path):
+            pin = hop if str(path).endswith("/alias.so") else final
+            return {key: pin[key] for key in ("device", "inode", "mode")}
+        with mock.patch.object(isolation, "_file_identity", side_effect=identity), \
+             mock.patch.object(isolation, "_link_parent_directories"), \
+             mock.patch.object(isolation.os, "readlink", return_value="alias.so.0"):
+            self.assertEqual(isolation._qualify_links(mapping, value), evidence)
+
+    def test_transitive_lx_links_bind_each_native_kind_separately_from_final_kind(self):
+        value, mapping, evidence = file_link_fixture()
+        inventory = value["candidate"]["descendants"]
+        inventory.update(entries=4, directories=2, files=2, reparse_points=2)
+        inventory["links"].append({"path": r"lib\alias.so.0", "tag": "0xa000001d", "kind": "directory"})
+        second = dict(evidence[0]["hops"][0], path="lib/alias.so.0", inode=125,
+                      native_entry_kind="directory", target="final")
+        final = dict(evidence[0]["final"], path="lib/final", mode=stat.S_IFDIR | 0o755)
+        evidence[0].update(target_kind="directory", final=final)
+        evidence[0]["hops"].append(second)
+        evidence.append({"path": r"lib\alias.so.0", "native_entry_kind": "directory",
+                         "target_kind": "directory", "hops": [second], "final": final})
+        isolation._validate_link_evidence(evidence, mapping, value)
+        evidence[0]["hops"][1]["native_entry_kind"] = "file"
+        with self.assertRaisesRegex(BuildControlError, "native LX_SYMLINK"):
+            isolation._validate_link_evidence(evidence, mapping, value)
+
+    def test_forged_target_kind_or_unknown_evidence_field_is_refused(self):
+        for change in ("target_kind", "native_entry_kind", "extra"):
+            value, mapping, evidence = file_link_fixture()
+            if change == "extra":
+                evidence[0]["bypass"] = True
+            else:
+                evidence[0][change] = "directory"
+            with self.subTest(change=change), self.assertRaises(BuildControlError):
+                isolation._validate_link_evidence(evidence, mapping, value)
+
+    def test_leading_parent_link_target_is_bounded_at_candidate_root(self):
+        self.assertEqual(isolation._resolve_link_target("node_modules/pkg", "../.pnpm/pkg"), ".pnpm/pkg")
+        self.assertEqual(isolation._resolve_link_target("a/b/pkg", "../../target"), "target")
+        for path, target in (("pkg", "../target"), ("a/pkg", "../../target"),
+                             ("a/pkg", "x/../target"), ("a/pkg", "./target"),
+                             ("a/pkg", "x//target")):
+            with self.subTest(path=path, target=target), self.assertRaises(BuildControlError):
+                isolation._resolve_link_target(path, target)
+
+    def test_directory_target_kind_must_match_final_and_cannot_end_outside_or_in_cycle(self):
+        value, mapping, evidence = file_link_fixture()
+        value["candidate"]["descendants"].update(directories=2, files=1)
+        value["candidate"]["descendants"]["links"][0]["kind"] = "directory"
+        evidence[0]["native_entry_kind"] = "directory"
+        evidence[0]["hops"][0]["native_entry_kind"] = "directory"
+        evidence[0]["target_kind"] = "directory"
+        for change in ("file", "escape", "cycle"):
+            candidate = copy.deepcopy(evidence)
+            if change == "escape":
+                candidate[0]["hops"][0]["target"] = "../../outside"
+            elif change == "cycle":
+                candidate[0]["hops"][0]["target"] = "alias.so"
+            with self.subTest(change=change), self.assertRaises(BuildControlError):
+                isolation._validate_link_evidence(candidate, mapping, value)
+
+    def test_unknown_native_link_kind_is_refused(self):
+        value, _, _ = file_link_fixture()
+        value["candidate"]["descendants"]["links"][0]["kind"] = "junction"
+        with self.assertRaises(BuildControlError):
+            self.check_native(value)
 
     def test_linux_file_link_parent_cannot_be_a_symlink(self):
         def metadata(path):
@@ -295,12 +387,12 @@ class WindowsIsolationTests(unittest.TestCase):
             value, _, evidence = file_link_fixture()
             candidate = proof()
             candidate["before"]["native"] = value
-            candidate["before"]["contained_file_links"] = evidence
+            candidate["before"]["contained_links"] = evidence
             candidate["after"] = copy.deepcopy(candidate["before"])
             if field == "target":
-                candidate["after"]["contained_file_links"][0]["hops"][0]["target"] = "different.so"
+                candidate["after"]["contained_links"][0]["hops"][0]["target"] = "different.so"
             else:
-                candidate["after"]["contained_file_links"][0]["final"]["inode"] += 1
+                candidate["after"]["contained_links"][0]["final"]["inode"] += 1
             with self.subTest(field=field), self.assertRaisesRegex(BuildControlError, "identities drifted"):
                 self.check_proof(candidate)
 

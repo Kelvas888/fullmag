@@ -25,7 +25,7 @@ MAX_BYTES = 1024 * 1024
 MAX_DESCENDANT_ENTRIES = 100000
 DESCENDANT_BUDGET_MS = 15000
 INVENTORY_SCHEMA = "fullmag.windows-contained-topology.v1"
-MAX_RELATIVE_FILE_LINKS = 256
+MAX_RELATIVE_LINKS = 256
 MAX_RELATIVE_LINK_HOPS = 16
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 CID = re.compile(r"[0-9a-f]{64}\Z")
@@ -33,7 +33,7 @@ IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 BACKINGS = {"wsl-current", "wsl-docker-desktop", "docker-desktop-data"}
 PROOF_FIELDS = {"schema", "decision", "container_id", "source_sha256",
                 "context", "before", "after", "provider_sha256"}
-OBSERVATION_FIELDS = {"engine", "backend", "foreign", "linux", "mapping", "native", "contained_file_links"}
+OBSERVATION_FIELDS = {"engine", "backend", "foreign", "linux", "mapping", "native", "contained_links"}
 
 # No Add-Type, compilation, temporary files or candidate contents are used.
 # Microsoft: hard links cannot refer to files on different volumes.
@@ -71,6 +71,52 @@ function FileId($path) {
     if ($ids.Count -ne 1) { throw 'ambiguous file identity' }
     return '0x'+$ids[0].Value.Substring(2).PadLeft(32,'0').ToLowerInvariant()
 }
+# FindFirstFile exposes the reparse tag without opening/dereferencing its target.
+# https://learn.microsoft.com/en-us/windows/win32/fileio/reparse-point-tags
+$assemblyName=[Reflection.AssemblyName]::new('FullmagWindowsMetadata')
+$assembly=[AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName,[Reflection.Emit.AssemblyBuilderAccess]::Run)
+$module=$assembly.DefineDynamicModule('Metadata')
+$type=$module.DefineType('FullmagWindowsMetadata',[Reflection.TypeAttributes]'Public,Abstract,Sealed')
+$methodFlags=[Reflection.MethodAttributes]'Public,Static,PinvokeImpl'
+$find=$type.DefinePInvokeMethod('FindFirstFileW','kernel32.dll',$methodFlags,
+    [Reflection.CallingConventions]::Standard,[IntPtr],[Type[]]@([string],[IntPtr]),
+    [Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+$find.SetImplementationFlags($find.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)
+$close=$type.DefinePInvokeMethod('FindClose','kernel32.dll',$methodFlags,
+    [Reflection.CallingConventions]::Standard,[int],[Type[]]@([IntPtr]),
+    [Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+$close.SetImplementationFlags($close.GetMethodImplementationFlags() -bor [Reflection.MethodImplAttributes]::PreserveSig)
+$nativeMetadata=$type.CreateType()
+function ReparseTag($path, $expectedAttributes) {
+    if ($path -cne (Canonical $path) -or $path.IndexOfAny([char[]]'*?') -ge 0) {
+        throw 'literal canonical reparse path required'
+    }
+    $buffer=[Runtime.InteropServices.Marshal]::AllocHGlobal(1024)
+    $handle=[IntPtr]::new(-1)
+    try {
+        $handle=$nativeMetadata::FindFirstFileW(('\\?\'+$path),$buffer)
+        if ($handle -eq [IntPtr]::new(-1) -or $handle -eq [IntPtr]::Zero) {
+            throw ('native reparse metadata unavailable: '+$path)
+        }
+        $attributes=[Runtime.InteropServices.Marshal]::ReadInt32($buffer,0)
+        $tag=[Runtime.InteropServices.Marshal]::ReadInt32($buffer,36)
+        $name=[Runtime.InteropServices.Marshal]::PtrToStringUni([IntPtr]::Add($buffer,44),260)
+        $terminator=$name.IndexOf([char]0)
+        if ($terminator -lt 0 -or
+            $name.Substring(0,$terminator) -cne [IO.Path]::GetFileName($path) -or
+            ($attributes -band 0x410) -ne ($expectedAttributes -band 0x410)) {
+            throw ('native reparse enumeration identity drifted: '+$path)
+        }
+        if ($tag -ne [int]0xa000001d) { throw ('unknown descendant reparse tag refused: '+$path) }
+        return '0xa000001d'
+    } finally {
+        try {
+            if ($handle -ne [IntPtr]::new(-1) -and $handle -ne [IntPtr]::Zero) {
+                if ($nativeMetadata::FindClose($handle) -eq 0) { throw 'native enumeration handle close failed' }
+            }
+        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
+    }
+}
 function DescendantBudget($clock, $entries, $directories, $files, $pending) {
     if ($entries -gt 100000 -or $clock.ElapsedMilliseconds -ge 15000) {
         throw ('descendant inventory fixed budget exceeded: entries={0} directories={1} files={2} pending={3} elapsed_ms={4}' -f
@@ -84,7 +130,8 @@ function Descendants($root, $serial, $rootFileId) {
     $clock=[Diagnostics.Stopwatch]::StartNew()
     $pendingDirs=New-Object 'System.Collections.Generic.Stack[string]'
     $rows=New-Object 'System.Collections.Generic.List[string]'
-    $fileLinks=New-Object 'System.Collections.Generic.List[string]'
+    $links=New-Object 'System.Collections.Generic.List[string]'
+    $linkKinds=@{}
     $pendingDirs.Push($root)
     $entryCount=0
     $directoryCount=0
@@ -106,34 +153,25 @@ function Descendants($root, $serial, $rootFileId) {
             # EnumerateFileSystemInfos supplies attributes from the enumeration.
             # https://learn.microsoft.com/en-us/dotnet/api/system.io.directoryinfo.enumeratefilesysteminfos
             $attributes=[int]$entry.Attributes
-            $isFileLink=($attributes -band 0x400) -ne 0
-            if ($isFileLink -and ($attributes -band 0x10) -ne 0) {
-                throw ('descendant directory reparse point refused: '+$entry.FullName)
-            }
+            $isLink=($attributes -band 0x400) -ne 0
             if (-not $entry.FullName.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)) {
                 throw 'descendant inventory escaped its canonical root'
             }
             $relative=$entry.FullName.Substring($root.Length+1)
             if (($relative.Split('\')).Length -gt 128) { throw 'descendant inventory depth budget exceeded' }
-            if ($isFileLink) {
-                if ($fileLinks.Count -ge 256) { throw 'relative file-link inventory exceeds its fixed bound' }
-                $tagText=(& fsutil.exe reparsepoint query $entry.FullName | Out-String)
-                if ($LASTEXITCODE -ne 0) { throw ('file reparse tag unavailable: '+$entry.FullName) }
-                # Microsoft reparse tag has its high bit set; fsutil also
-                # reports a small hexadecimal data length, which is not a tag.
-                $tags=[regex]::Matches($tagText,'(?i)0x[89a-f][0-9a-f]{7}\b')
-                if ($tags.Count -ne 1 -or $tags[0].Value.ToLowerInvariant() -ne '0xa000001d') {
-                    throw ('unknown descendant file reparse tag refused: '+$entry.FullName)
-                }
-                $fileLinks.Add($relative)
+            if ($isLink) {
+                if ($links.Count -ge 256) { throw 'relative LX-link inventory exceeds its fixed bound' }
+                $null=ReparseTag $entry.FullName $attributes
+                $links.Add($relative)
+                $linkKinds[$relative]=$(if(($attributes -band 0x10) -ne 0){'directory'}else{'file'})
             }
             if (($attributes -band 0x10) -ne 0) {
-                $kind='directory'
+                $kind=$(if($isLink){'directory-link'}else{'directory'})
                 $directoryCount++
-                $pendingDirs.Push($entry.FullName)
+                if (-not $isLink) { $pendingDirs.Push($entry.FullName) }
             } else {
                 if ($entry -isnot [IO.FileInfo]) { throw 'descendant object kind is unsupported' }
-                $kind=$(if($isFileLink){'file-link'}else{'file'})
+                $kind=$(if($isLink){'file-link'}else{'file'})
                 $fileCount++
             }
             # Length-prefix the path so delimiters inside names cannot collide.
@@ -163,12 +201,12 @@ function Descendants($root, $serial, $rootFileId) {
     try { $digest=([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
     finally { $hash.Dispose() }
     DescendantBudget $clock $entryCount $directoryCount $fileCount $pendingDirs.Count
-    [string[]]$orderedLinks=@($fileLinks.ToArray())
+    [string[]]$orderedLinks=@($links.ToArray())
     [Array]::Sort($orderedLinks,[StringComparer]::Ordinal)
-    $linkRecords=@($orderedLinks | ForEach-Object { @{path=$_;tag='0xa000001d'} })
+    $linkRecords=@($orderedLinks | ForEach-Object { @{path=$_;tag='0xa000001d';kind=$linkKinds[$_]} })
     return @{schema='fullmag.windows-contained-topology.v1';entries=$entryCount;
-        directories=$directoryCount;files=$fileCount;sha256=$digest;reparse_points=$fileLinks.Count;
-        file_links=$linkRecords;max_entries=100000;budget_ms=15000}
+        directories=$directoryCount;files=$fileCount;sha256=$digest;reparse_points=$links.Count;
+        links=$linkRecords;max_entries=100000;budget_ms=15000}
 }
 function Identity($value, $candidateSerial=$null) {
     $path=Canonical $value
@@ -324,15 +362,15 @@ def _native_link_relative(value):
 def _validate_descendants(value):
     require(isinstance(value, dict) and set(value) == {
         "schema", "entries", "directories", "files", "sha256", "reparse_points",
-        "file_links", "max_entries", "budget_ms"} and value["schema"] == INVENTORY_SCHEMA,
+        "links", "max_entries", "budget_ms"} and value["schema"] == INVENTORY_SCHEMA,
         "Directory descendant inventory is incomplete")
-    links = value["file_links"]
-    require(isinstance(links, list) and len(links) <= MAX_RELATIVE_FILE_LINKS,
+    links = value["links"]
+    require(isinstance(links, list) and len(links) <= MAX_RELATIVE_LINKS,
             "Directory file-link inventory exceeds its fixed bound")
     paths = []
     for link in links:
-        require(isinstance(link, dict) and set(link) == {"path", "tag"}
-                and link["tag"] == "0xa000001d", "Unknown descendant reparse tag")
+        require(isinstance(link, dict) and set(link) == {"path", "tag", "kind"}
+                and link["tag"] == "0xa000001d" and link["kind"] in {"file", "directory"}, "Unknown descendant reparse tag")
         _native_link_relative(link["path"])
         paths.append(link["path"])
     require(len(paths) == len(set(paths))
@@ -342,7 +380,9 @@ def _validate_descendants(value):
                 for key in ("entries", "directories", "files", "reparse_points", "max_entries", "budget_ms"))
             and value["entries"] <= MAX_DESCENDANT_ENTRIES
             and value["entries"] == value["directories"] + value["files"]
-            and value["reparse_points"] == len(links) <= value["files"]
+            and value["reparse_points"] == len(links) <= value["entries"]
+            and sum(item["kind"] == "file" for item in links) <= value["files"]
+            and sum(item["kind"] == "directory" for item in links) <= value["directories"]
             and value["max_entries"] == MAX_DESCENDANT_ENTRIES
             and value["budget_ms"] == DESCENDANT_BUDGET_MS
             and isinstance(value["sha256"], str) and SHA.fullmatch(value["sha256"]),
@@ -655,21 +695,37 @@ def _context(control, backend, container, source, reference_root):
             "source_root": identity["source_root"], "reference_root": str(reference_root)}
 
 
-def _file_link_paths(native):
+def _link_paths(native):
     inventory = native["candidate"]["descendants"]
     if inventory is None:
         return []
     _validate_descendants(inventory)
-    return [(item["path"], _native_link_relative(item["path"])) for item in inventory["file_links"]]
+    return [(item["path"], _native_link_relative(item["path"]), item["kind"])
+            for item in inventory["links"]]
 
 
 def _relative_link_target(value):
     require(isinstance(value, str) and value and len(value.encode("utf-8")) <= 4096
             and not value.startswith("/") and "\\" not in value and ":" not in value
-            and not any(ord(char) < 32 or ord(char) == 127 for char in value)
-            and ".." not in value.split("/"),
-            "File link target must be contained POSIX relative text without parent traversal")
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value),
+            "Link target must be contained POSIX relative text")
+    ordinary = False
+    for part in value.split("/"):
+        require(part not in {"", "."}, "Link target contains ambiguous segments")
+        require(part != ".." or not ordinary, "Link target has non-leading parent traversal")
+        ordinary = ordinary or part != ".."
     return PurePosixPath(value)
+
+
+def _resolve_link_target(relative, target):
+    parts = list(PurePosixPath(relative).parent.parts)
+    for part in _relative_link_target(target).parts:
+        if part == "..":
+            require(parts, "Relative link target escapes its candidate root")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts) or "."
 
 
 def _file_identity(path):
@@ -691,44 +747,48 @@ def _link_parent_directories(root, path, device):
                 "File link has a symlink, non-directory or external-filesystem parent")
 
 
-def _validate_file_link_evidence(value, mapping, native):
-    expected = _file_link_paths(native)
+def _validate_link_evidence(value, mapping, native):
+    expected = _link_paths(native)
     require(isinstance(value, list) and len(value) == len(expected),
             "Qualified file-link list does not cover the exact native inventory")
-    allowed = {relative for _, relative in expected}
+    allowed = {relative: kind for _, relative, kind in expected}
     identity_fields = {"path", "device", "inode", "mode"}
-    for entry, (windows_path, relative) in zip(value, expected):
-        require(isinstance(entry, dict) and set(entry) == {"path", "hops", "final"}
-                and entry["path"] == windows_path and isinstance(entry["hops"], list)
+    for entry, (windows_path, relative, kind) in zip(value, expected):
+        require(isinstance(entry, dict) and set(entry) == {"path", "native_entry_kind", "target_kind", "hops", "final"}
+                and entry["path"] == windows_path and entry["native_entry_kind"] == kind
+                and entry["target_kind"] in {"file", "directory"} and isinstance(entry["hops"], list)
                 and 1 <= len(entry["hops"]) <= MAX_RELATIVE_LINK_HOPS,
                 "Qualified file-link identity or hop bound differs")
         seen = set()
         for hop in entry["hops"]:
-            require(isinstance(hop, dict) and set(hop) == identity_fields | {"target"}
-                    and hop["path"] == relative and relative in allowed and relative not in seen
+            require(isinstance(hop, dict) and set(hop) == identity_fields | {"target", "native_entry_kind"}
+                    and hop["path"] == relative and relative in allowed
+                    and hop["native_entry_kind"] == allowed[relative] and relative not in seen
                     and type(hop["device"]) is int and hop["device"] == mapping["device"]
                     and type(hop["inode"]) is int and hop["inode"] > 0
                     and type(hop["mode"]) is int and stat.S_ISLNK(hop["mode"]),
                     "File-link hop is absent from native LX_SYMLINK inventory or lacks exact identity")
             seen.add(relative)
-            relative = (PurePosixPath(relative).parent / _relative_link_target(hop["target"])).as_posix()
+            relative = _resolve_link_target(relative, hop["target"])
         final = entry["final"]
         require(isinstance(final, dict) and set(final) == identity_fields
                 and final["path"] == relative and relative not in allowed
                 and type(final["device"]) is int and final["device"] == mapping["device"]
                 and type(final["inode"]) is int and final["inode"] > 0
-                and type(final["mode"]) is int and stat.S_ISREG(final["mode"]),
-                "Relative file link does not end in a contained regular file on the same DrvFs")
+                and type(final["mode"]) is int
+                and ((entry["target_kind"] == "file" and stat.S_ISREG(final["mode"]))
+                     or (entry["target_kind"] == "directory" and stat.S_ISDIR(final["mode"]))),
+                "Relative link does not end in a contained ordinary object of its qualified target kind on the same DrvFs")
     return value
 
 
-def _qualify_file_links(mapping, native):
-    expected = _file_link_paths(native)
-    allowed = {relative for _, relative in expected}
+def _qualify_links(mapping, native):
+    expected = _link_paths(native)
+    allowed = {relative: kind for _, relative, kind in expected}
     root = Path(mapping["path"])
     deadline = time.monotonic() + DESCENDANT_BUDGET_MS / 1000
     result = []
-    for windows_path, initial_relative in expected:
+    for windows_path, initial_relative, kind in expected:
         relative = initial_relative
         hops = []
         seen = set()
@@ -740,26 +800,28 @@ def _qualify_file_links(mapping, native):
             _link_parent_directories(root, current, mapping["device"])
             before = _file_identity(current)
             require(before["device"] == mapping["device"], "File link escaped the candidate DrvFs")
-            if stat.S_ISREG(before["mode"]):
+            if stat.S_ISREG(before["mode"]) or stat.S_ISDIR(before["mode"]):
                 require(hops and relative not in allowed,
                         "Native LX_SYMLINK inventory is not a Linux file symlink")
                 require(_file_identity(current) == before, "File-link final identity drifted")
-                result.append({"path": windows_path, "hops": hops, "final": {"path": relative, **before}})
+                result.append({"path": windows_path, "native_entry_kind": kind,
+                               "target_kind": "directory" if stat.S_ISDIR(before["mode"]) else "file",
+                               "hops": hops, "final": {"path": relative, **before}})
                 break
             require(stat.S_ISLNK(before["mode"]) and relative in allowed
                     and len(hops) < MAX_RELATIVE_LINK_HOPS,
-                    "Relative file-link hop is unknown, a directory, or exceeds its bound")
+                    "Relative LX-link hop is unknown or exceeds its bound")
             target = os.readlink(current)
             require(_file_identity(current) == before and os.readlink(current) == target,
                     "File-link identity or raw target drifted during qualification")
             _link_parent_directories(root, current, mapping["device"])
-            hops.append({"path": relative, "target": target, **before})
-            relative = (PurePosixPath(relative).parent / _relative_link_target(target)).as_posix()
+            hops.append({"path": relative, "native_entry_kind": allowed[relative], "target": target, **before})
+            relative = _resolve_link_target(relative, target)
         else:
             raise BuildControlError("Relative file-link chain exceeds its fixed hop bound")
     require(not expected or time.monotonic() < deadline,
             "Relative file-link qualification exceeded its time bound")
-    return _validate_file_link_evidence(result, mapping, native)
+    return _validate_link_evidence(result, mapping, native)
 
 
 def _observation(context, backend, foreign, source):
@@ -770,7 +832,7 @@ def _observation(context, backend, foreign, source):
     native = _native(source, context["distro"])
     return {"engine": engine, "backend": _container_pin(backend), "foreign": _container_pin(foreign),
             "linux": linux, "mapping": mapping, "native": native,
-            "contained_file_links": _qualify_file_links(mapping, native)}
+            "contained_links": _qualify_links(mapping, native)}
 
 
 def validate_windows_bind_disjoint_proof(proof, *, source, container_id):
@@ -833,7 +895,7 @@ def validate_windows_bind_disjoint_proof(proof, *, source, container_id):
             "Windows and WSL candidate object types differ")
     require(observed["mapping"]["device"] != observed["linux"]["root_device"],
             "DrvFs mapping is not physically separate from the WSL-native root")
-    _validate_file_link_evidence(observed["contained_file_links"], mapping, observed["native"])
+    _validate_link_evidence(observed["contained_links"], mapping, observed["native"])
     return proof
 
 
