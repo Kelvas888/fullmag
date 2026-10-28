@@ -2246,6 +2246,14 @@ async fn apply_projection(
             };
             if row.is_physical_observation() {
                 let scalar_revision = next.scalar_revision;
+                // A run's latest durable row never moves backwards, so an
+                // earlier step means a new step lineage: a run started from a
+                // fresh model in the same session (fm.reset(), a sweep point).
+                // The append-only table would reject every row of that run and
+                // keep reporting the previous run's final state.
+                if next.scalar_rows.last().is_some_and(|last| row.step < last.step) {
+                    next.scalar_rows.clear();
+                }
                 crate::session::apply_current_live_scalar_frame(
                     &mut next,
                     crate::types::CurrentLiveScalarFrameRequest {
