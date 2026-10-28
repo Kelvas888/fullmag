@@ -116,7 +116,19 @@ packages. For daily application development with source HMR and persistent
 Docker state, use the [Docker development workspace](#docker-development-workspace)
 below.
 
-Install the Python authoring layer:
+Install the Python authoring layer from PyPI (available once the first release is
+published; until then use the source checkout below):
+
+```bash
+pip install fullmag
+# or with uv
+uv add fullmag          # in a uv project
+uv pip install fullmag  # in an existing environment
+```
+
+The PyPI package is the pure-Python DSL and live API client (`fm.connect()`); it does not
+contain the FDM/FEM solvers, which run in the Docker DEV group or a native build. From a source
+checkout:
 
 ```bash
 git clone https://github.com/MateuszZelent/fullmag
@@ -127,7 +139,7 @@ python -m pip install ./packages/fullmag-py
 Install optional geometry and meshing dependencies when needed:
 
 ```bash
-python -m pip install "./packages/fullmag-py[meshing]"
+python -m pip install "./packages/fullmag-py[meshing]"   # PyPI: pip install "fullmag[meshing]"
 ```
 
 Run the repository-owned FDM CPU smoke scenario:
