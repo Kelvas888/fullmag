@@ -80,3 +80,21 @@ Natywne v4 dodano jako osobny etap źródeł: pełny union inventory/CAS/checkpo
 Ponowna kontrola magazynu po tych pracach: identyczne metadane wszystkich 1240 plików oraz SHA-256 44 katalogów, zero driftu. Przygotowano lokalne piny 15 terminalnych i 2 held runów; żaden status, release ani checkpoint nie został zmieniony.
 
 Badanie adaptera Windows wykazało potrzebę natywnej atestacji wolumenu, reparse/hardlinków oraz backing images. Nie wprowadzono niekwalifikowanej translacji ścieżek. Koordynator nie ma ownership pięciu blokujących grup; pytanie o rozszerzenie kontaktu z ich właścicielami pozostaje oczekujące. Nie zatrzymano żadnej z nich.
+
+## Integracja hosta i weryfikacja natywnego v4
+
+PR #301 scalono jako `953753d4cfa537f230dc618583733449f7f12892` po sukcesie wszystkich workflow. Główny checkout `master` zaktualizowano fast-forward; obca zmiana submodule została zachowana. Nie uruchomiono buildu aplikacji ani runtime.
+
+Natywne v4 zapisano jako `748273aeda0a223e45e75905b0f4cbc9c827e2b6` i skierowano do PR #302. Workflow bootstrap 3024 (`40604607571`) zakończył się success; jawne terminal recovery, retained manual-held oraz accepted Compute start-gates przeszły w GitHub CI. To dowód dla tego commita, a nie dla rzeczywistego store lub późniejszych zmian hosta.
+
+Rzeczywisty snapshot tylko do odczytu wykazał brak published artifact refs w dotychczasowym hostowym zbiorze CAS. Poprawka ma uwzględniać wyłącznie przypięte katalogi artefaktów i zgodne task/attempt/epoch/resource/released-lease, bez zbierania dowolnych referencji z payloadów. Kolejna próba nie opublikowała proof i zakończyła helper; jego limit 64 MiB nie pozwala materializować całego obiektu 81 MiB. Kontrola CAS otrzymuje ograniczony odczyt strumieniowy, zachowując hashowanie, limity i identity-before/after. Wynik pełnego snapshotu nadal wymaga potwierdzenia.
+
+Historyczne ownership pięciu blokujących grup ustalono w trzech sesjach Claude Code. Kontakt przez Claude Desktop zablokował błąd integracji narzędzia GUI; nie użyto nieudokumentowanego IPC, nie wznowiono sesji i nie zatrzymano grup. Użytkownik zezwolił na rozszerzoną koordynację, ale nie na stop/restart. Przekazanie pytania do właścicieli pozostaje wymaganą informacją do wyznaczenia okna recovery.
+
+### Wynik końcowego snapshotu hosta v4
+
+Po kontrolowanej zbiórce published artifact refs i strumieniowym SHA rzeczywisty isolated readonly helper zakończył się kodem 0, bez stderr. Pełny snapshot obejmuje 17 runów i 1240 plików; nie opublikowano recovery ani nie zapisano native store, nie uruchomiono aplikacji. Piny pozostają podzielone na 15 terminalnych i 2 held runy.
+
+Regresje po ostatnich zmianach: abrupt-stop 24, prepare wrapper 8, bridge v3/v4 15, legacy container recovery 13, legacy runtime bridge 5 — wszystkie PASS. Test strumieniowego hashowania obejmuje 81 MiB przy limicie pamięci subprocessu 64 MiB, drift mtime i oversized object. Niezależne review protokołu i snapshotu nie wykazało dalszych P1/P2 po naprawie obecności held field przy v3.
+
+Adapter Windows–WSL ma osobny ownership w skoordynowanym zadaniu sprzątania Dockera, które otrzymało bezpośrednie polecenie użytkownika dokończenia tego adaptera bez przerywania innych zadań. Ten etap nie zawiera niekwalifikowanego adaptera ani migracji; małe call sites zostaną uzgodnione po jego kwalifikacji. Recovery mastera, build/start i browser Airbox nadal NOT VERIFIED.

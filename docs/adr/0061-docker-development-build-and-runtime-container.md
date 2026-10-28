@@ -1038,3 +1038,9 @@ nie wolno zmienić requestu na starszą wersję lub pominąć modeli oczekujący
 Stan tej decyzji: implementacja źródłowa i review są oddzielone od kwalifikacji
 CI i rzeczywistego recovery. Do uzyskania receiptu zarządzanego wykonania oraz
 porównania zachowanych danych runtime pozostaje NOT VERIFIED.
+
+Hostowy preflight uwzględnia także opublikowane obiekty CAS z przypiętego
+katalogu artefaktów, zgodne z terminalnym task/attempt/epoch/resource i released
+lease. Nie zbiera dowolnych referencji z payloadów workerów. Izolowany helper
+pozostaje ograniczony do 64 MiB pamięci: CAS czyta i hashuje strumieniowo,
+z kontrolą limitów, liczby bajtów i niezmienności tożsamości pliku przed/po.

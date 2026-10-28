@@ -136,6 +136,7 @@ CONTAINER_RECOVERY_AUTHORIZATION_SCHEMA = (
 CONTAINER_RECOVERY_AUTHORIZATION_SCHEMAS = frozenset({CONTAINER_RECOVERY_AUTHORIZATION_SCHEMA})
 CONTAINER_RECOVERY_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v3"
+CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v4"
 CONTAINER_RECOVERY_CAPABILITIES_SCHEMA = "runtime_service_container_recovery_capabilities.v1"
 CONTAINER_RECOVERY_ATTESTATION_SCHEMA = "docker_namespace_teardown_attestation.v1"
 CONTAINER_RECOVERY_ABSENCE_ATTESTATION_SCHEMA = "docker_namespace_absence_attestation.v1"
@@ -3798,6 +3799,45 @@ def _container_recovery_owner_digest(paths: RuntimePaths) -> tuple[dict[str, Any
 
 
 def _container_recovery_expected_outcome(request: Mapping[str, Any]) -> str:
+    if request.get("schema_version") == CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA:
+        if "retained_cancelled_runs" in request:
+            _fail("v4 container recovery cannot carry cancelled-run pins")
+        terminal_pins = request.get("retained_terminal_runs")
+        held_pins = request.get("retained_held_manual_runs")
+        if not isinstance(terminal_pins, list) or not 0 <= len(terminal_pins) <= 128:
+            _fail("v4 container recovery requires 0..128 retained terminal run pins")
+        if not isinstance(held_pins, list) or not 1 <= len(held_pins) <= 128:
+            _fail("v4 container recovery requires 1..128 retained held-manual run pins")
+        if len(terminal_pins) + len(held_pins) > 128:
+            _fail("v4 container recovery retained run pins exceed the combined limit")
+        seen: set[str] = set()
+        for pin in terminal_pins:
+            if not isinstance(pin, dict) or set(pin) != {
+                "run_id", "run_intent_sha256", "run_catalog_sha256", "artifact_catalog_sha256"
+            }:
+                _fail("invalid v4 retained terminal run pin")
+            run_id = _recovery_store_id(pin.get("run_id"), "retained terminal run id")
+            if run_id in seen:
+                _fail("duplicate v4 retained run pin")
+            seen.add(run_id)
+            for key in ("run_intent_sha256", "run_catalog_sha256"):
+                _container_recovery_hex(pin.get(key), key)
+            if pin["artifact_catalog_sha256"] is not None:
+                _container_recovery_hex(pin["artifact_catalog_sha256"], "artifact catalog digest")
+        for pin in held_pins:
+            if not isinstance(pin, dict) or set(pin) != {
+                "run_id", "run_intent_sha256", "run_catalog_sha256", "start_release"
+            } or pin.get("start_release") != "absent":
+                _fail("invalid retained held-manual run pin")
+            run_id = _recovery_store_id(pin.get("run_id"), "retained held-manual run id")
+            if run_id in seen:
+                _fail("duplicate v4 retained run pin")
+            seen.add(run_id)
+            _container_recovery_hex(pin.get("run_intent_sha256"), "held-manual run intent digest")
+            _container_recovery_hex(pin.get("run_catalog_sha256"), "held-manual run catalog digest")
+        return "retained_manual_held_runs_recovered"
+    if "retained_held_manual_runs" in request:
+        _fail("held-manual run pins require container recovery v4")
     if request.get("schema_version") == CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA:
         if request.get("retained_cancelled_runs") is not None:
             _fail("v3 container recovery cannot carry cancelled-only pins")
@@ -3927,8 +3967,11 @@ def _validate_container_recovery_attestation_document(
              or not isinstance(request.get("retained_cancelled_runs"), list))
             and (request.get("schema_version") != CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA
                  or not isinstance(request.get("retained_terminal_runs"), list))
+            and (request.get("schema_version") != CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA
+                 or not isinstance(request.get("retained_terminal_runs"), list)
+                 or not isinstance(request.get("retained_held_manual_runs"), list))
         ):
-            _fail("container namespace absence proof requires a retained-run v2 or v3 request")
+            _fail("container namespace absence proof requires a retained-run v2, v3 or v4 request")
         if set(attestation) != {
             "schema_version",
             "request_sha256",
@@ -4893,7 +4936,7 @@ def _publish_container_capability_proof(paths: RuntimePaths, context, proof) -> 
 
 
 def _probe_container_recovery_capabilities(paths: RuntimePaths, context, *, cli, timeout):
-    """Pure native introspection precedes every first v3 native mutation.
+    """Pure native introspection precedes every first v3/v4 native mutation.
 
     This gate qualifies the newly built executable inside the backend. It is
     deliberately not evidence about the earlier host container-removal step.
@@ -4912,7 +4955,7 @@ def _probe_container_recovery_capabilities(paths: RuntimePaths, context, *, cli,
         capability = _run_cli(paths, ("runtime", "service-container-recovery-capabilities"),
                               timeout=min(timeout, 30.0), cli=cli, raw_output=raw_output)
     except RuntimeServiceError as error:
-        _fail("native container recovery v3 capabilities are unavailable; no mutator was invoked: " + str(error))
+        _fail("native container recovery capabilities are unavailable; no mutator was invoked: " + str(error))
     if _container_recovery_binary_sha(paths, cli) != binary_sha:
         _fail("native container recovery binary changed during capability probe")
     if _read_stable_container_recovery_file(paths.provenance, "native package provenance", MAX_JSON_BYTES) != provenance_raw:
@@ -5078,7 +5121,10 @@ def recover_container_namespace(
         context["attestation_sha256"],
     )
     capability = None
-    if request.get("schema_version") == CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA:
+    if request.get("schema_version") in {
+        CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA,
+        CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA,
+    }:
         capability = _probe_container_recovery_capabilities(paths, context, cli=cli, timeout=timeout)
     result = _run_container_recovery_cli(
         paths,

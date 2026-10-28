@@ -1,6 +1,9 @@
 """Publication fencing for read-only abrupt-stop preparation."""
 import contextlib
 import copy
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -79,6 +82,44 @@ class PreparationTests(unittest.TestCase):
             module.prepare(self.control, self.pins, {}, publish=True)
         self.assertEqual(self.control.records, {})
         self.assertFalse(self.control.leased)
+
+    def test_v4_forwards_paired_terminal_and_held_pins_without_new_operator_fields(self):
+        terminal=[]
+        held=[{'run_id':'held-run','run_intent_sha256':'a'*64,'run_catalog_sha256':'b'*64,'start_release':'absent'}]
+        result=module.prepare(self.control,self.pins,{},retained_terminal_runs=terminal,
+                              retained_held_manual_runs=held,publish=True)
+        self.assertEqual(result['state'],'prepared-awaiting-explicit-start')
+        self.assertEqual(self.builder.call_count,2)
+        for call in self.builder.call_args_list:
+            self.assertEqual(call.kwargs['retained_terminal_runs'],terminal)
+            self.assertEqual(call.kwargs['retained_held_manual_runs'],held)
+        operator=json.loads(self.control.records[result['operator_authorization_path']])
+        self.assertEqual(operator['schema_version'],'fullmag.docker-container-recovery-operator-authorization.v2')
+        self.assertNotIn('retained_terminal_runs',operator)
+        self.assertNotIn('retained_held_manual_runs',operator)
+
+    def test_v4_held_input_requires_explicit_terminal_array_even_when_empty(self):
+        held=[{'run_id':'held-run','run_intent_sha256':'a'*64,'run_catalog_sha256':'b'*64,'start_release':'absent'}]
+        with self.assertRaisesRegex(BuildControlError,'retained-terminal-runs'):
+            module.prepare(self.control,self.pins,{},retained_held_manual_runs=held)
+        self.assertEqual(self.builder.call_count,0)
+
+    def test_cli_pin_inputs_require_and_read_the_v4_pair_as_arrays(self):
+        with tempfile.TemporaryDirectory() as directory:
+            terminal=Path(directory)/'terminal.json'; held=Path(directory)/'held.json'
+            terminal.write_text('[]')
+            held.write_text('[{"run_id":"held-run","start_release":"absent"}]')
+            class Host:
+                def read_owned_regular(self,path,maximum):
+                    if Path(path).stat().st_size>maximum: raise AssertionError('input exceeded bounded reader limit')
+                    return Path(path).read_bytes()
+            host=Host()
+            with patch('docker_volume_dev._session_host',return_value=host):
+                self.assertEqual(module._read_retained_run_inputs(terminal,held),
+                                 ([],[{'run_id':'held-run','start_release':'absent'}]))
+                self.assertEqual(module._read_retained_run_inputs(terminal,None),([],None))
+                with self.assertRaisesRegex(BuildControlError,'requires --retained-terminal-runs'):
+                    module._read_retained_run_inputs(None,held)
 
     def test_same_request_cannot_replace_archived_proof(self):
         preview = module.prepare(self.control, self.pins, {})

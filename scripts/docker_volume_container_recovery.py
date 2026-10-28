@@ -43,7 +43,9 @@ OPERATOR_AUTHORIZATION_SCHEMA = (
 )
 ABRUPT_OPERATOR_SCHEMA = "fullmag.docker-container-recovery-operator-authorization.v2"
 ABRUPT_PROOF_SCHEMA = "fullmag.docker-abrupt-stop-proof.v1"
+ABRUPT_PROOF_HELD_MANUAL_SCHEMA = "fullmag.docker-abrupt-stop-proof.v2"
 TERMINAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v3"
+HELD_MANUAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v4"
 AUTHORIZATION_SCHEMA = "fullmag.docker-container-recovery-authorization.v1"
 REQUEST_SCHEMA = "runtime_service_container_recovery_request.v1"
 RETAINED_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v2"
@@ -340,6 +342,49 @@ def _validate_container_pins(pins: Sequence[object]) -> list[dict[str, object]]:
 
 def expected_recovery_outcome(request: Mapping[str, object]) -> str:
     """Bind receipt semantics to the explicit request version, never its outcome alone."""
+    if request.get("schema_version") == HELD_MANUAL_REQUEST_SCHEMA:
+        if "retained_cancelled_runs" in request:
+            _fail("v4 recovery cannot carry cancelled-run pins")
+        terminal_pins = request.get("retained_terminal_runs")
+        held_pins = request.get("retained_held_manual_runs")
+        if not isinstance(terminal_pins, list) or not 0 <= len(terminal_pins) <= 128:
+            _fail("v4 recovery requires 0..128 retained terminal run pins")
+        if not isinstance(held_pins, list) or not 1 <= len(held_pins) <= 128:
+            _fail("v4 recovery requires 1..128 retained held-manual run pins")
+        if len(terminal_pins) + len(held_pins) > 128:
+            _fail("v4 recovery retained run pins exceed the combined limit")
+        seen = set()
+        for pin in terminal_pins:
+            if not isinstance(pin, Mapping) or set(pin) != {
+                "run_id", "run_intent_sha256", "run_catalog_sha256", "artifact_catalog_sha256"}:
+                _fail("invalid v4 retained terminal run pin")
+            run_id = _require_text(pin.get("run_id"), "retained terminal run id", 128)
+            if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", run_id) or run_id.endswith("."):
+                _fail("unsafe retained terminal run id")
+            if run_id in seen:
+                _fail("duplicate v4 retained run pin")
+            seen.add(run_id)
+            for key in ("run_intent_sha256", "run_catalog_sha256"):
+                _require_sha(pin.get(key), key)
+            if pin["artifact_catalog_sha256"] is not None:
+                _require_sha(pin["artifact_catalog_sha256"], "artifact_catalog_sha256")
+        for pin in held_pins:
+            if not isinstance(pin, Mapping) or set(pin) != {
+                "run_id", "run_intent_sha256", "run_catalog_sha256", "start_release"}:
+                _fail("invalid retained held-manual run pin")
+            run_id = _require_text(pin.get("run_id"), "retained held-manual run id", 128)
+            if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", run_id) or run_id.endswith("."):
+                _fail("unsafe retained held-manual run id")
+            if run_id in seen:
+                _fail("duplicate v4 retained run pin")
+            seen.add(run_id)
+            for key in ("run_intent_sha256", "run_catalog_sha256"):
+                _require_sha(pin.get(key), key)
+            if pin.get("start_release") != "absent":
+                _fail("held-manual run must pin start_release as absent")
+        return "retained_manual_held_runs_recovered"
+    if "retained_held_manual_runs" in request and request.get("schema_version") != HELD_MANUAL_REQUEST_SCHEMA:
+        _fail("held-manual run pins require v4 recovery")
     if request.get("schema_version") == TERMINAL_REQUEST_SCHEMA:
         if request.get("retained_cancelled_runs") is not None:
             _fail("v3 recovery cannot carry cancelled-only pins")
@@ -364,6 +409,8 @@ def expected_recovery_outcome(request: Mapping[str, object]) -> str:
         return "retained_terminal_runs_recovered"
     if request.get("retained_terminal_runs") is not None:
         _fail("terminal run pins require v3 recovery")
+    if "retained_held_manual_runs" in request:
+        _fail("held-manual run pins require v4 recovery")
     if request.get("schema_version") == REQUEST_SCHEMA:
         if request.get("retained_cancelled_runs") is not None:
             _fail("v1 recovery cannot retain cancelled runs")
@@ -427,10 +474,21 @@ def validate_attestation(
     attestation = _require_mapping(value, "Docker namespace teardown attestation")
     if attestation.get("schema_version") == ABSENCE_ATTESTATION_SCHEMA:
         if (
-            request.get("schema_version") != RETAINED_REQUEST_SCHEMA
-            or not isinstance(request.get("retained_cancelled_runs"), list)
+            not (
+                request.get("schema_version") == RETAINED_REQUEST_SCHEMA
+                and isinstance(request.get("retained_cancelled_runs"), list)
+            )
+            and not (
+                request.get("schema_version") == TERMINAL_REQUEST_SCHEMA
+                and isinstance(request.get("retained_terminal_runs"), list)
+            )
+            and not (
+                request.get("schema_version") == HELD_MANUAL_REQUEST_SCHEMA
+                and isinstance(request.get("retained_terminal_runs"), list)
+                and isinstance(request.get("retained_held_manual_runs"), list)
+            )
         ):
-            _fail("Docker namespace absence proof requires a retained-run v2 request")
+            _fail("Docker namespace absence proof requires a retained-run v2/v3/v4 request")
         if set(attestation) != {
             "schema_version", "request_sha256", "docker_engine_id_sha256",
             "containers", "device_release", "manifest_sha256", "result",
@@ -767,14 +825,19 @@ def _build_request(
     containers: Sequence[Mapping[str, object]],
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
     retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_held_manual_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     device = _require_mapping(device_release, "device release")
     _require_text(device.get("resource_id"), "device release resource_id", 255)
     _require_sha(device.get("mapping_sha256"), "device release mapping_sha256")
     if device.get("mapping_detached") is not True:
         _fail("device release mapping is not detached")
+    if retained_held_manual_runs is not None and retained_terminal_runs is None:
+        _fail("v4 held-manual runs require the paired terminal run list")
+    if retained_held_manual_runs is not None and retained_cancelled_runs is not None:
+        _fail("v4 recovery cannot mix held-manual and cancelled run pins")
     request = {
-        "schema_version": TERMINAL_REQUEST_SCHEMA if retained_terminal_runs is not None else (RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA),
+        "schema_version": HELD_MANUAL_REQUEST_SCHEMA if retained_held_manual_runs is not None else (TERMINAL_REQUEST_SCHEMA if retained_terminal_runs is not None else (RETAINED_REQUEST_SCHEMA if retained_cancelled_runs is not None else REQUEST_SCHEMA)),
         "request_id": authorization["request_id"],
         "config_sha256": config_sha256,
         "owner_sha256": owner_sha256,
@@ -793,6 +856,8 @@ def _build_request(
         "containers": [dict(item) for item in containers],
         **({"retained_terminal_runs": [dict(item) for item in retained_terminal_runs]}
            if retained_terminal_runs is not None else {}),
+        **({"retained_held_manual_runs": [dict(item) for item in retained_held_manual_runs]}
+           if retained_held_manual_runs is not None else {}),
         **(
             {"retained_cancelled_runs": [dict(item) for item in retained_cancelled_runs]}
             if retained_cancelled_runs is not None
@@ -916,14 +981,28 @@ def _ledger_and_store_snapshot(
     compose=None,
     retained_cancelled_runs: Sequence[Mapping[str, object]] | None = None,
     retained_terminal_runs: Sequence[Mapping[str, object]] | None = None,
+    retained_held_manual_runs: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """Read the exact accepted store and shared ledger through an isolated helper."""
 
+    if retained_held_manual_runs is not None and (
+        retained_terminal_runs is None or retained_cancelled_runs is not None
+    ):
+        _fail("v4 held-manual pins require terminal pins and cannot mix cancelled pins")
     if retained_terminal_runs is not None and retained_cancelled_runs is not None:
         _fail("cannot mix terminal and cancelled-only retained run pins")
+    v4_mode = retained_held_manual_runs is not None
     terminal_mode = retained_terminal_runs is not None
     retained_pins = [dict(pin) for pin in retained_terminal_runs] if terminal_mode else None
-    if terminal_mode:
+    held_pins = [dict(pin) for pin in retained_held_manual_runs] if v4_mode else None
+    if v4_mode:
+        expected_recovery_outcome({
+            "schema_version": HELD_MANUAL_REQUEST_SCHEMA,
+            "retained_terminal_runs": retained_pins,
+            "retained_held_manual_runs": held_pins,
+        })
+        retained_pins = retained_pins + held_pins
+    elif terminal_mode:
         expected_recovery_outcome({"schema_version": TERMINAL_REQUEST_SCHEMA,
                                    "retained_terminal_runs": retained_pins})
     if retained_cancelled_runs is not None:
@@ -947,8 +1026,45 @@ def _ledger_and_store_snapshot(
         if not state_source.startswith("/") or ".." in PurePosixPath(state_source).parts:
             _fail("canonical state mount is not an absolute host path")
     ledger_mount, ledger_descriptor = _ledger_snapshot_mount(control, backend, compose)
-    script = r'''import fcntl, hashlib, json, os, pathlib, time
+    script = r'''import fcntl, hashlib, json, os, pathlib, stat, time
 MAX_ENTRIES=8192
+MAX_CAS_OBJECT_BYTES=128*1024*1024
+CAS_READ_CHUNK_BYTES=1024*1024
+
+def cas_identity(metadata):
+    return (metadata.st_dev,metadata.st_ino,stat.S_IFMT(metadata.st_mode),metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns)
+
+def hash_cas_object(path, expected, remaining_budget):
+    path=os.fspath(path)
+    maximum=min(MAX_CAS_OBJECT_BYTES,remaining_budget)
+    flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+    fd=os.open(path,flags)
+    try:
+        before=os.fstat(fd)
+        named_before=os.lstat(path)
+        identity=cas_identity(before)
+        if (not stat.S_ISREG(before.st_mode) or not stat.S_ISREG(named_before.st_mode)
+                or identity!=cas_identity(named_before) or before.st_size<0 or before.st_size>maximum):
+            raise RuntimeError('retained input CAS object exceeds its size/aggregate bound or changed before read')
+        digest=hashlib.sha256()
+        count=0
+        while True:
+            chunk=os.read(fd,CAS_READ_CHUNK_BYTES)
+            if not chunk: break
+            count+=len(chunk)
+            if count>maximum or count>before.st_size:
+                raise RuntimeError('retained input CAS object exceeds its size/aggregate bound or changed while reading')
+            digest.update(chunk)
+        after=os.fstat(fd)
+        named_after=os.lstat(path)
+        if (identity!=cas_identity(after) or identity!=cas_identity(named_after)
+                or count!=before.st_size):
+            raise RuntimeError('retained input CAS object metadata changed while reading')
+        if digest.hexdigest()!=expected:
+            raise RuntimeError('retained input CAS object bytes differ')
+        return count
+    finally:
+        os.close(fd)
 def regular(path, label, maximum=8*1024*1024):
     path=pathlib.Path(path)
     if not path.is_absolute() or '..' in path.parts or path.is_symlink() or not path.is_file(): raise RuntimeError(label+' is not a regular file')
@@ -986,7 +1102,7 @@ for entry in os.scandir(runs):
     if entry.is_symlink() or not entry.is_dir(follow_symlinks=False): raise RuntimeError('accepted store runs has an invalid entry')
     run_dirs.append(entry.name)
     if len(run_dirs)>MAX_ENTRIES: raise RuntimeError('accepted store inventory is unbounded')
-records={}; count=0
+records={}; run_file_paths={}; count=0
 for current, directories, files in os.walk(store, topdown=True, followlinks=False):
     current_path=pathlib.Path(current)
     if any((current_path/name).is_symlink() for name in directories): raise RuntimeError('accepted store contains a symlink')
@@ -995,11 +1111,54 @@ for current, directories, files in os.walk(store, topdown=True, followlinks=Fals
         if count>MAX_ENTRIES: raise RuntimeError('accepted store inventory is unbounded')
         path=current_path/name
         if path.is_symlink() or not path.is_file(): raise RuntimeError('accepted store contains an invalid file')
+        if path.is_relative_to(runs): run_file_paths[path.relative_to(runs).as_posix()]=path
         if name in ({'run_intent.json','run_catalog.json','artifact_catalog.json'} if observation.get('terminal_mode') else {'run_intent.json','run_catalog.json'}):
             relative=path.relative_to(store).as_posix()
             records[relative]=hashlib.sha256(regular(path,'retained run record')).hexdigest()
 pins=observation.get('retained_cancelled_runs')
-if pins is None:
+v4=observation.get('v4_mode') is True
+terminal_expected={}
+held_expected={}
+if v4:
+    terminal_pins=observation.get('retained_terminal_runs')
+    held_pins=observation.get('retained_held_manual_runs')
+    if not isinstance(terminal_pins,list) or not 0<=len(terminal_pins)<=128 or not isinstance(held_pins,list) or not 1<=len(held_pins)<=128 or len(terminal_pins)+len(held_pins)>128 or pins is not None:
+        raise RuntimeError('v4 retained run pin pair is invalid or unbounded')
+    expected={}
+    for pin in terminal_pins:
+        if not isinstance(pin,dict) or set(pin)!={'run_id','run_intent_sha256','run_catalog_sha256','artifact_catalog_sha256'}:
+            raise RuntimeError('v4 terminal pin has an invalid shape')
+        run_id=pin.get('run_id')
+        if not isinstance(run_id,str) or not run_id or '/' in run_id or '..' in run_id:
+            raise RuntimeError('v4 terminal run id is invalid')
+        for key in ('run_intent_sha256','run_catalog_sha256'):
+            value=pin.get(key)
+            if not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value): raise RuntimeError('v4 terminal digest is invalid')
+        if pin['artifact_catalog_sha256'] is not None and (not isinstance(pin['artifact_catalog_sha256'],str) or len(pin['artifact_catalog_sha256'])!=64 or any(c not in '0123456789abcdef' for c in pin['artifact_catalog_sha256'])): raise RuntimeError('v4 artifact catalog digest is invalid')
+        if run_id in expected: raise RuntimeError('v4 retained run id is repeated')
+        expected[run_id]=pin; terminal_expected[run_id]=pin
+    for pin in held_pins:
+        if not isinstance(pin,dict) or set(pin)!={'run_id','run_intent_sha256','run_catalog_sha256','start_release'} or pin.get('start_release')!='absent':
+            raise RuntimeError('held-manual pin has an invalid shape or release expectation')
+        run_id=pin.get('run_id')
+        if not isinstance(run_id,str) or not run_id or '/' in run_id or '..' in run_id:
+            raise RuntimeError('held-manual run id is invalid')
+        for key in ('run_intent_sha256','run_catalog_sha256'):
+            value=pin.get(key)
+            if not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value): raise RuntimeError('held-manual digest is invalid')
+        if run_id in expected: raise RuntimeError('v4 retained run id is repeated')
+        expected[run_id]=pin; held_expected[run_id]=pin
+    if set(run_dirs)!=set(expected): raise RuntimeError('v4 retained run pins do not exactly match run directories')
+    expected_records={}
+    for run_id,pin in expected.items():
+        expected_records['runs/'+run_id+'/run_intent.json']=pin['run_intent_sha256']
+        expected_records['runs/'+run_id+'/run_catalog.json']=pin['run_catalog_sha256']
+        if run_id in terminal_expected and pin['artifact_catalog_sha256'] is not None:
+            expected_records['runs/'+run_id+'/artifact_catalog.json']=pin['artifact_catalog_sha256']
+    if set(records)!=set(expected_records): raise RuntimeError('v4 accepted-store record inventory differs from retained pins')
+    if records!=expected_records: raise RuntimeError('v4 accepted-store record bytes differ from retained pins')
+    run_records=[dict(pin) for run_id,pin in sorted(expected.items())]
+elif pins is None:
     if records: raise RuntimeError('accepted store contains admitted run records')
     run_records=[]
 else:
@@ -1024,78 +1183,295 @@ else:
     if set(records)!=set(expected_records): raise RuntimeError('accepted store run-record inventory differs from retained pins')
     if records!=expected_records: raise RuntimeError('accepted store run-record bytes differ from retained pins')
     run_records=[dict(pin) for run_id,pin in sorted(expected.items())]
-    if observation.get('terminal_mode'):
-        for folder in ('manifests','live_command_journals','recovery','temp','batches'):
-            root=store/folder
+if observation.get('terminal_mode') or v4:
+    for folder in ('manifests','live_command_journals','recovery','temp','batches'):
+        root=store/folder
+        if root.exists():
+            if root.is_symlink() or not root.is_dir() or any(root.iterdir()): raise RuntimeError('pending or unknown runtime work: '+folder)
+    scheduler=store/'scheduler_pools'
+    if scheduler.exists():
+        if scheduler.is_symlink() or not scheduler.is_dir(): raise RuntimeError('invalid scheduler namespace')
+        for path in scheduler.iterdir():
+            checkpoint=json.loads(regular(path,'scheduler checkpoint'))
+            if any(run_id not in expected for run_id in checkpoint.get('run_ids',[])) or (checkpoint.get('next_run_id') is not None and checkpoint['next_run_id'] not in expected): raise RuntimeError('scheduler references unknown work')
+    referenced=set()
+    terminal_subset=terminal_expected if v4 else expected
+    for run_id,pin in terminal_subset.items():
+        intent=json.loads(regular(runs/run_id/'run_intent.json','run intent'))
+        refs=[intent.get(key) for key in ('definition_object_ref','study_object_ref','study_catalog_object_ref')]
+        assets=intent.get('asset_object_refs',{})
+        if not isinstance(assets,dict): raise RuntimeError('retained input asset refs are invalid')
+        refs.extend(assets.values())
+        for ref in refs:
+            if ref is None: continue
+            if not isinstance(ref,str) or len(ref)!=64 or any(c not in '0123456789abcdef' for c in ref): raise RuntimeError('retained input CAS ref is invalid')
+            referenced.add(ref)
+        catalog=json.loads(regular(runs/run_id/'run_catalog.json','run catalog'))
+        tasks=catalog.get('tasks')
+        if not isinstance(tasks,list) or not tasks: raise RuntimeError('terminal run has no tasks')
+        if any(not isinstance(t,dict) or t.get('lifecycle') not in ('succeeded','failed','cancelled') for t in tasks): raise RuntimeError('run contains nonterminal tasks')
+        if pin['artifact_catalog_sha256'] is None and any(t.get('artifact_ids') for t in tasks): raise RuntimeError('terminal run outputs have no artifact catalog')
+        task_by_id={t.get('task_id'):t for t in tasks if isinstance(t.get('task_id'),str)}
+        if len(task_by_id)!=len(tasks): raise RuntimeError('terminal task identity inventory is invalid')
+        def current_attempt(record,label):
+            task=task_by_id.get(record.get('task_id'))
+            attempt=record.get('attempt_id')
+            if (task is None or not isinstance(attempt,str) or not attempt
+                    or task.get('attempt_id')!=attempt or record.get('run_id',run_id)!=run_id
+                    or record.get('ownership_epoch')!=task.get('ownership_epoch')):
+                raise RuntimeError('unsupported historical retry: '+label+' differs from current terminal catalog attempt')
+            return task
+        solver_leases={}
+        for folder in ('resource_leases','preparation_resource_leases'):
+            root=runs/run_id/folder
             if root.exists():
-                if root.is_symlink() or not root.is_dir() or any(root.iterdir()): raise RuntimeError('pending or unknown runtime work: '+folder)
-        scheduler=store/'scheduler_pools'
-        if scheduler.exists():
-            if scheduler.is_symlink() or not scheduler.is_dir(): raise RuntimeError('invalid scheduler namespace')
-            for path in scheduler.iterdir():
-                checkpoint=json.loads(regular(path,'scheduler checkpoint'))
-                if any(run_id not in expected for run_id in checkpoint.get('run_ids',[])) or (checkpoint.get('next_run_id') is not None and checkpoint['next_run_id'] not in expected): raise RuntimeError('scheduler references unknown work')
-        referenced=set()
-        for run_id,pin in expected.items():
-            intent=json.loads(regular(runs/run_id/'run_intent.json','run intent'))
+                if root.is_symlink() or not root.is_dir(): raise RuntimeError('invalid local lease directory')
+                for path in root.rglob('*'):
+                    if path.is_symlink(): raise RuntimeError('local lease symlink')
+                    if path.is_file():
+                        lease=json.loads(regular(path,'local lease'))
+                        if lease.get('state')!='released': raise RuntimeError('active or unknown local lease')
+                        if folder=='resource_leases':
+                            if lease.get('run_id')!=run_id: raise RuntimeError('retained solver lease belongs to another run')
+                            task=current_attempt(lease,'retained solver lease')
+                            epoch=lease.get('ownership_epoch')
+                            attempt=lease.get('attempt_id')
+                            resource=lease.get('resource_id')
+                            if (type(epoch) is not int or epoch<=0 or not isinstance(attempt,str) or not attempt
+                                    or not isinstance(resource,str) or not resource
+                                    or resource!=task.get('resource_id')):
+                                raise RuntimeError('retained solver lease has an invalid task resource identity')
+                            key=(task['task_id'],attempt,epoch,resource)
+                            if key in solver_leases: raise RuntimeError('duplicate retained solver lease identity')
+                            solver_leases[key]=lease
+        admissions=runs/run_id/'task_admissions'
+        if admissions.exists():
+            if admissions.is_symlink() or not admissions.is_dir(): raise RuntimeError('invalid task admission directory')
+            for path in admissions.rglob('*'):
+                if path.is_symlink(): raise RuntimeError('task admission symlink')
+                if path.is_file():
+                    admission=json.loads(regular(path,'retained task admission'))
+                    task=admission.get('task'); lease=admission.get('lease')
+                    if not isinstance(task,dict) or not isinstance(lease,dict): raise RuntimeError('retained task admission has no task and lease')
+                    current_attempt(task,'retained task admission task')
+                    current_attempt(lease,'retained task admission lease')
+                    parts=path.relative_to(admissions).parts
+                    if len(parts)!=2 or parts[0]!=task.get('task_id') or parts[1]!=task.get('attempt_id')+'.json': raise RuntimeError('unsupported historical retry: retained task admission path differs from current terminal attempt')
+        artifact_path=runs/run_id/'artifact_catalog.json'
+        artifact_sha=pin.get('artifact_catalog_sha256')
+        if artifact_sha is None:
+            if any(task.get('artifact_ids') for task in tasks):
+                raise RuntimeError('terminal run outputs have no artifact catalog')
+        else:
+            artifact_raw=regular(artifact_path,'retained artifact catalog')
+            if hashlib.sha256(artifact_raw).hexdigest()!=artifact_sha:
+                raise RuntimeError('retained artifact catalog bytes differ from its pin')
+            def unique_object(pairs):
+                value={}
+                for key,item in pairs:
+                    if key in value: raise RuntimeError('retained artifact catalog contains a duplicate JSON key')
+                    value[key]=item
+                return value
+            artifact_catalog=json.loads(artifact_raw.decode(),object_pairs_hook=unique_object)
+            entries=artifact_catalog.get('entries') if isinstance(artifact_catalog,dict) else None
+            if (not isinstance(artifact_catalog,dict)
+                    or set(artifact_catalog)!={'schema_version','run_id','revision','updated_at','entries'}
+                    or artifact_catalog.get('schema_version')!='artifact_catalog.v1'
+                    or artifact_catalog.get('run_id')!=run_id
+                    or type(artifact_catalog.get('revision')) is not int or artifact_catalog['revision']<=0
+                    or not isinstance(artifact_catalog.get('updated_at'),str) or not artifact_catalog['updated_at']
+                    or not isinstance(entries,list) or len(entries)>MAX_ENTRIES):
+                raise RuntimeError('retained artifact catalog identity/inventory is invalid')
+            artifact_ids_by_task={}
+            seen_artifacts=set()
+            for entry in entries:
+                required_fields={'artifact_id','task_id','attempt_id','ownership_epoch','logical_path','artifact_type','content_sha256','status','required'}
+                if (not isinstance(entry,dict) or not required_fields.issubset(entry)
+                        or set(entry)-required_fields-{'object_ref','study_output'}):
+                    raise RuntimeError('retained artifact entry has an invalid shape')
+                task_id=entry.get('task_id')
+                task=task_by_id.get(task_id)
+                if task is None:
+                    raise RuntimeError('retained artifact refers to an unlisted task')
+                attempt=task.get('attempt_id')
+                epoch=task.get('ownership_epoch')
+                resource=task.get('resource_id')
+                if (not isinstance(attempt,str) or not attempt or type(epoch) is not int or epoch<=0
+                        or not isinstance(resource,str) or not resource
+                        or entry.get('attempt_id')!=attempt or type(entry.get('ownership_epoch')) is not int
+                        or entry['ownership_epoch']!=epoch):
+                    raise RuntimeError('retained artifact differs from its task attempt/epoch/resource')
+                if (task_id,attempt,epoch,resource) not in solver_leases:
+                    raise RuntimeError('retained artifact has no matching released task lease')
+                artifact_id=entry.get('artifact_id')
+                content_sha=entry.get('content_sha256')
+                if (not isinstance(artifact_id,str) or not artifact_id or artifact_id in seen_artifacts
+                        or not isinstance(content_sha,str) or len(content_sha)!=64
+                        or any(c not in '0123456789abcdef' for c in content_sha)
+                        or type(entry.get('required')) is not bool):
+                    raise RuntimeError('retained artifact identity/content metadata is invalid')
+                seen_artifacts.add(artifact_id)
+                object_ref=entry.get('object_ref')
+                if entry.get('status')=='published':
+                    if not isinstance(object_ref,str) or len(object_ref)!=64 or any(c not in '0123456789abcdef' for c in object_ref) or object_ref!=content_sha:
+                        raise RuntimeError('published retained artifact has no matching CAS object reference')
+                    referenced.add(object_ref)
+                elif entry.get('status') in {'unavailable','failed'}:
+                    if object_ref is not None:
+                        raise RuntimeError('unpublished retained artifact unexpectedly references CAS content')
+                else:
+                    raise RuntimeError('retained artifact status is unsupported')
+                artifact_ids_by_task.setdefault(task_id,set()).add(artifact_id)
+            for task_id,task in task_by_id.items():
+                declared=task.get('artifact_ids',[])
+                if not isinstance(declared,list) or len(set(declared))!=len(declared) or set(declared)!=artifact_ids_by_task.get(task_id,set()):
+                    raise RuntimeError('terminal task artifact references differ from its pinned catalog')
+    if v4:
+        allowed_exact={'run_intent.json','run_catalog.json','preparation_receipt.json'}
+        allowed_dirs={'preparation_resource_leases','preparation_process_launches','preparation_process_exit_receipts','task_preparation_receipts','accepted_stage_preparation_receipts','task_prepared_observations'}
+        for run_id,pin in held_expected.items():
+            run_root=runs/run_id
+            release=run_root/'start_release.json'
+            if os.path.lexists(str(release)):
+                raise RuntimeError('held-manual run already has start_release.json')
+            intent=json.loads(regular(run_root/'run_intent.json','held-manual run intent'))
+            if intent.get('schema_version')!='run_intent.v1' or intent.get('run_id')!=run_id or not isinstance(intent.get('specification'),dict):
+                raise RuntimeError('held-manual run intent identity differs')
+            specification=intent.get('specification')
+            parameters=specification.get('parameters')
+            policy=parameters.get('fullmag.accepted_run_start') if isinstance(parameters,dict) else None
+            if policy!={'schema_version':'accepted_run_start_policy.v1','mode':'manual'}:
+                raise RuntimeError('held-manual run has no exact accepted manual-start policy')
             refs=[intent.get(key) for key in ('definition_object_ref','study_object_ref','study_catalog_object_ref')]
             assets=intent.get('asset_object_refs',{})
-            if not isinstance(assets,dict): raise RuntimeError('retained input asset refs are invalid')
+            if not isinstance(assets,dict):
+                raise RuntimeError('held-manual input asset refs are invalid')
             refs.extend(assets.values())
             for ref in refs:
                 if ref is None: continue
-                if not isinstance(ref,str) or len(ref)!=64 or any(c not in '0123456789abcdef' for c in ref): raise RuntimeError('retained input CAS ref is invalid')
+                if not isinstance(ref,str) or len(ref)!=64 or any(c not in '0123456789abcdef' for c in ref):
+                    raise RuntimeError('held-manual input CAS ref is invalid')
                 referenced.add(ref)
-            catalog=json.loads(regular(runs/run_id/'run_catalog.json','run catalog'))
+            catalog=json.loads(regular(run_root/'run_catalog.json','held-manual run catalog'))
             tasks=catalog.get('tasks')
-            if not isinstance(tasks,list) or not tasks: raise RuntimeError('terminal run has no tasks')
-            if any(not isinstance(t,dict) or t.get('lifecycle') not in ('succeeded','failed','cancelled') for t in tasks): raise RuntimeError('run contains nonterminal tasks')
-            if pin['artifact_catalog_sha256'] is None and any(t.get('artifact_ids') for t in tasks): raise RuntimeError('terminal run outputs have no artifact catalog')
-            task_by_id={t.get('task_id'):t for t in tasks if isinstance(t.get('task_id'),str)}
-            if len(task_by_id)!=len(tasks): raise RuntimeError('terminal task identity inventory is invalid')
-            def current_attempt(record,label):
-                task=task_by_id.get(record.get('task_id'))
-                attempt=record.get('attempt_id')
-                if (task is None or not isinstance(attempt,str) or not attempt
-                        or task.get('attempt_id')!=attempt or record.get('run_id',run_id)!=run_id
-                        or record.get('ownership_epoch')!=task.get('ownership_epoch')):
-                    raise RuntimeError('unsupported historical retry: '+label+' differs from current terminal catalog attempt')
-                return task
-            for folder in ('resource_leases','preparation_resource_leases'):
-                root=runs/run_id/folder
-                if root.exists():
-                    if root.is_symlink() or not root.is_dir(): raise RuntimeError('invalid local lease directory')
-                    for path in root.rglob('*'):
-                        if path.is_symlink(): raise RuntimeError('local lease symlink')
-                        if path.is_file():
-                            lease=json.loads(regular(path,'local lease'))
-                            if lease.get('state')!='released': raise RuntimeError('active or unknown local lease')
-                            if folder=='resource_leases': current_attempt(lease,'retained solver lease')
-            admissions=runs/run_id/'task_admissions'
-            if admissions.exists():
-                if admissions.is_symlink() or not admissions.is_dir(): raise RuntimeError('invalid task admission directory')
-                for path in admissions.rglob('*'):
-                    if path.is_symlink(): raise RuntimeError('task admission symlink')
-                    if path.is_file():
-                        admission=json.loads(regular(path,'retained task admission'))
-                        task=admission.get('task'); lease=admission.get('lease')
-                        if not isinstance(task,dict) or not isinstance(lease,dict): raise RuntimeError('retained task admission has no task and lease')
-                        current_attempt(task,'retained task admission task')
-                        current_attempt(lease,'retained task admission lease')
-                        parts=path.relative_to(admissions).parts
-                        if len(parts)!=2 or parts[0]!=task.get('task_id') or parts[1]!=task.get('attempt_id')+'.json': raise RuntimeError('unsupported historical retry: retained task admission path differs from current terminal attempt')
-        pin_root=store/'objects/pins'
-        if pin_root.is_symlink() or not pin_root.is_dir(): raise RuntimeError('retained input CAS pins directory is missing')
-        for path in pin_root.iterdir():
-            pin=json.loads(regular(path,'retained input CAS pin',4096))
-            ref=path.name.removesuffix('.json')
-            if path.suffix!='.json' or set(pin)!={'schema','object_ref'} or pin['schema']!='fullmag.cas-pin.v1' or pin['object_ref']!=ref or ref not in referenced: raise RuntimeError('retained input CAS pin is not referenced by the retained intents')
-        total=0
-        for ref in sorted(referenced):
-            raw=regular(store/'objects/sha256'/ref,'retained input CAS object',128*1024*1024)
-            total+=len(raw)
-            if total>128*1024*1024: raise RuntimeError('retained input CAS budget exceeded')
-            if hashlib.sha256(raw).hexdigest()!=ref: raise RuntimeError('retained input CAS object bytes differ')
+            revision=catalog.get('revision')
+            if (catalog.get('schema_version')!='run_catalog.v1' or catalog.get('run_id')!=run_id
+                    or type(revision) is not int or revision<=0
+                    or not isinstance(tasks,list) or not tasks or len(tasks)>1024):
+                raise RuntimeError('held-manual run catalog identity/task inventory is invalid')
+            task_ids=set()
+            for task in tasks:
+                task_fields={'task_id','input_fingerprint','lifecycle','readiness','artifact_ids','attempt_id','ownership_epoch','resolved_input_fingerprint','observation','resource_id','coordinator_watermark','coordinator_genesis'}
+                if not isinstance(task,dict) or set(task)-task_fields or task.get('lifecycle')!='accepted':
+                    raise RuntimeError('held-manual run contains an invalid or non-Accepted task')
+                fingerprint=task.get('input_fingerprint')
+                if not isinstance(fingerprint,str) or len(fingerprint)!=64 or any(c not in '0123456789abcdef' for c in fingerprint):
+                    raise RuntimeError('held-manual task input fingerprint is invalid')
+                readiness=task.get('readiness')
+                if not isinstance(readiness,dict) or set(readiness)!={'state','reason'} or readiness.get('state')!='blocked' or not isinstance(readiness.get('reason'),str) or not readiness['reason'].strip():
+                    raise RuntimeError('held-manual task is not explicitly Blocked')
+                if any(task.get(key) is not None for key in ('attempt_id','ownership_epoch','resolved_input_fingerprint','resource_id','coordinator_watermark','coordinator_genesis','observation')) or task.get('artifact_ids',[])!=[]:
+                    raise RuntimeError('held-manual task has compute claims or artifact outputs')
+                task_id=task.get('task_id')
+                if not isinstance(task_id,str) or not task_id or task_id in task_ids:
+                    raise RuntimeError('held-manual task identity is invalid')
+                task_ids.add(task_id)
+            prefix=run_id+'/'
+            local_evidence={}
+            preparation={}
+            for relative,path in run_file_paths.items():
+                if not relative.startswith(prefix): continue
+                suffix=relative[len(prefix):]
+                parts=suffix.split('/')
+                valid=(suffix in allowed_exact
+                       or (len(parts)==2 and parts[0] in allowed_dirs-{'preparation_resource_leases'} and parts[1].endswith('.json'))
+                       or (len(parts)==3 and parts[0]=='preparation_resource_leases' and parts[2].endswith('.json')))
+                if not valid:
+                    raise RuntimeError('held-manual recovery rejects compute/cancellation/unknown evidence: '+suffix)
+                raw=regular(path,'held-manual evidence')
+                local_evidence[relative]=hashlib.sha256(raw).hexdigest()
+                if suffix not in {'run_intent.json','run_catalog.json'}:
+                    try: item=json.loads(raw.decode())
+                    except (UnicodeDecodeError,json.JSONDecodeError) as error:
+                        raise RuntimeError('held-manual preparation evidence is invalid JSON') from error
+                    if not isinstance(item,dict):
+                        raise RuntimeError('held-manual preparation evidence is not an object')
+                    preparation[suffix]=item
+            leases={}; launches={}; exits={}; receipts={}
+            def preparation_key(item):
+                return tuple(item.get(key) for key in ('task_id','preparation_attempt_id','resource_id','lease_token'))
+            for suffix,item in preparation.items():
+                leaf=suffix.split('/')[0]
+                key=preparation_key(item) if leaf in {'preparation_resource_leases','preparation_process_launches','preparation_process_exit_receipts'} else None
+                if leaf=='preparation_resource_leases':
+                    heartbeat=item.get('heartbeat_sequence')
+                    if (item.get('run_id')!=run_id or item.get('state')!='released'
+                            or not isinstance(item.get('released_at'),str) or not item['released_at']
+                            or type(heartbeat) is not int or heartbeat<0 or key[0] not in task_ids or None in key or key in leases):
+                        raise RuntimeError('held-manual preparation has an active or invalid lease')
+                    leases[key]=item
+                elif leaf=='preparation_process_launches':
+                    sequence=item.get('lease_heartbeat_sequence')
+                    process_id=item.get('supervisor_process_id')
+                    if (item.get('run_id')!=run_id or key[0] not in task_ids or None in key or key in launches
+                            or type(sequence) is not int or sequence<0 or type(process_id) is not int or process_id<=0):
+                        raise RuntimeError('held-manual preparation launch identity differs')
+                    launches[key]=item
+                elif leaf=='preparation_process_exit_receipts':
+                    exit_code=item.get('exit_code')
+                    sequence=item.get('lease_heartbeat_sequence')
+                    process_id=item.get('process_id')
+                    if (item.get('run_id')!=run_id or key[0] not in task_ids or None in key or key in exits
+                            or item.get('status_success') is not True or type(exit_code) is not int or exit_code!=0
+                            or item.get('timed_out') is not False or item.get('failure_reason') is not None
+                            or type(sequence) is not int or sequence<0 or type(process_id) is not int or process_id<=0
+                            or not isinstance(item.get('observed_at'),str) or not item['observed_at']):
+                        raise RuntimeError('held-manual preparation lacks a successful exit-zero receipt')
+                    exits[key]=item
+                elif leaf=='task_preparation_receipts':
+                    task_id=item.get('task_id')
+                    if item.get('run_id')!=run_id or task_id not in task_ids or task_id in receipts:
+                        raise RuntimeError('held-manual task preparation receipt identity differs')
+                    receipts[task_id]=item
+                elif leaf=='task_prepared_observations':
+                    if item.get('run_id')!=run_id or item.get('task_id') not in task_ids:
+                        raise RuntimeError('held-manual preparation observation identity differs')
+                    outcome=item.get('outcome')
+                    if isinstance(outcome,dict) and outcome.get('state')=='published':
+                        published=[outcome.get('bundle_object_ref')]
+                        object_refs=outcome.get('object_refs')
+                        if not isinstance(object_refs,list): raise RuntimeError('held-manual prepared object refs are invalid')
+                        published.extend(object_refs)
+                        for ref in published:
+                            if not isinstance(ref,str) or len(ref)!=64 or any(c not in '0123456789abcdef' for c in ref):
+                                raise RuntimeError('held-manual prepared object reference is invalid')
+                            referenced.add(ref)
+            if len(leases)!=len(launches) or len(leases)!=len(exits):
+                raise RuntimeError('held-manual preparation lease/launch/exit inventory is incomplete')
+            for key,lease in leases.items():
+                if key not in launches or key not in exits or key[0] not in receipts:
+                    raise RuntimeError('released held-manual preparation lacks its launch, successful exit, or task receipt')
+                launch=launches[key]; exit_receipt=exits[key]
+                if (launch['lease_heartbeat_sequence']>exit_receipt['lease_heartbeat_sequence']
+                        or exit_receipt['lease_heartbeat_sequence']!=lease['heartbeat_sequence']):
+                    raise RuntimeError('held-manual preparation heartbeat evidence differs')
+            if receipts and any(task_id not in {key[0] for key in leases} for task_id in receipts):
+                raise RuntimeError('held-manual task preparation receipt has no released preparation lease')
+            for relative,digest in local_evidence.items():
+                if hashlib.sha256(regular(runs/relative,'held-manual evidence final CAS')).hexdigest()!=digest:
+                    raise RuntimeError('held-manual evidence changed before final CAS')
+            if os.path.lexists(str(release)):
+                raise RuntimeError('held-manual start release appeared during snapshot')
+    pin_root=store/'objects/pins'
+    if pin_root.is_symlink() or not pin_root.is_dir(): raise RuntimeError('retained input CAS pins directory is missing')
+    for path in pin_root.iterdir():
+        pin=json.loads(regular(path,'retained input CAS pin',4096))
+        ref=path.name.removesuffix('.json')
+        if path.suffix!='.json' or set(pin)!={'schema','object_ref'} or pin['schema']!='fullmag.cas-pin.v1' or pin['object_ref']!=ref or ref not in referenced: raise RuntimeError('retained input CAS pin is not referenced by the retained intents')
+    total=0
+    cas_budget=1024*1024*1024 if v4 else 128*1024*1024
+    for ref in sorted(referenced):
+        total+=hash_cas_object(store/'objects/sha256'/ref,ref,cas_budget-total)
 
 print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_root_sha256':hashlib.sha256(b'/state/runs/docker-all/session-store').hexdigest(),'ledger_root_sha256':hashlib.sha256(b'/host-ledger/ledger').hexdigest(),'ledger_snapshot_sha256':ledger_digest,'store_file_count':count,'run_directories':sorted(run_dirs),'run_records':run_records,**({'host_ledger_volume_probe':volume_proof} if volume_proof is not None else {})},sort_keys=True))
 '''
@@ -1136,8 +1512,11 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
     ]
     args.append(canonical({
         "ledger_descriptor": ledger_descriptor,
-        "retained_cancelled_runs": retained_pins,
+        "retained_cancelled_runs": [dict(pin) for pin in retained_pins] if retained_pins is not None and not v4_mode else None,
         "terminal_mode": terminal_mode,
+        "retained_terminal_runs": [dict(pin) for pin in retained_terminal_runs] if retained_terminal_runs is not None else None,
+        "retained_held_manual_runs": held_pins,
+        "v4_mode": v4_mode,
     }).decode("utf-8"))
     result = bounded_capture(args, data=b"", timeout=90)
     if result.returncode:
@@ -1160,6 +1539,20 @@ print(json.dumps({'schema':'fullmag.container-recovery-storage-proof.v1','store_
 
 def _is_abrupt(authorization: Mapping[str, object]) -> bool:
     return authorization.get("schema_version") == ABRUPT_OPERATOR_SCHEMA
+
+
+def _assert_request_matches_abrupt_retained_pins(
+    request: Mapping[str, object], proof: Mapping[str, object]
+) -> None:
+    if request.get("retained_terminal_runs") != proof.get("retained_terminal_runs"):
+        _fail("prepared request terminal pins differ from abrupt proof")
+    if proof.get("schema") == ABRUPT_PROOF_HELD_MANUAL_SCHEMA:
+        if request.get("schema_version") != HELD_MANUAL_REQUEST_SCHEMA:
+            _fail("v4 abrupt proof requires a v4 recovery request")
+        if request.get("retained_held_manual_runs") != proof.get("retained_held_manual_runs"):
+            _fail("prepared request held-manual pins differ from abrupt proof")
+    elif "retained_held_manual_runs" in request:
+        _fail("held-manual pins have no matching v4 abrupt proof")
 
 
 def _abrupt_pins(value: Mapping[str, object]) -> dict[str, object]:
@@ -1401,7 +1794,10 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                 _fail("a foreign Docker container references the recovery store/control/ledger")
 
 
-def prepare_abrupt_stop_proof(control, authorization_pins, compose, *, retained_terminal_runs=None):
+def prepare_abrupt_stop_proof(
+    control, authorization_pins, compose, *,
+    retained_terminal_runs=None, retained_held_manual_runs=None
+):
     """Observe without writes. Publish the returned immutable JSON in a control operation.
 
     authorization_pins contains the twelve operator fields except schema_version,
@@ -1412,6 +1808,15 @@ def prepare_abrupt_stop_proof(control, authorization_pins, compose, *, retained_
     engine_sha = _docker_engine_sha()
     if retained_terminal_runs is not None:
         retained_terminal_runs = [dict(item) for item in retained_terminal_runs]
+    if retained_held_manual_runs is not None:
+        retained_held_manual_runs = [dict(item) for item in retained_held_manual_runs]
+        if retained_terminal_runs is None:
+            _fail("v4 abrupt proof requires the paired terminal pin array")
+        expected_recovery_outcome({
+            "schema_version": HELD_MANUAL_REQUEST_SCHEMA,
+            "retained_terminal_runs": retained_terminal_runs,
+            "retained_held_manual_runs": retained_held_manual_runs,
+        })
     if pins["compose_project"] != control.project or compose.get("name") != control.project:
         _fail("abrupt proof belongs to another Compose project")
     if _sha256(_canonical(compose)) != pins["compose_config_sha256"]:
@@ -1437,15 +1842,20 @@ def prepare_abrupt_stop_proof(control, authorization_pins, compose, *, retained_
                             "raw_utf8": raw.decode("utf-8"), "sha256": sha}
     _assert_no_foreign_storage_consumers(control, backend, frontend, compose)
     storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose,
-                                              retained_terminal_runs=retained_terminal_runs)
+                                              retained_terminal_runs=retained_terminal_runs,
+                                              retained_held_manual_runs=retained_held_manual_runs)
     if _docker_engine_sha() != engine_sha:
         _fail("Docker engine changed during abrupt proof preparation")
-    return {"schema": ABRUPT_PROOF_SCHEMA, "authorization_pins": pins,
-            "docker_engine_id_sha256": engine_sha, "raw_records": raw_records,
-            "containers": {"backend": backend, "frontend": frontend},
-            "network": _abrupt_network(backend, frontend, control.project),
-            "storage_proof": storage_proof,
-            "retained_terminal_runs": copy.deepcopy(retained_terminal_runs)}
+    proof = {"schema": ABRUPT_PROOF_HELD_MANUAL_SCHEMA if retained_held_manual_runs is not None else ABRUPT_PROOF_SCHEMA,
+             "authorization_pins": pins,
+             "docker_engine_id_sha256": engine_sha, "raw_records": raw_records,
+             "containers": {"backend": backend, "frontend": frontend},
+             "network": _abrupt_network(backend, frontend, control.project),
+             "storage_proof": storage_proof,
+             "retained_terminal_runs": copy.deepcopy(retained_terminal_runs)}
+    if retained_held_manual_runs is not None:
+        proof["retained_held_manual_runs"] = copy.deepcopy(retained_held_manual_runs)
+    return proof
 
 
 def validate_abrupt_stop_proof(proof, authorization, *, control=None, compose=None, transition=None):
@@ -1455,13 +1865,34 @@ def validate_abrupt_stop_proof(proof, authorization, *, control=None, compose=No
     A prepared retry compares its manifest to the original archived observations
     and revalidates all remaining containers before any further removal.
     """
-    if set(proof) != {"schema", "authorization_pins", "docker_engine_id_sha256", "raw_records", "containers", "network", "storage_proof", "retained_terminal_runs"} or proof.get("schema") != ABRUPT_PROOF_SCHEMA:
+    proof_schema = proof.get("schema")
+    legacy_fields = {"schema", "authorization_pins", "docker_engine_id_sha256", "raw_records", "containers", "network", "storage_proof", "retained_terminal_runs"}
+    held_fields = legacy_fields | {"retained_held_manual_runs"}
+    if ((proof_schema == ABRUPT_PROOF_SCHEMA and set(proof) != legacy_fields)
+            or (proof_schema == ABRUPT_PROOF_HELD_MANUAL_SCHEMA and set(proof) != held_fields)
+            or proof_schema not in {ABRUPT_PROOF_SCHEMA, ABRUPT_PROOF_HELD_MANUAL_SCHEMA}):
         _fail("abrupt stop proof does not match its frozen schema")
     if proof["authorization_pins"] != _abrupt_authorization_pins(authorization):
         _fail("abrupt proof operator pins differ")
     _require_sha(proof["docker_engine_id_sha256"], "abrupt engine digest")
     terminal_pins = proof["retained_terminal_runs"]
-    if terminal_pins is not None:
+    held_pins = proof.get("retained_held_manual_runs")
+    if proof_schema == ABRUPT_PROOF_HELD_MANUAL_SCHEMA:
+        if terminal_pins is None or held_pins is None:
+            _fail("v2 abrupt proof must carry both v4 retained pin arrays")
+        expected_recovery_outcome({
+            "schema_version": HELD_MANUAL_REQUEST_SCHEMA,
+            "retained_terminal_runs": terminal_pins,
+            "retained_held_manual_runs": held_pins,
+        })
+        storage = _require_mapping(proof.get("storage_proof"), "v4 abrupt storage proof")
+        expected_records = sorted(
+            [dict(pin) for pin in terminal_pins + held_pins],
+            key=lambda item: item["run_id"],
+        )
+        if storage.get("run_records") != expected_records:
+            _fail("v4 abrupt storage proof does not cover both retained pin arrays")
+    elif terminal_pins is not None:
         expected_recovery_outcome({"schema_version": TERMINAL_REQUEST_SCHEMA, "retained_terminal_runs": terminal_pins})
     records = _require_mapping(proof["raw_records"], "abrupt raw records")
     if set(records) != {"process_receipt", "owner", "launch", "config"}:
@@ -1511,7 +1942,11 @@ def validate_abrupt_stop_proof(proof, authorization, *, control=None, compose=No
             # the exact owned bridge without consumers other than the old pair.
             _abrupt_network(containers["backend"], containers["frontend"], control.project)
         _assert_no_foreign_storage_consumers(control, containers["backend"], containers["frontend"], compose)
-        observed = _ledger_and_store_snapshot(control, containers["backend"], compose=compose, retained_terminal_runs=terminal_pins)
+        observed = _ledger_and_store_snapshot(
+            control, containers["backend"], compose=compose,
+            retained_terminal_runs=terminal_pins,
+            retained_held_manual_runs=held_pins,
+        )
         if observed != proof["storage_proof"]:
             _fail("abrupt store/ledger snapshot changed")
     return proof
@@ -1789,8 +2224,7 @@ def _load_recovery_transition(
         if proof is None or proof_raw is None or _sha256(proof_raw) != authorization["stop_journal_sha256"]:
             _fail("prepared abrupt proof bytes changed")
         validate_abrupt_stop_proof(proof, authorization)
-        if request.get("retained_terminal_runs") != proof["retained_terminal_runs"]:
-            _fail("prepared request terminal pins differ from abrupt proof")
+        _assert_request_matches_abrupt_retained_pins(request, proof)
     if request.get("request_id") != authorization["request_id"] or request.get("docker_manifest_sha256") != manifest_sha:
         _fail("recovery transition request is not bound to its manifest")
     pins = _validate_container_pins(request.get("containers"))
@@ -2120,9 +2554,14 @@ def _revalidate_recovery_boundary(
     if backend.get("Id") != expected_backend.get("Id") or frontend.get("Id") != expected_frontend.get("Id"):
         _fail("Docker inspection identities changed before the destructive boundary")
     terminal_pins = journal.get("retained_terminal_runs") if _is_abrupt(authorization) else None
+    held_pins = journal.get("retained_held_manual_runs") if _is_abrupt(authorization) else None
     if _is_abrupt(authorization):
         validate_abrupt_stop_proof(journal, authorization, control=control, compose=current_compose, transition=current_transition)
-    storage_proof = _ledger_and_store_snapshot(control, pinned_backend, compose=compose, retained_terminal_runs=terminal_pins)
+    storage_proof = _ledger_and_store_snapshot(
+        control, pinned_backend, compose=compose,
+        retained_terminal_runs=terminal_pins,
+        retained_held_manual_runs=held_pins,
+    )
     for key in (set(storage_proof) | set(expected_storage)):
         if storage_proof.get(key) != expected_storage.get(key):
             _fail(f"storage proof {key} changed before the destructive boundary")
@@ -2370,9 +2809,14 @@ def recover(args: argparse.Namespace) -> None:
     ):
         _fail("Docker container pins changed since authorization")
     terminal_pins = journal.get("retained_terminal_runs") if _is_abrupt(authorization) else None
+    held_pins = journal.get("retained_held_manual_runs") if _is_abrupt(authorization) else None
     if _is_abrupt(authorization):
         validate_abrupt_stop_proof(journal, authorization, control=control, compose=compose, transition=transition)
-    storage_proof = _ledger_and_store_snapshot(control, backend, compose=compose, retained_terminal_runs=terminal_pins)
+    storage_proof = _ledger_and_store_snapshot(
+        control, backend, compose=compose,
+        retained_terminal_runs=terminal_pins,
+        retained_held_manual_runs=held_pins,
+    )
     manifest = transition["manifest"] if transition is not None else _manifest(
         authorization, engine_sha, backend, frontend, pins, device_release, device_mapping
     )
@@ -2487,6 +2931,7 @@ def recover(args: argparse.Namespace) -> None:
                 manifest_sha256=manifest_sha,
                 containers=pins,
                 retained_terminal_runs=terminal_pins,
+                retained_held_manual_runs=held_pins,
             )
             request_raw = _canonical(request)
             request_sha = _sha256(request_raw)
