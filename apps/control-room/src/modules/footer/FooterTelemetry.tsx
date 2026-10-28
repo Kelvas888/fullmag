@@ -1395,10 +1395,12 @@ function selectLatestFooterScalarSample(
   resourceSample: FooterScalarResourceSample | null | undefined,
 ): FooterLiveScalarSample | FooterScalarResourceSample | null {
   if (!resourceSample) return liveSample;
+  // At equal revision the live row includes optional diagnostics omitted from
+  // the history projection. A newer history row still supersedes it in full.
   if (
     !liveSample ||
     typeof liveSample.revision !== "number" ||
-    resourceSample.revision >= liveSample.revision
+    resourceSample.revision > liveSample.revision
   ) {
     return resourceSample;
   }
@@ -1408,7 +1410,7 @@ function selectLatestFooterScalarSample(
 export function resolveFooterMagneticModelPresent(
   scene: Pick<ResourceResult<SceneResource>, "data" | "status">,
 ): boolean | null {
-  if (scene.status !== "ready" || !Array.isArray(scene.data?.objects)) return null;
+  if ((scene.status !== "ready" && scene.status !== "stale") || !Array.isArray(scene.data?.objects)) return null;
   return !scene.data.objects.every(hasEmptyObjectMagneticModel);
 }
 

@@ -15,6 +15,7 @@ import {
   footerTelemetryStatusEquals,
   resolveFooterMagneticModelPresent,
   resolvePrimaryTelemetryObjectId,
+  resolveFooterScalarResourceSample,
   selectFooterTelemetryStatus,
 } from "./FooterTelemetry";
 
@@ -319,6 +320,18 @@ describe("FooterTelemetry", () => {
     const model = buildFooterTelemetryModel(currentStatus, objectMetrics, null, null, null, null, null, null, { magneticModelPresent });
     expect(model.metrics.some((metric) => metric.id.startsWith("avg-m") || metric.id.startsWith("energy-") || metric.id === "max-torque")).toBe(false);
     expect(model.metrics.some((metric) => metric.id === "time")).toBe(true);
+  });
+
+  it("keeps telemetry cards stable while a retained nonmagnetic scene refreshes", () => {
+    const scene = { objects: [{ id: "conductor", name: "Conductor" }], revision: 1 } satisfies SceneResource;
+    const cards = (["ready", "stale", "ready"] as const).map((resourceStatus) => {
+      const magneticModelPresent = resolveFooterMagneticModelPresent({ data: scene, status: resourceStatus });
+      return buildFooterTelemetryModel(currentStatus, null, null, null, null, null, null, null,
+        { magneticModelPresent }).metrics.map(({ id }) => id);
+    });
+    expect(cards[1]).toEqual(cards[0]);
+    expect(cards[2]).toEqual(cards[0]);
+    expect(cards[0]).not.toContain("energy-total");
   });
 
   it("retains global magnetic telemetry when a nonmagnetic object is selected in a mixed scene", () => {
@@ -1076,6 +1089,31 @@ describe("FooterTelemetry", () => {
     expect(model.frequencyDomainProgress?.detail).toContain("iteration=37/5000");
     expect(model.frequencyDomainProgress?.detail).toContain("residual=1.200e-5");
     expect(model.frequencyDomainProgress?.detail).not.toContain("range 2.000-5.000 GHz");
+  });
+
+  it("does not replace a complete live sample with a sparse history row at the same revision", () => {
+    const live = {
+      revision: 26, sessionId: currentStatus!.sessionId, runId: currentStatus!.run!.run_id,
+      step: 9, time: 0,
+      row: { step: 9, time: 0, mx: 1, my: 0, mz: 0, pseudo_time_s: 9e-6,
+        active_runtime_s: 3, solver_dt: 1e-8, e_ex: 7, e_total: 8 },
+    };
+    const window = { revision: 26, total_rows: 1, returned_rows: 1,
+      columns: ["step", "time", "mx", "my", "mz", "e_total"],
+      rows: [[9, 0, 1, 0, 0, 8]], observation_frames: [] };
+    const history = resolveFooterScalarResourceSample(currentStatus, window);
+    const before = buildFooterTelemetryModel(currentStatus, null, null, live);
+    const after = buildFooterTelemetryModel(currentStatus, null, null, live, null, null, null, history);
+    expect(after.metrics).toEqual(before.metrics);
+    expect(after.metrics.find(({ id }) => id === "time")?.label).toBe("Pseudo time");
+    // A strictly newer history sample must still win, without mixing revisions.
+    const newer = resolveFooterScalarResourceSample(currentStatus, {
+      ...window, revision: 27, rows: [[10, 1e-9, 0, 1, 0, 12]],
+    });
+    const updated = buildFooterTelemetryModel(currentStatus, null, null, live, null, null, null, newer);
+    expect(updated.metrics.find(({ id }) => id === "step")?.value).toBe("10");
+    expect(updated.metrics.find(({ id }) => id === "time")?.label).toBe("Sim time");
+    expect(updated.metrics.some(({ id }) => id === "active-runtime")).toBe(false);
   });
 
   it("ignores stale live scalar samples from a previous run", () => {
