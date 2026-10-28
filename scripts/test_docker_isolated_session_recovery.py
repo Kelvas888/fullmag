@@ -1,4 +1,6 @@
 import json
+from contextlib import ExitStack, contextmanager, nullcontext
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +13,27 @@ from docker_build_control import BuildControlError, canonical
 
 
 class SuccessorAdmissionTests(unittest.TestCase):
+    def test_normalization_preserves_original_pointer_and_only_changes_missing_ids(self):
+        for mutation in (None,'error','state','source','nonnull'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as folder:
+                control,pins,current,_,documents,context,compose,state=self.failed_fixture(folder)
+                normalized=canonical(current)
+                del current['backend_container'];current['frontend_container']=None
+                original=canonical(current);documents['development/current.json']=original
+                if mutation in ('error','state'): current[mutation]='changed'
+                elif mutation=='source': current['inputs']['source_root']='/other'
+                elif mutation=='nonnull': current['backend_container']='9'*64
+                if mutation: original=canonical(current);documents['development/current.json']=original
+                with mock.patch('docker_control_namespace.assert_namespace_activation'):
+                    if mutation:
+                        with self.assertRaises(BuildControlError):
+                            recovery._successor_admission_pins(control,pins,original,context=context,
+                                compose=compose,state=state,validation_terminal_raw=normalized)
+                    else:
+                        result=recovery._successor_admission_pins(control,pins,original,context=context,
+                            compose=compose,state=state,validation_terminal_raw=normalized)
+                        self.assertEqual(result[control.namespace+'/development/current.json'],original)
+
     def failed_fixture(self, folder):
         root=Path(folder); state=root/'runtime/state'; state.mkdir(parents=True)
         user=root/'user-data/current'; user.mkdir(parents=True)
@@ -190,6 +213,111 @@ class SuccessorAdmissionTests(unittest.TestCase):
         self.assertEqual(control.read.return_value,original_start)
         control.write.assert_not_called()
         control.write_bytes.assert_not_called()
+
+
+class StoppedProofIntegrationTests(unittest.TestCase):
+    @contextmanager
+    def environment(self, folder, *, apply=False):
+        fixture=SuccessorAdmissionTests().failed_fixture(folder)
+        control,pins,current,verified,documents,context,compose,state=fixture
+        normalized=canonical(current);del current['backend_container'];del current['frontend_container']
+        original=canonical(current)
+        terminal_path,compose_path=recovery.retained._terminal_paths(pins['development_attempt'])
+        documents['development/current.json']=documents[terminal_path]=original
+        control.volume='control';control.namespace_registry={'retirement':{
+            'schema':recovery.SNAPSHOT_SCHEMA,'recovery_id':'a'*32,'old_request_id':'old'}}
+        context['control']=control;context['selected']=Path('/repo');pins['source_root']='/repo';pins['request_id']='request'
+        store=state/'runs/docker-all/session-store';store.mkdir(parents=True)
+        (Path(context['layout']['runtime_root'])/'docker-volume-dev').mkdir()
+        owner=b'owner';certificate=canonical({'host_inode':state.stat().st_ino,'host_device':17,'engine_id':'engine'})
+        pins.update(expected_certificate_sha256=recovery.digest(certificate),expected_owner_sha256=recovery.digest(owner),
+                    expected_inode=state.stat().st_ino,old_host_device=17,new_host_device=state.stat().st_dev,filesystem_uuid='uuid')
+        args=SimpleNamespace(recovery_id='b'*32,successor_snapshot=True,apply=apply,
+            operator_pins=Path('pins.json'),restore_run_id='held',retained_terminal_runs=Path('/terminal-pins'),
+            retained_held_manual_runs=Path('/held-pins'),stopped_predecessor_proof='verification/proof.json',
+            stopped_predecessor_proof_sha256=recovery.digest(b'proof'))
+        stopped_pins={control.namespace+'/verification/proof.json':b'proof',
+                      control.namespace+'/development/current.json':original,
+                      control.namespace+'/'+terminal_path:original}
+        runtime={name:b'{}' for name in recovery.retained._RUNTIME_RECORDS}
+        evidence={control.namespace+'/'+path:raw for path,raw in documents.items()}
+        evidence.update(stopped_pins)
+        evidence.update({control.namespace+'/'+path:runtime[name] for name,path in recovery.retained._RUNTIME_RECORDS.items()})
+        def read_owned(path,*_):
+            if path.name==recovery.host.CERTIFICATE_NAME:return certificate
+            if path.name==recovery.host.OWNER_NAME:return owner
+            if str(path)=='/terminal-pins':return b'[]'
+            if str(path)=='/held-pins':return canonical([{'run_id':'held'}])
+            return b'{}'
+        pair={role:{'Id':pins[role+'_container_id'],'Image':pins['old_image_id']} for role in ('backend','frontend')}
+        services={'backend':{'proof':'backend'},'frontend':{'proof':'frontend'}}
+        with ExitStack() as stack:
+            def patch(target,name,**kwargs):return stack.enter_context(mock.patch.object(target,name,**kwargs))
+            patch(recovery.retained,'_read_operator_file',return_value=(pins,b'{}',Path('pins.json')))
+            patch(recovery.retained,'_request_context',return_value=context)
+            loader=patch(recovery,'load_stopped_predecessor',return_value=(normalized,stopped_pins,services))
+            observe=patch(recovery,'_stopped_pair',return_value=pair)
+            validate=patch(recovery,'validate_stopped_incarnations')
+            patch(recovery.retained,'_read_runtime_records',return_value=runtime)
+            patch(recovery.host,'read_owned_regular',side_effect=read_owned)
+            patch(recovery.retained,'_engine_id',return_value='engine')
+            patch(recovery.retained,'_filesystem_uuid',return_value='uuid')
+            patch(recovery,'_raw',side_effect=lambda _,path:b'registry' if path==recovery.REGISTRY_PATH else evidence[path])
+            patch(recovery.recovery,'_ledger_and_store_snapshot',return_value={'full-native-store-proof':True})
+            patch(recovery.retained,'_owner_lock',return_value=nullcontext())
+            fd=os.open(store,os.O_RDONLY);stack.callback(os.close,fd)
+            patch(recovery,'hold_source_writer',return_value=nullcontext(fd))
+            fence=mock.Mock();patch(recovery,'hold_managed_workspace_database',return_value=nullcontext(fence))
+            patch(recovery,'snapshot_control_workspace',return_value={'source':{},'copied':{}})
+            patch(recovery,'snapshot_tree',return_value={'total_bytes':0})
+            patch(recovery.shutil,'disk_usage',return_value=SimpleNamespace(free=10**12))
+            patch(recovery.storage,'git',return_value='c'*40)
+            patch(Path,'read_bytes',return_value=b'controller')
+            patch(recovery,'copy_verified_tree');patch(recovery,'_admit_copy')
+            patch(recovery.host,'admit_runtime_uid');patch(recovery,'_once')
+            patch(recovery,'validate_copied_workspace',return_value={})
+            patch(recovery,'validate_snapshot_namespace_receipt')
+            patch(recovery,'docker_capture',return_value=SimpleNamespace(stdout=b'',stderr=b''))
+            commit=patch(recovery,'bounded_capture',return_value=SimpleNamespace(returncode=0,stdout=b'{}',stderr=b''))
+            patch(recovery,'_remove_stopped')
+            control.operation.return_value=nullcontext({'receipt':{}})
+            stack.enter_context(mock.patch('docker_control_namespace.assert_namespace_activation'))
+            yield args,control,pins,original,stopped_pins,loader,observe,validate,commit
+
+    def test_failed_missing_ids_proof_wires_all_observations_and_original_cas(self):
+        with tempfile.TemporaryDirectory() as folder,self.environment(folder,apply=True) as env:
+            args,control,pins,original,proof_pins,loader,observe,validate,commit=env
+            result=recovery.recover(args)
+            self.assertEqual(result['state'],'snapshot-awaiting-gated-start')
+            loader.assert_called_once_with(control,pins,original,args.stopped_predecessor_proof,args.stopped_predecessor_proof_sha256)
+            self.assertEqual(observe.call_count,4);self.assertEqual(validate.call_count,4)
+            self.assertEqual([c.args[0] for c in validate.call_args_list],[observe.return_value]*4)
+            payload=json.loads(commit.call_args.kwargs['data'])
+            for path,raw in proof_pins.items():self.assertEqual(payload['pins'][path],recovery.digest(raw))
+            operation_inputs=control.operation.call_args.args[1]
+            self.assertEqual(operation_inputs['stopped_predecessor_proof'],{
+                'path':args.stopped_predecessor_proof,'sha256':args.stopped_predecessor_proof_sha256})
+            self.assertIn('docker_isolated_stopped_predecessor.py',operation_inputs['executor']['script_sha256'])
+
+    def test_proof_flags_require_explicit_failed_successor_and_both_values(self):
+        for mutation in ('missing_proof','missing_sha','no_proof','not_successor','not_failed'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as folder,self.environment(folder) as env:
+                args,control,pins,original,proof_pins,loader,*_=env
+                if mutation=='missing_proof':args.stopped_predecessor_proof=None
+                elif mutation=='missing_sha':args.stopped_predecessor_proof_sha256=None
+                elif mutation=='no_proof':args.stopped_predecessor_proof=args.stopped_predecessor_proof_sha256=None
+                elif mutation=='not_successor':args.successor_snapshot=False
+                else:
+                    changed=canonical(dict(json.loads(original),state='succeeded'))
+                    control.read_bytes.side_effect=lambda path,**kwargs:changed
+                with self.assertRaises((BuildControlError,ValueError)):recovery.recover(args)
+                loader.assert_not_called()
+
+    def test_conflicting_raw_control_pins_are_rejected(self):
+        target={'same':b'original'}
+        recovery._merge_control_pins(target,{'same':b'original','other':b'proof'})
+        with self.assertRaises(BuildControlError):recovery._merge_control_pins(target,{'same':b'normalized'})
+        self.assertEqual(target['same'],b'original')
 
 
 class IsolatedCommitTests(unittest.TestCase):
