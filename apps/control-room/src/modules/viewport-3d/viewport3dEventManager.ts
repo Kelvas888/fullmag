@@ -127,7 +127,7 @@ export function createViewport3DPointerMoveHandler(
 }
 
 /** Gizmos that take the pointer-down before orbit while mounted (not the move tool). */
-const PROBE_GIZMOS = new Set(["move-axis", "planar-normal"]);
+const PROBE_GIZMOS = new Set(["move-axis", "planar-normal", "planar-rotate"]);
 let registeredProbeGizmos = 0;
 
 /** Registers a mounted probe gizmo (planar normal handle); returns the unregister. */

@@ -162,7 +162,9 @@ import {
   ClipPlaneLayer,
   PlanarMonitorFramePreviewLayer,
 } from "./ClipPlaneLayer";
+import { PlanarMonitorFacePicker } from "./PlanarMonitorFacePicker";
 import { PlanarMonitorNormalHandle } from "./PlanarMonitorNormalHandle";
+import { PlanarMonitorRotationRings } from "./PlanarMonitorRotationRings";
 import { pickRegionOverlayFromRay } from "./regionOverlayPicking";
 import type { ClipPlaneIntersectionMarkerBuffers } from "./clipPlaneModel";
 import {
@@ -1068,8 +1070,14 @@ function Viewport3DOverlayLayerStack({
             onGestureActiveChange={onPlanarHandleGestureActiveChange}
             preview={planarMonitorFramePreview}
           />
+          <PlanarMonitorRotationRings
+            colors={colors}
+            onGestureActiveChange={onPlanarHandleGestureActiveChange}
+            preview={planarMonitorFramePreview}
+          />
         </>
       ) : null}
+      <PlanarMonitorFacePicker />
       {viewport3DBoundsLayersEnabledFromBrowserConfig() ? (
         <>
           <DomainBoxLayer
