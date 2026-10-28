@@ -66,6 +66,34 @@ def exited():
 
 
 class RecoveryBuildTests(unittest.TestCase):
+    def test_history_build_requires_explicit_version_and_complete_history(self):
+        value = request()
+        value["schema"] = dev._RECOVERY_HISTORY_BUILD_SCHEMA
+        value["retained_terminal_runs"] = [{"run_id": "terminal", "run_intent_sha256": "a" * 64,
+            "run_catalog_sha256": "b" * 64, "artifact_catalog_sha256": None}]
+        value["retained_attempt_histories"] = [{"run_id": "terminal", "run_evidence_sha256": "c" * 64,
+            "attempts": [{"task_id": "task-old", "attempt_id": "attempt-old", "ownership_epoch": 1,
+                "resource_id": "docker-all.compute.cpu"}]}]
+        self.assertEqual(dev._recovery_build_request(json.dumps(value)), value)
+        for change in (lambda x: x.update(schema=dev._RECOVERY_BUILD_SCHEMA),
+                       lambda x: x.pop("retained_attempt_histories"),
+                       lambda x: x.update(retained_attempt_histories=[]),
+                       lambda x: x["retained_attempt_histories"][0].update(run_id="unlisted"),
+                       lambda x: x["retained_attempt_histories"][0].update(run_evidence_sha256="invalid")):
+            wrong = copy.deepcopy(value); change(wrong)
+            with self.subTest(value=wrong), self.assertRaises((BuildControlError, ValueError)):
+                dev._recovery_build_request(json.dumps(wrong))
+
+    def test_history_build_rejects_v4_only_native_package(self):
+        value = request()
+        value["schema"] = dev._RECOVERY_HISTORY_BUILD_SCHEMA
+        receipt, provenance, capability = publication(value)
+        with self.assertRaisesRegex(BuildControlError, "v5 recovery capability"):
+            dev._recovery_build_publication(receipt, provenance, capability, value)
+        capability["capabilities"]["supported_recovery_schemas"].append(recovery.ATTEMPT_HISTORY_REQUEST_SCHEMA)
+        capability["raw_utf8"] = json.dumps(capability["capabilities"])
+        dev._recovery_build_publication(receipt, provenance, capability, value)
+
     def test_closed_request_requires_all_pins_and_canonical_held_policy(self):
         value = request()
         self.assertEqual(dev._recovery_build_request(json.dumps(value)), value)

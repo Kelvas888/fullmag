@@ -6510,6 +6510,7 @@ print(json.dumps(sorted(result,key=lambda p:p['pid'])))
 
 
 _RECOVERY_BUILD_SCHEMA = "fullmag.retained-recovery-build.v1"
+_RECOVERY_HISTORY_BUILD_SCHEMA = "fullmag.retained-recovery-build.v2"
 _RECOVERY_BUILD_HELPERS = ("backend_dev.py", "linux_native_probe.py")
 
 
@@ -6519,12 +6520,18 @@ def _recovery_build_request(raw):
     fields = {"schema", "authorization_pins", "retained_terminal_runs", "retained_held_manual_runs",
               "storage_proof_sha256", "certificate_sha256", "source_commit", "source_digest",
               "source_snapshot_sha256", "controller_sha256", "baked_helpers"}
-    if not isinstance(value, dict) or set(value) != fields or value["schema"] != _RECOVERY_BUILD_SCHEMA:
+    if not isinstance(value, dict) or value.get("schema") not in {_RECOVERY_BUILD_SCHEMA, _RECOVERY_HISTORY_BUILD_SCHEMA}:
+        raise BuildControlError("Recovery build request fields/schema differ")
+    history = value["schema"] == _RECOVERY_HISTORY_BUILD_SCHEMA
+    if set(value) != fields | ({"retained_attempt_histories"} if history else set()):
         raise BuildControlError("Recovery build request fields/schema differ")
     recovery._abrupt_pins(value["authorization_pins"])
-    recovery.expected_recovery_outcome({"schema_version": recovery.HELD_MANUAL_REQUEST_SCHEMA,
+    recovery_request = {"schema_version": recovery.ATTEMPT_HISTORY_REQUEST_SCHEMA if history else recovery.HELD_MANUAL_REQUEST_SCHEMA,
         "retained_terminal_runs": value["retained_terminal_runs"],
-        "retained_held_manual_runs": value["retained_held_manual_runs"]})
+        "retained_held_manual_runs": value["retained_held_manual_runs"]}
+    if history:
+        recovery_request["retained_attempt_histories"] = value["retained_attempt_histories"]
+    recovery.expected_recovery_outcome(recovery_request)
     for key in ("storage_proof_sha256", "certificate_sha256", "source_digest", "source_snapshot_sha256", "controller_sha256"):
         recovery._require_sha(value[key], key)
     if not isinstance(value["source_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["source_commit"]):
@@ -6605,7 +6612,7 @@ before=snapshot()
 if [item[0] for item in before]!=[expected['binary_sha256'],expected['receipt_sha256'],expected['provenance_sha256']]:
     raise RuntimeError('Capability input differs from pinned publication; native command not executed')
 result=subprocess.run([str(paths[0]),'runtime','service-container-recovery-capabilities'],capture_output=True,timeout=30)
-if result.returncode or len(result.stdout)>65536: raise RuntimeError('Native v4 capability command failed')
+if result.returncode or len(result.stdout)>65536: raise RuntimeError('Native recovery capability command failed')
 if snapshot()!=before: raise RuntimeError('Capability publication changed')
 print(json.dumps({'binary_sha256':before[0][0],'receipt_sha256':before[1][0],'provenance_sha256':before[2][0],
                   'raw_utf8':result.stdout.decode('utf-8'),'capabilities':json.loads(result.stdout),
@@ -6657,10 +6664,12 @@ def _recovery_build_publication(receipt, provenance, capability, request, *, exp
             or json.loads(capability["raw_utf8"]) != value):
         raise BuildControlError("Invalid native recovery capabilities")
     schemas = value["supported_recovery_schemas"]
+    required_schema = ("runtime_service_container_recovery_request.v5"
+        if request["schema"] == _RECOVERY_HISTORY_BUILD_SCHEMA else "runtime_service_container_recovery_request.v4")
     build = value["build_identity"]
     if (not isinstance(schemas, list) or not 1 <= len(schemas) <= 16
             or any(not isinstance(item, str) or not re.fullmatch(r"runtime_service_container_recovery_request\.v[1-9][0-9]*", item) for item in schemas)
-            or len(schemas) != len(set(schemas)) or "runtime_service_container_recovery_request.v4" not in schemas
+            or len(schemas) != len(set(schemas)) or required_schema not in schemas
             or not isinstance(build, dict) or set(build) != {"version", "built_at_utc", "git_commit", "worktree_state", "source_snapshot_sha256"}
             or build.get("git_commit") != request["source_commit"]
             or build.get("source_snapshot_sha256") != request["source_snapshot_sha256"]
@@ -6668,7 +6677,7 @@ def _recovery_build_publication(receipt, provenance, capability, request, *, exp
             or not isinstance(build.get("version"), str) or not 0 < len(build["version"]) <= 128
             or not isinstance(build.get("built_at_utc"), str)
             or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", build["built_at_utc"])):
-        raise BuildControlError("Actual native package lacks matching v4 recovery capability")
+        raise BuildControlError("Actual native package lacks matching " + required_schema.rsplit(".", 1)[-1] + " recovery capability")
 
 
 def _recovery_build_timeout(actual, started_at, logs):
@@ -6714,8 +6723,11 @@ def _retained_recovery_build(args, control, previous, document, selected, layout
         raise BuildControlError("Recovery build retained source/attempt/group differs")
     state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Linux sessions")
     def observe(operation_helper=None):
+        history_options = ({"retained_attempt_histories": request["retained_attempt_histories"]}
+            if request["schema"] == _RECOVERY_HISTORY_BUILD_SCHEMA else {})
         proof = recovery.prepare_abrupt_stop_proof(control, pins, document,
-            retained_terminal_runs=request["retained_terminal_runs"], retained_held_manual_runs=request["retained_held_manual_runs"])
+            retained_terminal_runs=request["retained_terminal_runs"], retained_held_manual_runs=request["retained_held_manual_runs"],
+            **history_options)
         owner = json.loads(proof["raw_records"]["owner"]["raw_utf8"])
         if owner.get("state") != "ready" or hashlib.sha256(canonical(proof["storage_proof"])).hexdigest() != request["storage_proof_sha256"]:
             raise BuildControlError("Recovery build requires the unchanged Ready owner and retained inventory")
