@@ -1634,9 +1634,11 @@ def _abrupt_network(backend, frontend, project):
         _fail(str(error))
 
 
-def _retained_compose_state_root(backend, compose):
-    if not isinstance(compose, Mapping) or compose.get("name") != "fullmag-master":
-        _fail("foreign alias proof has no retained master Compose identity")
+def _retained_compose_state_root(backend, compose, *, project="fullmag-master"):
+    if (not isinstance(project, str) or PROJECT_RE.fullmatch(project) is None
+            or not isinstance(compose, Mapping) or compose.get("name") != project
+            or backend.get("Config", {}).get("Labels", {}).get("com.docker.compose.project") != project):
+        _fail("foreign alias proof has no retained selected Compose identity")
     service = compose.get("services", {}).get("backend", {})
     volumes = service.get("volumes") if isinstance(service, Mapping) else None
     candidates = [item for item in volumes if isinstance(item, Mapping)
@@ -1744,6 +1746,16 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
             kind = mount.get("Type")
             if kind == "bind":
                 source = mount.get("Source")
+                if isinstance(source, str) and re.fullmatch(r"[A-Za-z]:[\\/].+", source):
+                    try:
+                        from docker_windows_bind_isolation import (
+                            prove_windows_bind_disjoint, validate_windows_bind_disjoint_proof)
+                        state_root = _retained_compose_state_root(backend, compose, project=control.project)
+                        proof = prove_windows_bind_disjoint(control, backend, item, source, state_root)
+                        validate_windows_bind_disjoint_proof(proof, source=source, container_id=item.get("Id"))
+                    except Exception as error:
+                        _fail("foreign Windows bind has unresolved storage identity: " + str(error))
+                    continue
                 if (not isinstance(source, str) or not source.startswith("/")
                         or ".." in PurePosixPath(source).parts
                         or str(PurePosixPath(source)) != source):

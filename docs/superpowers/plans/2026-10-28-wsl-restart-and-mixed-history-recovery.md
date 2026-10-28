@@ -370,3 +370,39 @@ z build-storage governance. Zachowujemy wszystkie bieżące cache, pakiet rollba
 logi, dokumenty recovery i wyniki, ponieważ są referencjonowane przez aktywne
 odzyskiwanie. Brak wykazanego zbędnego kandydata; niczego nie usuwano. Ponowna
 ocena dopiero po zweryfikowanym nowym pakiecie i zakończonym recovery.
+
+
+## Adapter Windows: stan file-only i granica dalszego recovery
+
+Dodano adapter `docker_windows_bind_isolation` do kanonicznego guard obcych
+konsumentów. Odczyt łączy Windows serial/FileID i backing VHD z kernelowym
+DrvFs, źródłami grupy i ext4 WSL; nie przyjmuje różnej litery dysku jako dowodu.
+Mounts jest porównywane bez wpływu kolejności. Root i descendants nie mogą
+wprowadzać niezakwalifikowanych reparse; source/reference nie mogą mieć
+zewnętrznych submountów. Zwykłe zmiany treści heartbeat nie zmieniają dowodu
+samej topologii. Backing hardlinks pozostają ograniczone do jednego tam, gdzie
+obiekty są na tym samym natywnym volume; różne serial wykluczają cross-volume
+hardlink bez udawania obsługi fsutil, której nie ma na C:.
+
+77 testów bieżącego adaptera file-only i integracji z recovery: PASS, zero
+failures/errors. Dowody i dokładne SHA: `windows-contained-tests.json` i log
+w `verification/recovery-mount-order-20261028/` control volume. 84 testy
+wydzielonego commita recepty a41d4c9cdc46a64ed2d4a1f4ad5f4042636d06f5 również
+PASS. Commit jest wypchnięty do PR #247; opis PR został zaktualizowany przez
+uwierzytelnione środowisko WSL. Błąd dostępu gh w PowerShell nie wymagał nowego
+logowania użytkownika.
+
+Rzeczywisty preflight nie przeszedł. Po usunięciu kosztu Get-Item i zbędnych
+metadanych dotarł do istniejącego linku biblioteki libfullmag_fem.so; ten wąski
+przypadek ma kwalifikację file-only. Kolejna odmowa dotyczy linku katalogowego
+react-doctor w starym node_modules. Przegląd zaakceptował ograniczony model
+zawartych LX directory links, ale automatyczna kontrola odrzuciła zapis jako
+rozszerzenie autoryzacji. Odrzuconej zmiany nie zastosowano. Konkretna propozycja:
+[kwalifikacja katalogowych linków LX](2026-10-28-windows-contained-lx-directory-proposal.md).
+
+Backend i frontend nadal pozostają zatrzymane; nie było nowego buildu aplikacji,
+probe admission ani Solve. Nie zmieniono cudzych kontenerów, wyników lub cache.
+Dalszy krok zależny: rozstrzygnięcie tego rozszerzenia, jego regresje i rzeczywisty
+preflight, dopiero potem już przygotowana recepta buildu i native v4 recovery.
+Brak przejścia preflightu nie jest dowodem braku kodu solvera ani poprawnej
+kwalifikacji zapisanych danych. Pełny E0–E12 pozostaje aktywny.

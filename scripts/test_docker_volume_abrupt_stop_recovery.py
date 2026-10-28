@@ -362,6 +362,57 @@ class AbruptStopTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(r.ContainerRecoveryError):
                 r._stable_container_observation(value)
 
+    def test_retained_state_root_accepts_only_explicit_matching_worktree(self):
+        proof, _, _ = self.fixture()
+        backend = copy.deepcopy(proof['containers']['backend'])
+        project = 'fullmag-worktree-selected'
+        backend['Config']['Labels']['com.docker.compose.project'] = project
+        with tempfile.TemporaryDirectory() as directory:
+            state = str(Path(directory).resolve())
+            backend['Mounts'][0]['Source'] = '/daemon/state-alias'
+            compose = {'name': project, 'services': {'backend': {
+                'volumes': [{'type': 'bind', 'source': state, 'target': '/state'}],
+                'x-fullmag-daemon-binds': {'/state': '/daemon/state-alias'}}}}
+            image = {'Id': backend['Image'], 'Config': {}}
+            with patch.object(r, 'docker_capture', return_value=SimpleNamespace(stdout=json.dumps([image]).encode())), \
+                 patch('docker_volume_dev._validate_retained_service') as validate:
+                self.assertEqual(r._retained_compose_state_root(backend, compose, project=project), Path(state))
+                validate.assert_called_once()
+                with self.assertRaisesRegex(r.ContainerRecoveryError, 'selected Compose identity'):
+                    r._retained_compose_state_root(backend, compose)
+                backend['Config']['Labels']['com.docker.compose.project'] = 'foreign'
+                with self.assertRaisesRegex(r.ContainerRecoveryError, 'selected Compose identity'):
+                    r._retained_compose_state_root(backend, compose, project=project)
+                self.assertEqual(validate.call_count, 1)
+
+    def test_windows_bind_dispatch_requires_qualified_proof_and_keeps_volume_guard(self):
+        proof, _, compose = self.fixture()
+        backend, frontend = proof['containers'].values()
+        foreign = {'Id': 'a'*64, 'Mounts': [
+            {'Type': 'bind', 'Source': r'D:\foreign\storage', 'Destination': '/storage', 'RW': True}]}
+        def responses():
+            return [SimpleNamespace(stdout=foreign['Id'].encode()),
+                    SimpleNamespace(stdout=json.dumps([foreign]).encode())]
+        with patch.object(r, 'docker_capture', side_effect=responses()), \
+             patch.object(r, '_retained_compose_state_root', return_value=Path('/retained/state')), \
+             patch('docker_windows_bind_isolation.prove_windows_bind_disjoint', return_value={'typed': 'proof'}) as prove, \
+             patch('docker_windows_bind_isolation.validate_windows_bind_disjoint_proof') as validate:
+            r._assert_no_foreign_storage_consumers(SimpleNamespace(project=compose['name']), backend, frontend, compose)
+            self.assertEqual(prove.call_args.args[3:], (r'D:\foreign\storage', Path('/retained/state')))
+            validate.assert_called_once_with({'typed': 'proof'}, source=r'D:\foreign\storage', container_id=foreign['Id'])
+        with patch.object(r, 'docker_capture', side_effect=responses()), \
+             patch.object(r, '_retained_compose_state_root', return_value=Path('/retained/state')), \
+             patch('docker_windows_bind_isolation.prove_windows_bind_disjoint', side_effect=ValueError('physical overlap')):
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'unresolved storage identity.*physical overlap'):
+                r._assert_no_foreign_storage_consumers(SimpleNamespace(project=compose['name']), backend, frontend, compose)
+        backend['Mounts'].append({'Type': 'volume', 'Name': 'control-vol', 'Destination': r.CONTROL_ROOT})
+        foreign['Mounts'].append({'Type': 'volume', 'Name': 'control-vol', 'Destination': '/foreign-control'})
+        with patch.object(r, 'docker_capture', side_effect=responses()), \
+             patch.object(r, '_retained_compose_state_root', return_value=Path('/retained/state')), \
+             patch('docker_windows_bind_isolation.prove_windows_bind_disjoint', return_value={'typed': 'proof'}), \
+             patch('docker_windows_bind_isolation.validate_windows_bind_disjoint_proof'):
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'control/ledger'):
+                r._assert_no_foreign_storage_consumers(SimpleNamespace(project=compose['name']), backend, frontend, compose)
 
     def test_owner_host_and_identity_cannot_be_fabricated(self):
         proof,auth,_=self.fixture()

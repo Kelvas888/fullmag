@@ -854,6 +854,7 @@ jobs:
           python -B scripts/test_linux_native_device_preparation.py -v
           python -B scripts/test_docker_linux_host_readmission.py -v
           python -B scripts/test_docker_volume_abrupt_stop_recovery.py -v
+          python -B scripts/test_docker_windows_bind_isolation.py -v
           python -B scripts/test_docker_prepare_container_recovery.py -v
           python -B scripts/test_docker_foreign_bind_identity.py -v
           python -B scripts/test_docker_stopped_network.py -v
@@ -900,6 +901,7 @@ jobs:
 
           python -B scripts/test_docker_volume_host_device.py -v
           python -B scripts/test_docker_volume_wsl.py -v
+          python -B scripts/test_docker_volume_recovery_build.py -v
           python -B scripts/test_linux_native_host.py -v
           python -B scripts/test_docker_dev_codegen.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
