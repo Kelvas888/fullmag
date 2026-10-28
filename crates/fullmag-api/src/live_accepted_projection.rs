@@ -2484,6 +2484,7 @@ async fn apply_projection(
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
     let mut changed = profile_changed;
+    let mut scalar_sample_advanced = false;
     if let Some(run) = next.run.as_mut() {
         if run.status != projection.status {
             run.status = projection.status.to_string();
@@ -2679,6 +2680,14 @@ async fn apply_projection(
             };
             if row.is_physical_observation() {
                 let scalar_revision = next.scalar_revision;
+                // A run's latest durable row never moves backwards, so an
+                // earlier step means a new step lineage: a run started from a
+                // fresh model in the same session (fm.reset(), a sweep point).
+                // The append-only table would reject every row of that run and
+                // keep reporting the previous run's final state.
+                if next.scalar_rows.last().is_some_and(|last| row.step < last.step) {
+                    next.scalar_rows.clear();
+                }
                 crate::session::apply_current_live_scalar_frame(
                     &mut next,
                     crate::types::CurrentLiveScalarFrameRequest {
@@ -2686,7 +2695,10 @@ async fn apply_projection(
                         latest_scalar_row: Some(row),
                     },
                 )?;
-                changed |= next.scalar_revision != scalar_revision;
+                if next.scalar_revision != scalar_revision {
+                    changed = true;
+                    scalar_sample_advanced = true;
+                }
             }
         }
     }
@@ -2896,6 +2908,18 @@ async fn apply_projection(
     }
     next.state_version = next.state_version.saturating_add(1);
     let published_fence = ProjectionPublicationFence::capture(&next)?;
+    // Accepted runs publish scalars through this projection, so emit the same
+    // scalar.sample event the interactive sync path does for live clients.
+    let scalar_sample = scalar_sample_advanced
+        .then(|| next.scalar_rows.last().cloned())
+        .flatten()
+        .map(|row| crate::PendingRealtimeScalarSample {
+            session_id: next.session.session_id.clone(),
+            run_id: next.run.as_ref().map(|run| run.run_id.clone()),
+            revision: next.scalar_revision,
+            row,
+            terminal,
+        });
     let mut realtime_state =
         crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
 
@@ -2946,6 +2970,9 @@ async fn apply_projection(
         let mut current = state.current_live_state.write().await;
         std::mem::replace(&mut *current, Some(next))
     };
+    if let Some(sample) = scalar_sample {
+        crate::queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
+    }
     drop(transition);
     if let Some(previous) = previous {
         let _ = tokio::task::spawn_blocking(move || drop(previous));
@@ -3771,7 +3798,6 @@ mod tests {
                 "status":"accepted"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
         apply_projection(&state, &context, projection).await.unwrap();
         let current = state.current_live_state.read().await;
         let snapshot = current.as_ref().unwrap();
@@ -3830,7 +3856,6 @@ mod tests {
                 "status":"running"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
         let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert_eq!(projection.status, "failed");
         assert!(projection.terminal_without_outputs);
@@ -3842,7 +3867,9 @@ mod tests {
             let ledger = state.current_command_ledger.lock().await;
             assert_eq!(ledger[0].status, crate::types::CommandLifecycleState::Failed);
             assert_eq!(ledger[0].completion_status, Some(crate::types::CommandCompletionState::Failed));
-            assert_eq!(ledger[0].error.as_deref(), Some("accepted Study execution failed"));
+            assert_eq!(ledger[0].error.as_deref(), Some(
+                "Stage step:run failed: no failure detail was published. Inspect diagnostics and correct the cause before starting another run.",
+            ));
             assert!(ledger.iter().skip(1).all(|record|
                 record.status == crate::types::CommandLifecycleState::Running));
             ledger[0].completed_at_unix_ms.unwrap()
