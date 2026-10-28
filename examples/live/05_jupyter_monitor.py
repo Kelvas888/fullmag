@@ -6,9 +6,9 @@ plot, or a text table without matplotlib). Outside IPython it only collects
 the samples, so this file also runs as a plain script. Install the extras
 with ``pip install fullmag[jupyter]`` (IPython and matplotlib).
 
-Accepted Docker DEV runs do not project the scalar table yet, so the monitor
-may stay empty there; the last cells therefore also plot ``m`` read from the
-field route, which works on every lane.
+API builds older than PR #304 did not emit ``scalar.sample`` for accepted
+Docker DEV runs, so the monitor may stay empty there; the last cells therefore
+also plot ``m`` read from the field route, which works on every lane.
 
 Usage: open ``05_jupyter_monitor.ipynb`` with ``FULLMAG_URL`` set, or
     FULLMAG_URL=http://127.0.0.1:3197 python examples/live/05_jupyter_monitor.py
