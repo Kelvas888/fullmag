@@ -6,95 +6,90 @@ Data: 28.10.2026. Branch: `codex/ui-mesh-build-scenario-20261028`.
 
 Użytkownik uruchamia Fullmag bez skryptu, tworzy pustą symulację FEM, definiuje
 universe, dodaje dwie sfery (r = 50 nm, środki x = ±60 nm), ustawia w Inspektorze
-parametry siatki, buduje siatkę i ocenia jej jakość.
+parametry siatki, buduje siatkę i ocenia jej jakość. Potem zmienia geometrię albo
+parametry i przebudowuje siatkę.
 
-Scenariusz odtworzono w przeglądarce na grupie `fullmag-master` (port 3198, backend
-`0.1.0-dev.20261028.g44dccd0dc40d`, tryb Docker API-only). Grupy dla worktree zadania
-nie zbudowano: bramka launchera wymaga 32 GiB wolnego miejsca na dysku C:, na którym
-leży `docker_data.vhdx`, a dostępne było 28 GiB.
+**Stan wyjściowy.** Odtworzenie w przeglądarce na grupie `fullmag-master` (backend
+`0.1.0-dev.20261028.g44dccd0dc40d`, tryb Docker API-only) pokazało, że scenariusz nie
+przechodzi. Siatkę udało się zbudować dopiero po siedmiu obejściach przez API i tylko
+dla prostopadłościanów. Po pierwszym buildzie nie dało się już zmienić ani geometrii,
+ani parametrów siatki.
 
-Wynik: scenariusz nie przechodzi w obecnym stanie. Siatkę udało się zbudować dopiero
-po siedmiu obejściach przez API, i to dla prostopadłościanów zamiast sfer. Po pierwszym
-buildzie nie da się już zmienić ani geometrii, ani parametrów siatki.
+**Stan po poprawkach.** Cały scenariusz przechodzi z UI na grupie Docker kopii
+weryfikacyjnej worktree (`ui-mesh-build-verify-20261028`, port 3310). Szczegóły
+w sekcji Weryfikacja.
 
 ## Ustalenia
 
-Ważność: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza w błąd,
+Waga: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza w błąd,
 **N** – utrudnia pracę.
 
 | # | Waga | Objaw w UI | Przyczyna | Status |
 |---|---|---|---|---|
-| 1 | B | Apply polityki shared-domain kończy się błędem 400 `invalid type: boolean true, expected a string` | `SharedDomainMeshPolicySection` wysyła `h_max`/`h_min` jako liczby i `optimize` jako bool. Backend (`ScriptBuilderMeshState`) oczekuje `hmax`/`hmin`/`growth_rate` jako tekstu, a `optimize` jako nazwy optymalizatora. Odczyt też używał złych kluczy, więc zapisane wartości nie wracały do pól | poprawione na branchu |
-| 2 | B | Build sfery: „Sphere is preview-only for fem and cannot feed the production mesh pipeline yet” | `crates/fullmag-authoring/src/geometry.rs` oznacza `Sphere`/`Ellipsoid` jako `GEOMETRY_KIND_PREVIEW_ONLY`, a ribbon Geometry oferuje sferę bez ostrzeżenia. IR, konwersja `commands.rs` i mesher Pythona (`Ellipsoid` w OCC i voxelizacji) sferę obsługują | Rust na branchu (FEM), kompilacja NOT VERIFIED |
-| 3 | B | Build bez materiału: „Object references a missing material” | Walidacja geometrii blokuje `build_mesh` bez materiału i magnetyzacji, choć siatkowanie zależy tylko od geometrii | Rust na branchu (ADR 0074), kompilacja NOT VERIFIED |
-| 4 | B | Build bez interakcji: `IncompletePhysicsError: Problem requires at least one interaction` | Ścieżka buildu renderuje pełny skrypt `Problem`. Nowa sesja FEM ma `exchange_enabled = false` i `demag_enabled = false` | ADR 0074: build nie renderuje `Problem`; NOT VERIFIED |
-| 5 | B | Build bez etapu study: 422 „legacy live execution migration has no authored source for the StudyPlan” | W trybie Docker `mesh_build` wywołuje `ensure_live_accepted_study_with_transition`, który tworzy pełny, wykonywalny StudyPlan | ADR 0074: build bez RunIntent; NOT VERIFIED |
-| 6 | B | Universe w trybie Auto (domyślnym): „FEM demag requires a conformal shared-domain mesh … Call study.build_domain_mesh()” | Planowanie study przed buildem wymaga istniejącej siatki z powietrzem. Bez jawnego universe (Manual) to zależność cykliczna | ADR 0074: Auto bez paddingu daje czytelny błąd „ustaw rozmiar lub padding”; NOT VERIFIED w runtime |
-| 7 | B | Apply universe/Airbox: 409 „universe mesh policy changed since revision 0 (current 7)” | Rewizja polityki to `mesh_revision`, który rośnie przy każdym commicie sceny. Zasób polityki nie był unieważniany przy zmianie sceny, a brudny draft zachowywał starą rewizję | poprawione na branchu (unieważnianie i rebase) |
-| 8 | B | Po pierwszym udanym buildzie każda zmiana geometrii lub polityki siatki kończy się 409 `accepted_execution_input_locked`, a przycisk Stop jest nieaktywny | Build tworzy zaakceptowany run czekający na Compute. `validate_active_scene_mutation` blokuje zmiany wejścia nieterminalnego runu. W praktyce sesja zamarza i trzeba utworzyć nową | ADR 0074: build bez RunIntent, edycja dozwolona; NOT VERIFIED |
-| 9 | W | Siatka zbudowana z h_max = 10 nm ma w obiektach elementy o rozmiarze ~20–24 nm (313 tetraedrów na sześcian 80 nm). Raport deklaruje cel 1e-8 ze źródłem `workflow_default`, a „Size field kinds: none” | Dwie przyczyny. (a) Ścieżka Docker przekazuje politykę shared-domain tylko w `canonical_policy_snapshot`, a `remesh_cli` czyta rozmiary z top-level `mesh_options`. (b) W mesherze tło ma rozmiar `max(hmax, airbox_hmax)`, a ciało bez receptury per-obiekt nie dostaje zacisku, więc jest siatkowane w rozmiarze powietrza. Próba: przy `hmax` 10 i 20 nm sfery dostają te same 176 komórek | (b) poprawione i zweryfikowane pytestem (`7a8701987`); (a) poprawione w ścieżce ADR 0074, NOT VERIFIED |
-| 10 | W | Krok „sprawdzam jakość” jest niemożliwy. `GET …/shared-domain/quality` zwraca `{"revision":10}`, Latest Success = 0, Elements = unknown, log builda jest pusty, fazy pipeline mają status „pending”, a drzewo pokazuje „Mesh outdated – no source-scene provenance” | Ścieżka Docker publikuje siatkę i statystyki w raporcie (`mesh_statistics`: SICN min 0,44–0,47), ale nie wypełnia `mesh_quality_summary`, provenance ani historii buildów | ADR 0074 publikuje jakość, historię i `source_scene_revision`; NOT VERIFIED |
-| 11 | W | Readiness po udanym buildzie nadal pokazuje „Build a current shared-domain mesh before running” | Skutek braku provenance z pkt 10 | jak pkt 10 |
-| 12 | N | Ponowny build zaraz po zmianie polityki: „mesh_revision precondition failed: expected 7, got 8” | `MeshBuildDialog` bierze `mesh_revision` z bieżącego statusu sesji. Status nie odświeżył się po commicie polityki | częściowo: pkt 7 unieważnia polityki; odświeżenie statusu do weryfikacji |
-| 13 | N | Manifest siatki ma `object_id: "sphere_left"` (nazwę), a nie `sphere-left-mvscroi3` | Segmenty obiektów kluczowane nazwą geometrii, wbrew kontraktowi `object_id` ≠ `name` | otwarte |
-| 14 | N | „Mesh editor capabilities 0/8 – Capability fem is not advertised” w sesji FEM | Zasób meshingu nie publikuje capabilities | otwarte |
-| 15 | N | Po utworzeniu symulacji z „Configure now” Inspektor pokazywał „Nothing selected” zamiast Universe | Nieustalona. Wybór opcji nie został potwierdzony zrzutem; możliwa utrata `pendingDomainNavigationSessionIdRef` przy przemontowaniu po zmianie trasy | do weryfikacji |
-| 16 | N | Readiness uznaje interakcje za włączone na podstawie `physics_stack` obiektu, a renderer skryptu używa `study.exchange_enabled`/`demag_enabled` | Dwa źródła prawdy dla exchange/demag | otwarte |
-| 17 | W | Ustawienie „Element growth rate” = 1,3 kończy build błędem `adjacent_size_growth_exceeded: maximum ratio 1.72 exceeds allowed 1.3` | `_mesh_result_payload` traktuje zadany `growth_rate` jako twardą bramkę po siatkowaniu (tolerancja 0), a gmsh traktuje go tylko jako wskazówkę. Dotąd niewidoczne, bo ścieżka Docker gubiła top-level `mesh_options` | otwarte – decyzja: bramka czy wskazówka |
+| 1 | B | Apply polityki shared-domain kończy się błędem 400 `invalid type: boolean true, expected a string` | `SharedDomainMeshPolicySection` wysyłała `h_max`/`h_min` jako liczby i `optimize` jako bool. Backend (`ScriptBuilderMeshState`) oczekuje `hmax`/`hmin`/`growth_rate` jako tekstu, a `optimize` jako nazwy optymalizatora. Odczyt używał złych kluczy | naprawione, zweryfikowane w UI |
+| 2 | B | Build sfery: „Sphere is preview-only for fem” | `geometry.rs` oznaczał `Sphere`/`Ellipsoid` jako preview, choć IR i mesher je obsługują | naprawione dla FEM, zweryfikowane w UI |
+| 3 | B | Build bez materiału: „Object references a missing material” | Walidacja geometrii blokowała `build_mesh` bez materiału i magnetyzacji | naprawione (blokują tylko Compute), zweryfikowane |
+| 4 | B | Build bez interakcji: `IncompletePhysicsError` | Build renderował pełny skrypt `Problem` | naprawione (ADR 0074), zweryfikowane |
+| 5 | B | Build bez etapu study: 422 „no authored source for the StudyPlan” | `mesh_build` tworzył pełny, zaakceptowany StudyPlan | naprawione (ADR 0074), zweryfikowane |
+| 6 | B | Universe Auto: „FEM demag requires a conformal shared-domain mesh …” | Planowanie study przed buildem wymagało istniejącej siatki z powietrzem | build nie planuje study; Auto bez paddingu daje czytelny błąd (pytest) |
+| 7 | B | Apply Airbox: 409 „changed since revision 0 (current 7)” | Zasób polityki nie był unieważniany przy zmianie sceny, a brudny draft trzymał starą rewizję | naprawione, zweryfikowane w UI |
+| 8 | B | Po pierwszym buildzie każda zmiana geometrii lub polityki siatki kończy się 409 `accepted_execution_input_locked`, a Stop jest nieaktywny | Build tworzył run czekający na Compute, który zamrażał wejścia | naprawione (ADR 0074), zweryfikowane w UI |
+| 9 | W | Elementy w obiektach ~20–24 nm przy h_max = 10 nm | (a) ścieżka Docker nie przekazywała polityki do top-level `mesh_options`; (b) mesher nie zaciskał ciała bez receptury, gdy `airbox_hmax` > `hmax` | naprawione; (b) pytest, (a) UI: ~2270 tetraedrów na sferę zamiast 88–176 |
+| 10 | W | Brak jakości w UI: pusty `/quality`, Latest Success = 0, brak provenance | Ścieżka Docker nie publikowała `mesh_quality_summary` ani historii | naprawione: SICN/gamma w `/quality`, historia, `source_scene_revision` |
+| 11 | W | Readiness po buildzie: „Build a current shared-domain mesh” | Skutek pkt 10 | naprawione, zweryfikowane |
+| 12 | N | Build: „mesh_revision precondition failed: expected 3, got 4” | Status sesji nie odświeżał się po zmianie siatki | naprawione (status przy zdarzeniu Mesh), zweryfikowane |
+| 13 | N | Manifest z `object_id` równym nazwie | Segmenty kluczowane nazwą geometrii | naprawione w ścieżce ADR 0074 (`object_id` z dokumentu sceny) |
+| 14 | N | „Mesh editor capabilities 0/8 – fem is not advertised” | Zasób meshingu nie publikuje capabilities | otwarte |
+| 15 | N | „Configure now” w oknie New simulation nie otwiera Inspektora Universe | Potwierdzone (`aria-checked=true`, a Inspektor pokazuje „Nothing selected”); przyczyna nieustalona | otwarte |
+| 16 | N | Readiness uznaje interakcje na podstawie `physics_stack`, a renderer skryptu używa `study.exchange_enabled`/`demag_enabled` | Dwa źródła prawdy | otwarte |
+| 17 | W | „Element growth rate” = 1,3 kończy build błędem `adjacent_size_growth_exceeded` | `_mesh_result_payload` traktuje `growth_rate` jako twardą bramkę po siatkowaniu (tolerancja 0) | otwarte – decyzja: bramka czy wskazówka |
+| 18 | B | Build z sekcji Inspektora: „Choose FEM or FDM in Study settings” | Kontekst polecenia w Inspektorze nie miał statusu sesji | naprawione (Shared-Domain i Airbox), zweryfikowane |
+| 19 | N | Dialog buildu: „scene_revision precondition failed: expected 4, got 5” | Zasób sceny w dialogu podawał rewizję z cache | naprawione (nowsza z rewizji: zasób sceny albo status), zweryfikowane |
+| 20 | B | Druga edycja Airbox blokuje Compute: `scene_document_universe_conflict` | Trasa polityki universe aktualizowała `scene.universe` tylko przy pierwszym zapisie | naprawione, zweryfikowane |
+| 21 | B | Compute FEM po buildzie tylko z geometrii: „simulation preparation unavailable” | Frontend wymagał przygotowania, które dawniej powstawało przy buildzie | naprawione: przy braku przygotowania przygotowuje serwer; Compute zakończony |
+| 22 | N | Po udanym Apply Inspektory Universe i geometrii nadal zgłaszają niezapisane zmiany | Draft pozostaje „dirty” względem nowej bazy | otwarte |
+| 23 | N | Polecenie `close` w trybie Docker zostaje w kolejce (`queued`) | Brak konsumenta journala w trybie API-only | otwarte |
 
-## Poprawki na branchu
+## Commity
 
-1. `sharedDomainMeshPolicyDraft.ts` (wydzielone z `SharedDomainMeshPolicySection.tsx`)
-   zapisuje i czyta kanoniczne klucze `ScriptBuilderMeshState`: rozmiary jako tekst,
-   aliasy COMSOL zachowane, `optimize` jako nazwa optymalizatora (`Netgen` lub pusty
-   ciąg). Usuwa też starsze klucze `h_max`/`h_min`.
-2. `RealtimeInvalidationBridge` unieważnia semantykę i polityki siatki (universe,
-   shared-domain, obiekty) przy każdej zmianie dokumentu sceny.
-3. `rebaseAirboxMeshPolicyDraft` przenosi brudny draft Airbox na nowszą rewizję, gdy
-   autorska polityka universe na serwerze się nie zmieniła. Prawdziwa współbieżna
-   edycja polityki nadal kończy się konfliktem.
-
-Testy regresyjne: `sharedDomainMeshPolicyDraft.test.ts` i nowe przypadki w
-`airboxMeshPolicyDraft.test.ts`.
-
-4. Zacisk ciała w mesherze (`_study_default_body_clamp_fields`, nota 0102),
-   commit `7a8701987`, test `test_shared_domain_body_hmax.py`.
-5. Wariant A (ADR 0074, przyjęty 28.10.2026):
-   - moduł Pythona `fullmag.meshing.geometry_mesh_build` (commit `3da221619`,
-     test `test_geometry_mesh_build.py`);
-   - API: `live_geometry_mesh_build.rs` i dispatch `remesh` w trybie Docker bez
-     RunIntent;
-   - planer: `pack_geometry_only_shared_domain_mesh`;
-   - runner: `FemMeshPayload::from_geometry_only_domain_mesh`;
-   - authoring: materiał i magnetyzacja blokują tylko Compute, a sfera i
-     elipsoida są produkcyjne dla FEM.
-
-   Część Rust nie jest jeszcze skompilowana.
-
-## Plan dla pozostałych blokad
-
-**A. Odsprzęgnięcie siatkowania od fizyki i zaakceptowanego runu** (pkt 3–6, 8, 11).
-To decyzja architektoniczna dla ścieżki Docker API-only. Rekomendacja: `mesh_build`
-przygotowuje wyłącznie artefakt siatki z geometrii, universe i polityk, bez tworzenia
-zaakceptowanego RunIntent. Walidacja materiałów, interakcji i etapów przechodzi do
-Compute. Siatka niesie provenance `source_scene_revision`, a zmiana geometrii lub
-polityki oznacza ją jako nieaktualną, zamiast blokować edycję. Wariant minimalny:
-run przygotowawczy, który nie blokuje wejść i jest zastępowany przy kolejnej zmianie
-sceny. Ten wariant nadal wymaga fizyki.
-
-**B. Sfera i elipsoida jako geometria produkcyjna FEM/FDM** (pkt 2), z testem siatki
-dwóch sfer w `packages/fullmag-py/tests`.
-
-**C. Egzekwowanie rozmiarów i publikacja jakości** (pkt 9–10, 13): przekazanie
-polityki shared-domain i per-obiekt do `mesh_options` w ścieżce Docker, publikacja
-`mesh_quality_summary`, provenance i historii buildu, segmenty kluczowane `object_id`.
+- `664902d6e`, `ccc864c53` – raport audytu.
+- `7a8701987` – zacisk rozmiaru ciała w mesherze, nota 0102, test pytest.
+- `3da221619` – moduł `fullmag.meshing.geometry_mesh_build` i ADR 0074.
+- `49b9caf51` – API: build siatki tylko z geometrii (bez RunIntent), bramki
+  authoringu, sfera i elipsoida FEM, pakowanie w planerze, payload w runnerze.
+- `cf8bfb283` – synchronizacja `universe` z `study.universe_mesh`.
+- `117efbdf4` – format polityki shared-domain i kontekst polecenia w Inspektorze.
+- `d7397891f` – aktualne rewizje buildu, rebase Airbox, Compute bez przygotowania.
 
 ## Weryfikacja
 
-- Odtworzenie scenariusza: przeglądarka, grupa `fullmag-master`, sesja
-  `mesh-two-spheres-probe`. Dowodem są komunikaty błędów i odpowiedzi API cytowane
-  w tabeli.
-- Poprawki 1–3: NOT VERIFIED w runtime ani w kontroli typów. Zarządzana trasa
-  `check-control-room-production-source` wymaga workspace zależności, którego nie da
-  się przygotować bez grupy Docker worktree. Testów jednostkowych nie uruchamiano
-  (obowiązujący zakaz).
+- **pytest** (Python hosta: miniconda, gmsh 4.15.2; nie interpreter zarządzany przez
+  repo): `test_shared_domain_body_hmax.py` i `test_geometry_mesh_build.py` przechodzą.
+  W `test_meshing.py`, `test_meshing_fallbacks.py`,
+  `test_conformal_occ_degenerate_retry_regression.py` i `test_mixed_element_meshing.py`
+  przechodzi 602 testów. 9 pada identycznie z poprawką i bez niej (środowisko hosta).
+- **Kompilacja Rust:** backend grupy weryfikacyjnej zbudował się z całą zmianą
+  (`development: succeeded`, potem restart `iteration: succeeded` po zmianie `mesh.rs`).
+  Testów jednostkowych Rust nie kompilowano (obowiązujący zakaz).
+- **Frontend:** `tsc --noEmit` na kodzie produkcyjnym (bez plików testów) i ESLint
+  `--max-warnings=0` na zmienionych plikach przechodzą w kontenerze `frontend` grupy.
+  Testów vitest nie uruchamiano.
+- **Przeglądarka (port 3310), krok po kroku:**
+  1. Nowa symulacja FEM.
+  2. Universe Manual 400×240×240 nm, `airbox_hmax` 30 nm (Apply z Inspektora).
+  3. Dwie sfery z wstążki, bez materiałów.
+  4. Polityka shared-domain h_max 10 nm, h_min 3 nm, Netgen (zapis i odczyt).
+  5. Build z sekcji Inspektora: 12 325 tetraedrów, ~2270 na sferę, SICN p5 0,62,
+     segmenty z `object_id`, readiness bez blokady siatki.
+  6. Zmiana promienia prawej sfery na 40 nm (bez 409) i rebuild: 1215 elementów.
+  7. Zmiana h_max na 20 nm i `airbox_hmax` na 40 nm (200) i rebuild: 336/198 elementów.
+  8. Fizyka, etap relax i Compute: `solve` zakończony, 8 kroków.
+
+  Canvas WebGL jest widoczny, kontekst nie jest utracony, bufor rysowania ma 684×449,
+  a dialog potwierdził renderowanie nowej rewizji siatki.
+- **Środowisko:** grupy pierwotnego worktree nie dało się uruchomić. Najpierw zabrakło
+  pul adresów sieci Docker; za zgodą użytkownika usunięto 8 pustych sieci. Potem
+  launcher zostawił znacznik aktywnej operacji bez usług. Do weryfikacji użyto
+  odłączonej kopii worktree na tym samym commicie z tymi samymi zmianami. Bramkę
+  wolnego miejsca launchera (32 GiB) na polecenie użytkownika obniżono lokalnie do
+  24 GiB tylko na czas weryfikacji; zmiana nie weszła do commitów.

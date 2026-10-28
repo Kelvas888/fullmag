@@ -1,7 +1,9 @@
 # ADR 0074: Build siatki FEM wyłącznie z geometrii
 
 Status: przyjęte przez użytkownika 28.10.2026 (wariant A z audytu
-`docs/audits/2026-10-28-ui-mesh-build-scenario-audit.md`); runtime NOT VERIFIED.
+`docs/audits/2026-10-28-ui-mesh-build-scenario-audit.md`). Zweryfikowane w przeglądarce
+na grupie Docker DEV (FEM CPU): build bez fizyki, edycja po buildzie i Compute.
+FEM GPU i FDM NOT VERIFIED.
 
 ## Kontekst
 
