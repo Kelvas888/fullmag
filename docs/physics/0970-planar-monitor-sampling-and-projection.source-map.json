@@ -789,6 +789,13 @@
       "symbol": "tracePlanarStreamlines",
       "responsibility": "In-plane streamline presentation: bilinear direction field, RK4 in physical length, Jobard-Lefer seeding, deterministic order and bounded budgets.",
       "evidence_status": "implemented-unit-tests-not-run"
+    },
+    {
+      "id": "planar-element-index",
+      "path": "crates/fullmag-api/src/planar_sampling/element_index.rs",
+      "symbol": "ElementBvh",
+      "responsibility": "AABB hierarchy over selected FEM elements for batched point location (profiles); candidates in ascending element order so results equal the direct scan.",
+      "evidence_status": "implemented-compiled-unit-tests-not-run"
     }
   ],
   "public_api": {

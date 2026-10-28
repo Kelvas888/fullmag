@@ -910,6 +910,24 @@ cells is applied. Points outside the frame are `outside`, points outside the
 sampled target are `empty`, and neither carries a value. A profile is a derived
 resource of one sample (`sample_token`); it never resamples the raster.
 
+### Spatial index for point location
+
+Point evaluations of a FEM sample ({ref}`planar-monitor-probe-evaluation`,
+{eq}`eq-planar-line-profile`) locate the element that contains a world point.
+For a batch of points (a line profile, from 32 points on) the locator first
+builds a bounding-volume hierarchy over the axis-aligned boxes of the selected
+elements (median split on the longest centroid axis, leaves of at most 8
+elements) and tests only the elements whose box, padded by $10^{-9}$ of the
+mesh diagonal to cover the $10^{-11}$ weight tolerance of the containment
+test, contains the point. Candidates are tested in ascending element index,
+the order of the direct scan, so a point on a shared face resolves to the same
+element and the value, entity id and occupancy are identical to the direct
+traversal; the index changes cost, never results. It is built per request and
+discarded with it; a single probe keeps the direct scan, which is cheaper than
+building the index. The plane operator keeps its per-element rasterization,
+and gathering the cached operator on the device for the FEM GPU lane is not
+implemented.
+
 ### In-plane streamlines (presentation)
 
 Streamlines are a presentation of the in-plane projection of one vector
@@ -1047,7 +1065,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N13 | FDM target × dynamic-extent cross-product | `target_bounds`, `magnetic_domain`, and `universe` resolve independently of target masking for `domain`, `magnetic_domain`, `object`, and `region`; the current distinct-bounds source path requires fresh per-lane qualification |
 | PM-N14 | FDM procedural grid overlay | `FMFG v1` zawiera skończone, nieduplikowane segmenty przecięcia wybranych komórek z $s=0$, zachowuje sample identity i odrzuca przekroczenie budżetu zamiast zwracać uciętą geometrię |
 | PM-N16 | cached operator vs. direct evaluation on Tet4, Prism6 and FDM | relative agreement $\le 10^{-13}$ of the occupied range; two operator builds bitwise identical |
-| PM-N17 | spatial index on 10k, 200k and 2M Tet4 elements | identical raster to the direct traversal; bounded candidate count per plane |
+| PM-N17 | spatial index for batched point location on structured and graded Tet4 meshes (interior, face, edge and outside points; unselected elements) | located element and value identical to the direct scan for every point; candidate count bounded by the elements around a node; plane-operator indexing and the 200k/2M scale points remain open |
 | PM-N18 | Hex8 linear and trilinear manufactured fields, axis and oblique planes | reproduction within $10^{-12}$ relative; no tetrahedral split |
 | PM-N19 | Pyramid5 basis against the linked MFEM first-order pyramid | pointwise agreement of all five shape functions at interior and face points |
 | PM-N20 | Prism6/Hex8/Pyramid5 slab of the element interpolant ($q=\xi\tau$) | integral exact to quadrature tolerance; linear clipping fails this gate |
