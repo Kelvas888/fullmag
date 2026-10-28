@@ -2484,6 +2484,7 @@ async fn apply_projection(
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
     let mut changed = profile_changed;
+    let mut scalar_sample_advanced = false;
     if let Some(run) = next.run.as_mut() {
         if run.status != projection.status {
             run.status = projection.status.to_string();
@@ -2679,6 +2680,14 @@ async fn apply_projection(
             };
             if row.is_physical_observation() {
                 let scalar_revision = next.scalar_revision;
+                // A run's latest durable row never moves backwards, so an
+                // earlier step means a new step lineage: a run started from a
+                // fresh model in the same session (fm.reset(), a sweep point).
+                // The append-only table would reject every row of that run and
+                // keep reporting the previous run's final state.
+                if next.scalar_rows.last().is_some_and(|last| row.step < last.step) {
+                    next.scalar_rows.clear();
+                }
                 crate::session::apply_current_live_scalar_frame(
                     &mut next,
                     crate::types::CurrentLiveScalarFrameRequest {
@@ -2686,7 +2695,10 @@ async fn apply_projection(
                         latest_scalar_row: Some(row),
                     },
                 )?;
-                changed |= next.scalar_revision != scalar_revision;
+                if next.scalar_revision != scalar_revision {
+                    changed = true;
+                    scalar_sample_advanced = true;
+                }
             }
         }
     }
@@ -2896,6 +2908,18 @@ async fn apply_projection(
     }
     next.state_version = next.state_version.saturating_add(1);
     let published_fence = ProjectionPublicationFence::capture(&next)?;
+    // Accepted runs publish scalars through this projection, so emit the same
+    // scalar.sample event the interactive sync path does for live clients.
+    let scalar_sample = scalar_sample_advanced
+        .then(|| next.scalar_rows.last().cloned())
+        .flatten()
+        .map(|row| crate::PendingRealtimeScalarSample {
+            session_id: next.session.session_id.clone(),
+            run_id: next.run.as_ref().map(|run| run.run_id.clone()),
+            revision: next.scalar_revision,
+            row,
+            terminal,
+        });
     let mut realtime_state =
         crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
 
@@ -2946,6 +2970,9 @@ async fn apply_projection(
         let mut current = state.current_live_state.write().await;
         std::mem::replace(&mut *current, Some(next))
     };
+    if let Some(sample) = scalar_sample {
+        crate::queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
+    }
     drop(transition);
     if let Some(previous) = previous {
         let _ = tokio::task::spawn_blocking(move || drop(previous));
@@ -3168,6 +3195,15 @@ mod tests {
         ProjectionContext,
         fullmag_session::FmsRunCatalog,
     ) {
+        preclaim_cancelled_scene_fixture(None)
+    }
+
+    fn preclaim_cancelled_scene_fixture(authored: Option<&fullmag_authoring::SceneDocument>) -> (
+        tempfile::TempDir,
+        fullmag_session::SessionStore,
+        ProjectionContext,
+        fullmag_session::FmsRunCatalog,
+    ) {
         use fullmag_application::{ProjectEnvelope, ProjectId, ProjectSnapshot, RequestedExecution,
             RequestedResourceBudget, RunId, RunIntent, RunSpecification, StudyId, StudyReference};
         use fullmag_authoring::{PrimitiveStageNode, StudyDiscretizationReference,
@@ -3178,7 +3214,17 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let store = fullmag_session::SessionStore::open(directory.path().join("store")).unwrap();
-        let definition = ProjectEnvelope::blank(ProjectId::parse("project-cancel").unwrap(), "Cancel").unwrap();
+        let mut definition = ProjectEnvelope::blank(ProjectId::parse("project-cancel").unwrap(), "Cancel").unwrap();
+        if let Some(authored) = authored {
+            // Reproduce the historical writer: immutable definition contains
+            // the derived profile, while RunIntent pins the authored scene.
+            let mut effective = authored.clone();
+            effective.study.execution_profile = Some(fullmag_application::legacy_live_execution_profile());
+            definition.replace_scene(fullmag_application::RawJsonEnvelope::from_value(
+                serde_json::to_value(effective).unwrap()).unwrap()).unwrap();
+            definition.definition.revision = authored.revision;
+            definition.rewrite_known_fields().unwrap();
+        }
         let study = StudyPlan::from_pipeline("study-cancel", 1, &StudyPipelineDocument {
             version: "study_pipeline.v2".into(),
             nodes: ["step:run", "step:run-2"].into_iter().map(|id|
@@ -3199,7 +3245,9 @@ mod tests {
         ).collect()).unwrap();
         let context = ProjectionContext {
             session_id: "session-cancel".into(), run_id: "run-cancel".into(), session_epoch: 4,
-            scene_revision: 9, execution_input: None, api_instance_id: "api-cancel".into(),
+            scene_revision: authored.map_or(9, |scene| scene.revision),
+            execution_input: authored.map(|scene| crate::live_execution_binding::input_identity(scene).unwrap()),
+            api_instance_id: "api-cancel".into(),
             allow_api_instance_rebind: false,
         };
         let mut specification = RunSpecification::new(
@@ -3217,6 +3265,9 @@ mod tests {
                 }) },
         );
         specification.run_id = RunId::parse(context.run_id.clone()).unwrap();
+        if let Some(identity) = context.execution_input.as_ref() {
+            specification.parameters["live_workspace"]["execution_input"] = serde_json::to_value(identity).unwrap();
+        }
         crate::run_intent_persistence::commit_validated_run_intent(&store,
             &RunIntent::new("submit-cancel", specification), &definition, &study, &problem_catalog,
             &std::collections::BTreeMap::new()).unwrap();
@@ -3771,7 +3822,7 @@ mod tests {
                 "status":"accepted"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
+        // apply_projection owns its publication transition fence.
         apply_projection(&state, &context, projection).await.unwrap();
         let current = state.current_live_state.read().await;
         let snapshot = current.as_ref().unwrap();
@@ -3788,6 +3839,68 @@ mod tests {
             .read_live_command_journal(&context.session_id).unwrap().unwrap();
         let journal: Value = serde_json::from_slice(&journal).unwrap();
         assert_eq!(journal["records"][0]["completion_status"], "cancelled");
+        assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn recovered_legacy_profile_completes_stop_in_snapshot_and_durable_journal() {
+        let mut authored = fullmag_authoring::SceneDocument::default();
+        authored.revision = 9;
+        authored.scene.id = "session-cancel".into();
+        assert!(authored.study.execution_profile.is_none());
+        let (directory, store, mut context, _) = preclaim_cancelled_scene_fixture(Some(&authored));
+        let accepted = fullmag_runtime_control::load_accepted_study_snapshot(
+            &store,
+            &fullmag_application::RunId::parse(context.run_id.clone()).unwrap(),
+            &fullmag_application::ProjectId::parse("project-cancel").unwrap(),
+        ).unwrap();
+        let restored = crate::development_accepted_restore::scene_from_definition(
+            &accepted.run.definition_bytes, &accepted.run.specification,
+        ).unwrap();
+        assert_eq!(restored, authored);
+        context.execution_input = Some(crate::live_execution_binding::input_identity(&restored).unwrap());
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let journal_root = directory.path().join("recovered-journal");
+        Arc::get_mut(&mut state).unwrap().current_command_journal_store_root = Some(journal_root.clone());
+        context.api_instance_id = state.request_scope_instance_id.clone();
+        context.allow_api_instance_rebind = true;
+        state.current_live_session_epoch.store(context.session_epoch, std::sync::atomic::Ordering::Release);
+        {
+            let mut current = state.current_live_state.write().await;
+            let snapshot = current.as_mut().unwrap();
+            snapshot.session.session_id = context.session_id.clone();
+            snapshot.session.run_id = context.run_id.clone();
+            snapshot.session.status = "stopping".into();
+            snapshot.scene_document = Some(restored);
+            snapshot.run = Some(serde_json::from_value(json!({
+                "run_id":context.run_id, "session_id":context.session_id,
+                "status":"stopping", "total_steps":2, "artifact_dir":""
+            })).unwrap());
+        }
+        state.current_command_ledger.lock().await.push_back(serde_json::from_value(json!({
+            "command":{"seq":1,"command_id":"stop-command","kind":"stop","created_at_unix_ms":1,
+                "target":{"kind":"run","run_id":context.run_id}},
+            "status":"accepted"
+        })).unwrap());
+        let catalog_before = std::fs::read(store.root().join(format!("runs/{}/run_catalog.json", context.run_id))).unwrap();
+        let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
+        apply_projection(&state, &context, projection).await.unwrap();
+        {
+            let current = state.current_live_state.read().await;
+            let snapshot = current.as_ref().unwrap();
+            assert_eq!(snapshot.session.status, "cancelled");
+            assert_eq!(snapshot.run.as_ref().unwrap().status, "cancelled");
+        }
+        let ledger = state.current_command_ledger.lock().await;
+        assert_eq!(ledger[0].status, crate::types::CommandLifecycleState::Completed);
+        assert_eq!(ledger[0].completion_status, Some(crate::types::CommandCompletionState::Completed));
+        drop(ledger);
+        let journal = fullmag_session::SessionStore::open_existing(journal_root).unwrap()
+            .read_live_command_journal(&context.session_id).unwrap().unwrap();
+        let journal: Value = serde_json::from_slice(&journal).unwrap();
+        assert_eq!(journal["records"][0]["status"], "completed");
+        assert_eq!(journal["records"][0]["completion_status"], "completed");
+        assert_eq!(catalog_before, std::fs::read(store.root().join(format!("runs/{}/run_catalog.json", context.run_id))).unwrap());
         assert!(store.read_artifact_catalog(&context.run_id).unwrap().is_none());
     }
 
@@ -3830,7 +3943,7 @@ mod tests {
                 "status":"running"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
+        // apply_projection owns its publication transition fence.
         let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert_eq!(projection.status, "failed");
         assert!(projection.terminal_without_outputs);
@@ -3842,7 +3955,9 @@ mod tests {
             let ledger = state.current_command_ledger.lock().await;
             assert_eq!(ledger[0].status, crate::types::CommandLifecycleState::Failed);
             assert_eq!(ledger[0].completion_status, Some(crate::types::CommandCompletionState::Failed));
-            assert_eq!(ledger[0].error.as_deref(), Some("accepted Study execution failed"));
+            assert_eq!(ledger[0].error.as_deref(), Some(
+                "Stage step:run failed: no failure detail was published. Inspect diagnostics and correct the cause before starting another run.",
+            ));
             assert!(ledger.iter().skip(1).all(|record|
                 record.status == crate::types::CommandLifecycleState::Running));
             ledger[0].completed_at_unix_ms.unwrap()

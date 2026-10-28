@@ -1480,9 +1480,13 @@ pub(crate) fn materialize_accepted_run_catalog(
             updated_at: Utc::now(),
             tasks,
         };
-        match fullmag_runtime_control::retry_store_writer_busy(|| {
-            store.commit_run_catalog(&materialized)
-        }) {
+        // A busy writer leaves nothing published, so waiting longer is safe;
+        // on a Windows-folder store five seconds left accepted runs in
+        // recovery for a writer that was only briefly held.
+        match fullmag_runtime_control::retry_store_writer_busy_within(
+            RUN_CATALOG_WRITER_WAIT,
+            || store.commit_run_catalog(&materialized),
+        ) {
             Ok(()) => materialized,
             Err(error) => {
                 if let Some(existing) = store.read_run_catalog(run_id)? {
@@ -1537,6 +1541,9 @@ pub(crate) fn materialize_accepted_run_catalog(
     }
     Ok(catalog)
 }
+
+/// How long run catalog publication waits for a busy session-store writer.
+const RUN_CATALOG_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn same_task_identity(existing: &[FmsTaskCatalogEntry], expected: &[FmsTaskCatalogEntry]) -> bool {
     existing.len() == expected.len()
