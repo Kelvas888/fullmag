@@ -103,7 +103,11 @@ def validate_gate_container_mounts(actual, service, document, state_root):
         require(isinstance(mount, dict) and mount.get("Type") == kind and mount.get("RW") is writable,
                 "Initial-gate retained mount mode differs: " + service + target)
         observed = mount.get("Source") if kind == "bind" else mount.get("Name")
-        require(observed == source, "Initial-gate retained mount source differs: " + service + target)
+        daemon_pin = document["services"][service].get("x-fullmag-daemon-binds", {}).get(target)
+        pinned_wsl_alias = (kind == "bind" and isinstance(observed, str)
+            and observed.startswith("/run/desktop/mnt/host/wsl/") and observed == daemon_pin)
+        require(observed == source or pinned_wsl_alias,
+                "Initial-gate retained mount source differs: " + service + target)
     if service == "backend":
         require(str(_compose_state_root(document).resolve(strict=True)) == str(Path(state_root).resolve(strict=True)),
                 "Initial-gate state root differs from the pinned Compose bind")
@@ -545,8 +549,9 @@ def _protected_retained_mounts(original, document, r, volumes=None, *, state_roo
     return protected, protected_state_root
 
 
-def _live_mount_consumes(actual, protected_volumes, protected_state_root):
-    return any((mount.get("Name") in protected_volumes or mount.get("Source") == protected_state_root)
+def _live_mount_consumes(actual, protected_volumes, protected_state_root, *, state_alias=None):
+    return any((mount.get("Name") in protected_volumes or mount.get("Source") == protected_state_root
+                or (state_alias is not None and mount.get("Source") == state_alias))
                and mount.get("RW") is True for mount in actual.get("Mounts", []))
 
 
@@ -672,10 +677,12 @@ def observe(control, source, r, result=None, helper_name=None):
     running = docker_capture("ps", "--no-trunc", "--format", "{{.ID}}").stdout.decode().split()
     retained_volumes, retained_state_root = _protected_retained_mounts(
         original, document, r, volumes, state_root=state if r["schema"] == GATE_FAILURE_SCHEMA else None)
+    state_alias = (document['services']['backend'].get('x-fullmag-daemon-binds', {}).get('/state')
+                   if r['schema'] == GATE_FAILURE_SCHEMA else None)
     for actual in (json.loads(docker_capture("inspect", *running).stdout) if running else []):
         if helper_name and actual.get("Name") == "/" + helper_name:
             continue
-        require(not _live_mount_consumes(actual, retained_volumes, retained_state_root),
+        require(not _live_mount_consumes(actual, retained_volumes, retained_state_root, state_alias=state_alias),
             "A live container consumes retained volumes")
     # This scanner identifies our held Docker helper as a mutating client.
     # Scan before acquiring it; canonical admissions thereafter share its flock.

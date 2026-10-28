@@ -282,6 +282,20 @@ class InterruptedDevelopmentTests(unittest.TestCase):
         self.assertTrue(recovery._live_mount_consumes(state_consumer, retained, state_root))
         self.assertEqual(state_root, str(self.state_root))
 
+    def test_gate_mount_accepts_only_the_exact_retained_wsl_alias(self):
+        _, _, document = self.gate_fixture()
+        alias='/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/pinned'
+        self.actual['backend']['Mounts'][0]['Source']=alias
+        with self.assertRaises(BuildControlError):
+            recovery.validate_gate_container_mounts(self.actual['backend'],'backend',document,self.state_root)
+        document['services']['backend']['x-fullmag-daemon-binds']={'/state':alias}
+        recovery.validate_gate_container_mounts(self.actual['backend'],'backend',document,self.state_root)
+        consumer={'Mounts':[{'Source':alias,'RW':True}]}
+        self.assertTrue(recovery._live_mount_consumes(consumer,set(),str(self.state_root),state_alias=alias))
+        self.actual['backend']['Mounts'][0]['Source']=alias+'-different'
+        with self.assertRaises(BuildControlError):
+            recovery.validate_gate_container_mounts(self.actual['backend'],'backend',document,self.state_root)
+
     def test_existing_live_mount_protection_still_includes_package_volume(self):
         original = {"backend_volumes": {"build": "build", "package": "global-package", "control": "control"},
                     "frontend_volume": "frontend", "state_root": "/own/state"}
