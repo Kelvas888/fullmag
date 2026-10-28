@@ -17,6 +17,7 @@ use super::{
     validate_container_recovery_attestation, validate_lower_hex,
     RuntimeServiceContainerRecoveryRequest, RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V2,
     RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V3,
+    RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V4,
 };
 
 pub const DOCKER_NAMESPACE_ABSENCE_ATTESTATION_SCHEMA: &str =
@@ -96,15 +97,22 @@ impl DockerNamespaceAbsenceAttestation {
             RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V2 => {
                 request.retained_cancelled_runs.is_some()
                     && request.retained_terminal_runs.is_none()
+                    && request.retained_held_manual_runs.is_none()
             }
             RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V3 => {
                 request.retained_terminal_runs.is_some()
+                    && request.retained_cancelled_runs.is_none()
+                    && request.retained_held_manual_runs.is_none()
+            }
+            RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V4 => {
+                request.retained_terminal_runs.is_some()
+                    && request.retained_held_manual_runs.is_some()
                     && request.retained_cancelled_runs.is_none()
             }
             _ => false,
         };
         if !retained_runs_pinned {
-            bail!("Docker namespace absence proof requires a retained-run v2 or v3 request");
+            bail!("Docker namespace absence proof requires a retained-run v2, v3 or v4 request");
         }
         if self.schema_version != DOCKER_NAMESPACE_ABSENCE_ATTESTATION_SCHEMA {
             bail!("unsupported Docker namespace absence attestation schema");

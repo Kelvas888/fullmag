@@ -4,6 +4,7 @@ use fullmag_session::runtime_service::{
     RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA,
     RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V2,
     RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V3,
+    RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V4,
 };
 
 pub(crate) fn document() -> serde_json::Value {
@@ -14,6 +15,7 @@ pub(crate) fn document() -> serde_json::Value {
             RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA,
             RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V2,
             RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V3,
+            RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V4,
         ],
         "build_identity": {
             "version": fullmag_build_info::version(),
@@ -66,6 +68,7 @@ mod tests {
                 RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA,
                 RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V2,
                 RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V3,
+                RUNTIME_SERVICE_CONTAINER_RECOVERY_REQUEST_SCHEMA_V4,
             ])
         );
         assert_eq!(

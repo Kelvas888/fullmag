@@ -18,6 +18,19 @@ class TerminalContainerRecoveryTests(unittest.TestCase):
     def terminal_pin():
         return {'run_id':'terminal-1','run_intent_sha256':'1'*64,'run_catalog_sha256':'2'*64,'artifact_catalog_sha256':None}
 
+    @staticmethod
+    def held_pin():
+        return {'run_id':'held-1','run_intent_sha256':'3'*64,'run_catalog_sha256':'4'*64,'start_release':'absent'}
+
+    def make_v4(self, context, terminal=None):
+        request=context['request']
+        request['schema_version']=r.CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA
+        request['retained_terminal_runs']=[] if terminal is None else terminal
+        request['retained_held_manual_runs']=[self.held_pin()]
+        request.pop('retained_cancelled_runs',None)
+        context['request_sha256']=r._sha256_bytes(r._canonical_container_recovery_json(request))
+        return request
+
     def fixture(self, root):
         fixture=fixtures.ContainerRuntimeRecoveryBridgeTests()._document_fixture(root)
         package=root/'package'; (package/'bin').mkdir(parents=True)
@@ -37,7 +50,7 @@ class TerminalContainerRecoveryTests(unittest.TestCase):
         context={'request':request,'request_sha256':request_sha,'config_sha256':request['config_sha256'],'authorization':authorization,
                  'request_path':root/'request.json','attestation_path':root/'attestation.json','attestation_sha256':'c'*64,'expected_owner':owner}
         capability={'schema_version':r.CONTAINER_RECOVERY_CAPABILITIES_SCHEMA,
-                    'supported_recovery_schemas':[r.CONTAINER_RECOVERY_REQUEST_SCHEMA,'runtime_service_container_recovery_request.v2',r.CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA],
+                    'supported_recovery_schemas':[r.CONTAINER_RECOVERY_REQUEST_SCHEMA,'runtime_service_container_recovery_request.v2',r.CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA,r.CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA],
                     'build_identity':{'version':'0.1.0','built_at_utc':'2026-10-27T12:00:00Z','git_commit':'a'*40,'worktree_state':'clean','source_snapshot_sha256':'b'*64}}
         return paths,context,capability,fixture
 
@@ -187,6 +200,28 @@ class TerminalContainerRecoveryTests(unittest.TestCase):
         cancelled={key:value for key,value in pin.items() if key!='artifact_catalog_sha256'}
         self.assertEqual(r._container_recovery_expected_outcome({'schema_version':'runtime_service_container_recovery_request.v2','retained_cancelled_runs':[cancelled]}),'retained_cancelled_runs_recovered')
 
+    def test_v4_held_manual_pin_pairing_limits_and_v3_isolation(self):
+        terminal=self.terminal_pin(); held=self.held_pin()
+        request={'schema_version':r.CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA,
+                 'retained_terminal_runs':[],'retained_held_manual_runs':[held]}
+        self.assertEqual(r._container_recovery_expected_outcome(request),'retained_manual_held_runs_recovered')
+        self.assertEqual(r._container_recovery_expected_outcome({**request,'retained_terminal_runs':[terminal]}),
+                         'retained_manual_held_runs_recovered')
+        for changed in (
+            {**request,'retained_held_manual_runs':[]},
+            {**request,'retained_held_manual_runs':[{**held,'start_release':'present'}]},
+            {**request,'retained_held_manual_runs':[{**held,'unexpected':True}]},
+            {**request,'retained_held_manual_runs':[{**held,'run_intent_sha256':'invalid'}]},
+            {**request,'retained_terminal_runs':[terminal],'retained_held_manual_runs':[{**held,'run_id':terminal['run_id']}]},
+            {**request,'retained_cancelled_runs':[]},
+            {**request,'retained_terminal_runs':[terminal]*128},
+        ):
+            with self.subTest(changed=changed),self.assertRaises(r.RuntimeServiceError):
+                r._container_recovery_expected_outcome(changed)
+        v3={'schema_version':r.CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA,'retained_terminal_runs':[terminal],
+            'retained_held_manual_runs':[held]}
+        with self.assertRaises(r.RuntimeServiceError):r._container_recovery_expected_outcome(v3)
+
     def test_absence_attestation_accepts_exact_v3_terminal_pins(self):
         with tempfile.TemporaryDirectory() as directory:
             paths,context,cap,_=self.fixture(Path(directory)); request=context['request']
@@ -203,6 +238,59 @@ class TerminalContainerRecoveryTests(unittest.TestCase):
             with self.assertRaises(r.RuntimeServiceError):r._validate_container_recovery_attestation_document(v1,context['request_sha256'],attestation,'a'*64)
             attestation['containers'][0]['absence']['ps_all']['outcome']='unknown'
             with self.assertRaises(r.RuntimeServiceError):r._validate_container_recovery_attestation_document(request,context['request_sha256'],attestation,'a'*64)
+
+    def test_absence_attestation_accepts_v4_and_request_digest_freezes_held_pins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths,context,cap,_=self.fixture(Path(directory)); request=self.make_v4(context)
+            attestation={'schema_version':r.CONTAINER_RECOVERY_ABSENCE_ATTESTATION_SCHEMA,
+                'request_sha256':context['request_sha256'],'docker_engine_id_sha256':request['docker_engine_id_sha256'],
+                'manifest_sha256':request['docker_manifest_sha256'],'result':'authoritative_namespace_absence',
+                'device_release':{'resource_id':request['device_release_resource_id'],'mapping_sha256':request['device_release_mapping_sha256'],'mapping_detached':True},
+                'containers':[{'container_id':pin['container_id'],'image_id':pin['image_id'],'config_sha256':pin['config_sha256'],'service':pin['service'],
+                    'absence':{'inspect':{'outcome':'no_such_object','matched_container_id':pin['container_id'],'output_sha256':'1'*64},
+                               'ps_all':{'outcome':'empty','output_sha256':'2'*64}}} for pin in request['containers']]}
+            r._validate_container_recovery_attestation_document(request,context['request_sha256'],attestation,'a'*64)
+            request['retained_held_manual_runs']=[{**self.held_pin(),'run_catalog_sha256':'5'*64}]
+            changed_sha=r._sha256_bytes(r._canonical_container_recovery_json(request))
+            with self.assertRaisesRegex(r.RuntimeServiceError,'request'):
+                r._validate_container_recovery_attestation_document(request,changed_sha,attestation,'a'*64)
+
+    def test_v4_actual_capability_gate_precedes_mutator_and_pins_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths,context,cap,_=self.fixture(Path(directory)); request=self.make_v4(context); calls=[]
+            raw=(json.dumps(cap,indent=2)+'\n').encode()
+            failed=json.dumps({**context['expected_owner'],'state':'failed'}).encode(); receipt=self.receipt(context,failed)
+            original=(paths.runtime_services/'OWNER.json').read_bytes()
+            def cli(paths,args,*,timeout,cli,raw_output=None):
+                calls.append(tuple(args))
+                if args[1]=='service-container-recovery-capabilities':
+                    raw_output.append(raw);return cap
+                (paths.runtime_services/'OWNER.json').write_bytes(failed);return receipt
+            result=self.run_recovery(paths,context,cli)
+            self.assertEqual(result['outcome'],'retained_manual_held_runs_recovered')
+            self.assertEqual([call[1] for call in calls],['service-container-recovery-capabilities','service-recover-container'])
+            proof=list(paths.runtime_services.glob('container-recovery/*/native-capabilities/*.json'))
+            self.assertEqual(len(proof),1)
+            self.assertEqual(json.loads(proof[0].read_bytes())['request_schema'],r.CONTAINER_RECOVERY_HELD_MANUAL_REQUEST_SCHEMA)
+            self.assertNotEqual((paths.runtime_services/'OWNER.json').read_bytes(),original)
+
+    def test_v4_requires_actual_native_capability_and_replay_skips_mutator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths,context,cap,_=self.fixture(Path(directory)); self.make_v4(context); cap['supported_recovery_schemas']=[r.CONTAINER_RECOVERY_TERMINAL_REQUEST_SCHEMA]
+            calls=[]
+            def cli(paths,args,*,timeout,cli,raw_output=None):
+                calls.append(tuple(args));raw_output.append(json.dumps(cap).encode());return cap
+            with self.assertRaisesRegex(r.RuntimeServiceError,'does not support'):
+                self.run_recovery(paths,context,cli)
+            self.assertEqual([call[1] for call in calls],['service-container-recovery-capabilities'])
+        with tempfile.TemporaryDirectory() as directory:
+            paths,context,cap,_=self.fixture(Path(directory)); self.make_v4(context)
+            failed=json.dumps({**context['expected_owner'],'state':'failed'}).encode()
+            (paths.runtime_services/'OWNER.json').write_bytes(failed)
+            receipt=self.receipt(context,failed); target=paths.store/'runtime-services/container-recovery'/context['request_sha256']/'receipt.json'; target.parent.mkdir(parents=True);target.write_text(json.dumps(receipt))
+            native=mock.Mock(side_effect=AssertionError('v4 replay must not invoke native or capability probe'))
+            self.assertEqual(self.run_recovery(paths,context,native),receipt)
+            native.assert_not_called()
 
     def test_completed_v3_replay_validates_receipt_without_capability_or_native_invocation(self):
         with tempfile.TemporaryDirectory() as directory:

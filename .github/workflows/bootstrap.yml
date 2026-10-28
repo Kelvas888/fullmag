@@ -114,6 +114,11 @@ jobs:
       - name: Run terminal Docker recovery contracts
         run: cargo test -p fullmag-session --lib runtime_service::retained_terminal_runs::tests --no-fail-fast
 
+      - name: Run retained manual-held Docker recovery contracts
+        run: |
+          cargo test -p fullmag-session --lib runtime_service::retained_held_manual_runs::tests --no-fail-fast
+          cargo test -p fullmag-session --lib manual_held --no-fail-fast
+
       - name: Run accepted explicit Compute start-gate contracts
         run: |
           cargo test -p fullmag-session --lib accepted_start_gate

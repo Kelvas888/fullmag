@@ -96,6 +96,53 @@ class AbruptStopTests(unittest.TestCase):
         with self.assertRaisesRegex(r.ContainerRecoveryError, 'bytes'):
             r.validate_abrupt_stop_proof(stale, auth)
 
+    def test_v2_abrupt_proof_freezes_v4_held_pins_and_preserves_v1_shape(self):
+        proof, _, _=self.fixture()
+        held={'run_id':'held-run','run_intent_sha256':'a'*64,'run_catalog_sha256':'b'*64,'start_release':'absent'}
+        v2=copy.deepcopy(proof)
+        v2['schema']=r.ABRUPT_PROOF_HELD_MANUAL_SCHEMA
+        v2['retained_terminal_runs']=[]
+        v2['retained_held_manual_runs']=[held]
+        v2['storage_proof']['run_records']=[held]
+        auth=r.validate_operator_authorization({
+            **v2['authorization_pins'],'schema_version':r.ABRUPT_OPERATOR_SCHEMA,
+            'abrupt_stop_proof':'verification/v4-proof.json',
+            'abrupt_stop_proof_sha256':r._sha256(r._canonical(v2)),
+        })
+        r.validate_abrupt_stop_proof(v2,auth)
+        request={'schema_version':r.HELD_MANUAL_REQUEST_SCHEMA,
+                 'retained_terminal_runs':[],'retained_held_manual_runs':[held]}
+        r._assert_request_matches_abrupt_retained_pins(request,v2)
+        with self.assertRaisesRegex(r.ContainerRecoveryError,'held-manual pins'):
+            r._assert_request_matches_abrupt_retained_pins({**request,'retained_held_manual_runs':[]},v2)
+        with self.assertRaisesRegex(r.ContainerRecoveryError,'frozen schema'):
+            r.validate_abrupt_stop_proof({**proof,'retained_held_manual_runs':[held]},self.fixture()[1])
+        with self.assertRaisesRegex(r.ContainerRecoveryError,'both v4'):
+            r.validate_abrupt_stop_proof({**v2,'retained_held_manual_runs':None},auth)
+
+    def test_v4_absence_attestation_is_bound_to_request_digest(self):
+        pin={'container_id':'1'*64,'image_id':'sha256:'+'2'*64,'config_sha256':'3'*64,'service':'backend'}
+        request={'schema_version':r.HELD_MANUAL_REQUEST_SCHEMA,'retained_terminal_runs':[],
+                 'retained_held_manual_runs':[{'run_id':'held-run','run_intent_sha256':'4'*64,
+                                               'run_catalog_sha256':'5'*64,'start_release':'absent'}],
+                 'docker_engine_id_sha256':'6'*64,'docker_manifest_sha256':'7'*64,
+                 'device_release_resource_id':'resource','device_release_mapping_sha256':'8'*64,
+                 'containers':[pin]}
+        request_sha='9'*64
+        attestation={'schema_version':r.ABSENCE_ATTESTATION_SCHEMA,'request_sha256':request_sha,
+                     'docker_engine_id_sha256':request['docker_engine_id_sha256'],
+                     'manifest_sha256':request['docker_manifest_sha256'],
+                     'result':'authoritative_namespace_absence',
+                     'containers':[{'container_id':pin['container_id'],'image_id':pin['image_id'],
+                         'config_sha256':pin['config_sha256'],'service':pin['service'],
+                         'absence':{'inspect':{'outcome':'no_such_object','matched_container_id':pin['container_id'],'output_sha256':'a'*64},
+                                    'ps_all':{'outcome':'empty','output_sha256':'b'*64}}}],
+                     'device_release':{'resource_id':'resource','mapping_sha256':'8'*64,'mapping_detached':True}}
+        with patch.object(r,'validate_request',side_effect=lambda value:dict(value)):
+            r.validate_attestation(attestation,request,request_sha)
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'digest differs'):
+                r.validate_attestation(attestation,request,'c'*64)
+
     def test_v1_still_requires_shutdown_unknown_process_receipt(self):
         raw=b'{"schema":"fullmag.docker-process-tree.v1","state":"ready"}'
         with patch.object(r,'_control_json',return_value=(json.loads(raw),raw)):
@@ -313,7 +360,33 @@ class AbruptStopTests(unittest.TestCase):
             with self.assertRaises(r.ContainerRecoveryError): r.expected_recovery_outcome({**request,'retained_terminal_runs':changed})
         for schema in (r.REQUEST_SCHEMA,r.RETAINED_REQUEST_SCHEMA):
             with self.assertRaises(r.ContainerRecoveryError): r.expected_recovery_outcome({**request,'schema_version':schema})
+        held={'run_id':'run-held','run_intent_sha256':'c'*64,'run_catalog_sha256':'d'*64,'start_release':'absent'}
+        with self.assertRaises(r.ContainerRecoveryError):
+            r.expected_recovery_outcome({**request,'retained_held_manual_runs':[held]})
         with self.assertRaises(r.ContainerRecoveryError): r.expected_recovery_outcome({**request,'retained_cancelled_runs':[pin]})
+
+    def test_held_manual_v4_pin_pairing_limits_and_version_isolation(self):
+        terminal={'run_id':'run-terminal','run_intent_sha256':'a'*64,'run_catalog_sha256':'b'*64,'artifact_catalog_sha256':None}
+        held={'run_id':'run-held','run_intent_sha256':'c'*64,'run_catalog_sha256':'d'*64,'start_release':'absent'}
+        request={'schema_version':'runtime_service_container_recovery_request.v4',
+                 'retained_terminal_runs':[],'retained_held_manual_runs':[held]}
+        self.assertEqual(r.expected_recovery_outcome(request),'retained_manual_held_runs_recovered')
+        self.assertEqual(r.expected_recovery_outcome({**request,'retained_terminal_runs':[terminal]}),
+                         'retained_manual_held_runs_recovered')
+        invalid=[
+            {**request,'retained_held_manual_runs':[]},
+            {**request,'retained_held_manual_runs':[{**held,'start_release':'present'}]},
+            {**request,'retained_held_manual_runs':[{**held,'extra':True}]},
+            {**request,'retained_held_manual_runs':[{**held,'run_catalog_sha256':'bad'}]},
+            {**request,'retained_terminal_runs':[terminal],'retained_held_manual_runs':[{**held,'run_id':terminal['run_id']}]},
+            {**request,'retained_cancelled_runs':[]},
+            {**request,'schema_version':r.TERMINAL_REQUEST_SCHEMA,'retained_terminal_runs':[terminal]},
+            {**request,'schema_version':r.TERMINAL_REQUEST_SCHEMA,'retained_terminal_runs':[terminal],'retained_held_manual_runs':None},
+            {**request,'retained_terminal_runs':[terminal]*128},
+        ]
+        for changed in invalid:
+            with self.subTest(changed=changed), self.assertRaises(r.ContainerRecoveryError):
+                r.expected_recovery_outcome(changed)
 
     def test_snapshot_uses_only_pinned_canonical_state_for_stale_wsl_alias(self):
         proof,_,_=self.fixture(); backend=proof['containers']['backend']
@@ -337,9 +410,18 @@ class AbruptStopTests(unittest.TestCase):
             (ledger/'HOST_RESOURCE_LEDGER.json').write_text(json.dumps({'policy':{},'reservations':[]}))
             run=state/'runs/docker-all/session-store/runs/run-1'; run.mkdir(parents=True)
             (run.parent.parent/'objects/pins').mkdir(parents=True)
-            intent=b'{"run_id":"run-1"}'; catalog=b'{"tasks":[{"task_id":"task-1","attempt_id":"current-attempt","ownership_epoch":1,"lifecycle":"succeeded","artifact_ids":["result"]}]}'
-            artifact=b'{"entries":[{"id":"result"}]}'
+            intent=b'{"run_id":"run-1"}'
+            output_payload=b'published terminal output'; output_ref=r._sha256(output_payload)
+            catalog=json.dumps({'tasks':[{'task_id':'task-1','attempt_id':'current-attempt','ownership_epoch':1,'resource_id':'cpu','lifecycle':'succeeded','artifact_ids':['result']}]},separators=(',',':')).encode()
+            artifact=json.dumps({'schema_version':'artifact_catalog.v1','run_id':'run-1','revision':1,'updated_at':'2026-10-27T00:00:00Z','entries':[{'artifact_id':'result','task_id':'task-1','attempt_id':'current-attempt','ownership_epoch':1,'logical_path':'results/result.json','artifact_type':'result','content_sha256':output_ref,'object_ref':output_ref,'status':'published','required':True}]},separators=(',',':')).encode()
             for name,raw in [('run_intent',intent),('run_catalog',catalog),('artifact_catalog',artifact)]: (run/(name+'.json')).write_bytes(raw)
+            store=run.parent.parent; cas=store/'objects/sha256'; pins=store/'objects/pins'
+            cas.mkdir(parents=True); pins.mkdir(parents=True,exist_ok=True)
+            (cas/output_ref).write_bytes(output_payload)
+            (pins/(output_ref+'.json')).write_text(json.dumps({'schema':'fullmag.cas-pin.v1','object_ref':output_ref}))
+            leases=run/'resource_leases/cpu'; leases.mkdir(parents=True)
+            lease={'schema_version':'resource_lease.v1','resource_id':'cpu','kind':'cpu','budget':{'cpu_millis':1,'memory_bytes':0,'gpu_memory_bytes':0,'storage_bytes':0},'run_id':'run-1','task_id':'task-1','attempt_id':'current-attempt','ownership_epoch':1,'lease_token':'lease-token','state':'released','acquired_at':'2026-10-27T00:00:00Z','heartbeat_at':'2026-10-27T00:00:01Z','heartbeat_sequence':1,'released_at':'2026-10-27T00:00:02Z'}
+            (leases/'lease.json').write_text(json.dumps(lease))
             pin={'run_id':'run-1','run_intent_sha256':r._sha256(intent),'run_catalog_sha256':r._sha256(catalog),'artifact_catalog_sha256':r._sha256(artifact)}
             backend={'Image':'sha256:'+'d'*64,'Mounts':[{'Type':'bind','Source':str(state),'Destination':'/state','RW':True},{'Type':'bind','Source':str(root),'Destination':'/host-ledger','RW':True}]}
             def execute(argv,**kwargs):
@@ -349,10 +431,21 @@ class AbruptStopTests(unittest.TestCase):
             with patch.object(r,'bounded_capture',side_effect=execute):
                 result=r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
                 self.assertEqual(result['run_records'],[pin])
+                lease_path=leases/'lease.json'; lease_raw=lease_path.read_bytes()
+                lease_path.unlink()
+                with self.assertRaisesRegex(r.ContainerRecoveryError,'no matching released task lease'):
+                    r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
+                lease_path.write_bytes(lease_raw)
+                changed_catalog=json.loads(artifact); changed_catalog['entries'][0]['attempt_id']='historical-attempt'
+                changed_artifact=json.dumps(changed_catalog,separators=(',',':')).encode()
+                (run/'artifact_catalog.json').write_bytes(changed_artifact)
+                changed_pin={**pin,'artifact_catalog_sha256':r._sha256(changed_artifact)}
+                with self.assertRaisesRegex(r.ContainerRecoveryError,'differs from its task attempt'):
+                    r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[changed_pin])
+                (run/'artifact_catalog.json').write_bytes(artifact)
                 (run/'artifact_catalog.json').write_bytes(artifact+b' ')
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'bytes differ'): r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
                 (run/'artifact_catalog.json').write_bytes(artifact)
-                cas=run.parent.parent/'objects/sha256'; cas.mkdir()
                 payload=b'accepted input'; ref=r._sha256(payload); (cas/ref).write_bytes(payload)
                 (run.parent.parent/'objects/pins'/(ref+'.json')).write_text(json.dumps({'schema':'fullmag.cas-pin.v1','object_ref':ref}))
                 intent=json.dumps({'run_id':'run-1','definition_object_ref':ref}).encode(); (run/'run_intent.json').write_bytes(intent)
@@ -366,9 +459,8 @@ class AbruptStopTests(unittest.TestCase):
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'pending or unknown'):
                     r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
                 pending_file.unlink()
-                leases=run/'resource_leases/cpu'; leases.mkdir(parents=True); (leases/'lease.json').write_text('{"state":"active"}')
+                (leases/'lease.json').write_text('{"state":"active"}')
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'active or unknown'): r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
-                lease={'state':'released','run_id':'run-1','task_id':'task-1','attempt_id':'current-attempt','ownership_epoch':1}
                 (leases/'lease.json').write_text(json.dumps(lease))
                 admissions=run/'task_admissions/task-1';admissions.mkdir(parents=True)
                 admission={'task':{'task_id':'task-1','attempt_id':'current-attempt','ownership_epoch':1},'lease':{**lease,'state':'active'}}
@@ -393,6 +485,176 @@ class AbruptStopTests(unittest.TestCase):
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'outputs'): r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[null_pin])
                 (ledger/'HOST_RESOURCE_LEDGER.json').write_text(json.dumps({'policy':{},'reservations':[{'state':'active'}]}))
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'reservations'): r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[pin])
+
+    def test_terminal_snapshot_streams_large_cas_with_metadata_and_size_fences(self):
+        if not sys.platform.startswith('linux'):
+            self.skipTest('the helper memory-bound regression uses Linux resource limits')
+        import resource
+
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); state=root/'state'; ledger=root/'ledger'; ledger.mkdir()
+            (ledger/'WRITER.lock').touch()
+            (ledger/'HOST_RESOURCE_LEDGER.json').write_text(json.dumps({'policy':{},'reservations':[]}))
+            run=state/'runs/docker-all/session-store/runs/run-large'; run.mkdir(parents=True)
+            store=run.parent.parent; cas=store/'objects/sha256'; pins=store/'objects/pins'
+            cas.mkdir(parents=True); pins.mkdir(parents=True)
+            size=81*1024*1024; zero_chunk=bytes(1024*1024); digest=hashlib.sha256()
+            for _ in range(81): digest.update(zero_chunk)
+            object_ref=digest.hexdigest(); object_path=cas/object_ref
+            with object_path.open('wb') as output: output.truncate(size)
+            (pins/(object_ref+'.json')).write_text(json.dumps({'schema':'fullmag.cas-pin.v1','object_ref':object_ref}))
+            intent=json.dumps({'run_id':'run-large','definition_object_ref':object_ref},separators=(',',':')).encode()
+            catalog=json.dumps({'tasks':[{'task_id':'task-large','lifecycle':'succeeded','artifact_ids':[]}]},separators=(',',':')).encode()
+            (run/'run_intent.json').write_bytes(intent); (run/'run_catalog.json').write_bytes(catalog)
+            pin={'run_id':'run-large','run_intent_sha256':r._sha256(intent),
+                 'run_catalog_sha256':r._sha256(catalog),'artifact_catalog_sha256':None}
+            backend={'Image':'sha256:'+'d'*64,'Mounts':[
+                {'Type':'bind','Source':str(state),'Destination':'/state','RW':True},
+                {'Type':'bind','Source':str(root),'Destination':'/host-ledger','RW':True}]}
+
+            def invoke(*,drift=False):
+                def execute(argv,**kwargs):
+                    script=argv[-2].replace(
+                        "pathlib.Path('/state/runs/docker-all/session-store')",
+                        'pathlib.Path('+repr(str(state/'runs/docker-all/session-store'))+')',
+                    ).replace(
+                        "pathlib.Path('/host-ledger/ledger')",
+                        'pathlib.Path('+repr(str(ledger))+')',
+                    )
+                    if drift:
+                        injection=("_read_before_drift=os.read\n_drift_target=pathlib.Path("+repr(str(object_path))+")\n"
+                                   "_did_drift=[False]\ndef _read_with_metadata_drift(fd,count):\n"
+                                   "    data=_read_before_drift(fd,count)\n"
+                                   "    if data and not _did_drift[0]:\n"
+                                   "        _did_drift[0]=True\n        os.utime(_drift_target,ns=(1,1))\n"
+                                   "    return data\nos.read=_read_with_metadata_drift\n")
+                        script=script.replace('MAX_ENTRIES=8192\n','MAX_ENTRIES=8192\n'+injection,1)
+                    def limit_address_space():
+                        memory_limit=64*1024*1024
+                        resource.setrlimit(resource.RLIMIT_AS,(memory_limit,memory_limit))
+                    return subprocess.run([sys.executable,'-B','-c',script,argv[-1]],
+                                          capture_output=True,preexec_fn=limit_address_space)
+                with patch.object(r,'bounded_capture',side_effect=execute):
+                    return r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,
+                                                        retained_terminal_runs=[pin])
+
+            result=invoke()
+            self.assertEqual(result['run_records'],[pin])
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'metadata changed while reading'):
+                invoke(drift=True)
+            with object_path.open('wb') as output: output.truncate(128*1024*1024+1)
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'exceeds its size/aggregate bound'):
+                invoke()
+
+    def test_v4_snapshot_accepts_exact_held_manual_inventory_and_rejects_release_or_unknown_evidence(self):
+        def make_state(root):
+            state=root/'state'; ledger=root/'ledger'; ledger.mkdir()
+            (ledger/'WRITER.lock').touch()
+            (ledger/'HOST_RESOURCE_LEDGER.json').write_text(json.dumps({'policy':{},'reservations':[]}))
+            store=state/'runs/docker-all/session-store'
+            run=store/'runs/run-held'; run.mkdir(parents=True)
+            terminal_run=store/'runs/run-terminal'; terminal_run.mkdir(parents=True)
+            digest=hashlib.sha256(b'held manual accepted input').hexdigest()
+            objects=store/'objects'
+            (objects/'sha256').mkdir(parents=True)
+            (objects/'pins').mkdir(parents=True)
+            (objects/'sha256'/digest).write_bytes(b'held manual accepted input')
+            (objects/'pins'/(digest+'.json')).write_text(json.dumps({'schema':'fullmag.cas-pin.v1','object_ref':digest}))
+            intent={'schema_version':'run_intent.v1','run_id':'run-held','idempotency_key':'key-held',
+                    'payload_sha256':'e'*64,'specification':{'parameters':{'fullmag.accepted_run_start':{'schema_version':'accepted_run_start_policy.v1','mode':'manual'}}},
+                    'definition_object_ref':digest}
+            task={'task_id':'task-held','input_fingerprint':'a'*64,'lifecycle':'accepted',
+                  'readiness':{'state':'blocked','reason':'awaiting preparation'},'artifact_ids':[]}
+            catalog={'schema_version':'run_catalog.v1','run_id':'run-held','revision':1,
+                     'updated_at':'2026-10-27T12:00:00Z','tasks':[task]}
+            terminal_intent={'schema_version':'run_intent.v1','run_id':'run-terminal','idempotency_key':'key-terminal',
+                             'payload_sha256':'f'*64,'specification':{'parameters':{}},'definition_object_ref':digest}
+            terminal_catalog={'schema_version':'run_catalog.v1','run_id':'run-terminal','revision':1,
+                              'updated_at':'2026-10-27T12:00:00Z',
+                              'tasks':[{'task_id':'task-terminal','input_fingerprint':'b'*64,'lifecycle':'succeeded',
+                                        'readiness':{'state':'ready'},'artifact_ids':[]}]}
+            intent_raw=json.dumps(intent,separators=(',',':')).encode()
+            catalog_raw=json.dumps(catalog,separators=(',',':')).encode()
+            terminal_intent_raw=json.dumps(terminal_intent,separators=(',',':')).encode()
+            terminal_catalog_raw=json.dumps(terminal_catalog,separators=(',',':')).encode()
+            (run/'run_intent.json').write_bytes(intent_raw)
+            (run/'run_catalog.json').write_bytes(catalog_raw)
+            (terminal_run/'run_intent.json').write_bytes(terminal_intent_raw)
+            (terminal_run/'run_catalog.json').write_bytes(terminal_catalog_raw)
+            held={'run_id':'run-held','run_intent_sha256':hashlib.sha256(intent_raw).hexdigest(),
+                  'run_catalog_sha256':hashlib.sha256(catalog_raw).hexdigest(),'start_release':'absent'}
+            terminal={'run_id':'run-terminal','run_intent_sha256':hashlib.sha256(terminal_intent_raw).hexdigest(),
+                      'run_catalog_sha256':hashlib.sha256(terminal_catalog_raw).hexdigest(),'artifact_catalog_sha256':None}
+            backend={'Image':'sha256:'+'d'*64,'Mounts':[
+                {'Type':'bind','Source':str(state),'Destination':'/state','RW':True},
+                {'Type':'bind','Source':str(root),'Destination':'/host-ledger','RW':True}]}
+            return state,ledger,store,run,backend,terminal,held
+
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); state,ledger,store,run,backend,terminal,held=make_state(root)
+            # Re-run with both subsets to prove one exact inventory/CAS union.
+            def run_combined():
+                def execute(argv,**kwargs):
+                    script=argv[-2].replace(
+                        "pathlib.Path('/state/runs/docker-all/session-store')",
+                        'pathlib.Path('+repr(str(state/'runs/docker-all/session-store'))+')',
+                    ).replace(
+                        "pathlib.Path('/host-ledger/ledger')",
+                        'pathlib.Path('+repr(str(state.parent/'ledger'))+')',
+                    )
+                    return subprocess.run([sys.executable,'-B','-c',script,argv[-1]],capture_output=True)
+                with patch.object(r,'bounded_capture',side_effect=execute):
+                    return r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,
+                                                        retained_terminal_runs=[terminal],retained_held_manual_runs=[held])
+            combined=run_combined()
+            self.assertEqual(combined['run_records'],sorted([terminal,held],key=lambda item:item['run_id']))
+            self.assertEqual(combined['run_directories'],['run-held','run-terminal'])
+            self.assertEqual(combined['store_file_count'],6)
+            prep_key={'run_id':'run-held','task_id':'task-held','preparation_attempt_id':'prep-attempt-1',
+                      'resource_id':'resource-1','lease_token':'lease-1'}
+            lease={**prep_key,'state':'released','released_at':'2026-10-27T12:00:03Z','heartbeat_sequence':2}
+            launch={**prep_key,'lease_heartbeat_sequence':1,'supervisor_process_id':123,'created_at':'2026-10-27T12:00:01Z'}
+            exit_receipt={**prep_key,'lease_heartbeat_sequence':2,'process_id':123,'status_success':True,
+                          'exit_code':0,'timed_out':False,'failure_reason':None,'observed_at':'2026-10-27T12:00:02Z'}
+            for relative,value in (
+                ('preparation_resource_leases/resource-1/lease-1.json',lease),
+                ('preparation_process_launches/launch.json',launch),
+                ('preparation_process_exit_receipts/exit.json',exit_receipt),
+                ('task_preparation_receipts/task-held.json',{'run_id':'run-held','task_id':'task-held'}),
+            ):
+                path=run/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(value))
+            prepared=run_combined()
+            self.assertEqual(prepared['run_records'],sorted([terminal,held],key=lambda item:item['run_id']))
+            self.assertEqual(prepared['store_file_count'],10)
+            (run/'start_release.json').write_text('{}')
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'start_release'):
+                run_combined()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); state,ledger,store,run,backend,terminal,held=make_state(root)
+            evidence=run/'resource_leases'/'compute.json'; evidence.parent.mkdir(); evidence.write_text('{}')
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'unknown evidence'):
+                def invoke():
+                    def execute(argv,**kwargs):
+                        script=argv[-2].replace("pathlib.Path('/state/runs/docker-all/session-store')",'pathlib.Path('+repr(str(state/'runs/docker-all/session-store'))+')').replace("pathlib.Path('/host-ledger/ledger')",'pathlib.Path('+repr(str(state.parent/'ledger'))+')')
+                        return subprocess.run([sys.executable,'-B','-c',script,argv[-1]],capture_output=True)
+                    with patch.object(r,'bounded_capture',side_effect=execute):
+                        return r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[terminal],retained_held_manual_runs=[held])
+                invoke()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); state,ledger,store,run,backend,terminal,held=make_state(root)
+            intent=json.loads((run/'run_intent.json').read_bytes())
+            intent['specification']['parameters']['fullmag.accepted_run_start']['mode']='automatic'
+            (run/'run_intent.json').write_text(json.dumps(intent,separators=(',',':')))
+            with self.assertRaisesRegex(r.ContainerRecoveryError,'bytes differ'):
+                def invoke():
+                    def execute(argv,**kwargs):
+                        script=argv[-2].replace("pathlib.Path('/state/runs/docker-all/session-store')",'pathlib.Path('+repr(str(state/'runs/docker-all/session-store'))+')').replace("pathlib.Path('/host-ledger/ledger')",'pathlib.Path('+repr(str(state.parent/'ledger'))+')')
+                        return subprocess.run([sys.executable,'-B','-c',script,argv[-1]],capture_output=True)
+                    with patch.object(r,'bounded_capture',side_effect=execute):
+                        return r._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-master'),backend,retained_terminal_runs=[terminal],retained_held_manual_runs=[held])
+                invoke()
 
     def test_full_recover_v2_consumes_ready_proof_and_builds_v3_without_solve(self):
         """Exercise orchestration through start() with all external actions mocked."""

@@ -47,10 +47,34 @@ def _publish_once(control, relative, raw):
         raise BuildControlError("Recovery preparation readback differs: " + relative)
 
 
-def prepare(control, pins, compose, *, retained_terminal_runs=None, publish=False):
+def _read_retained_run_inputs(terminal_path, held_path):
+    if held_path is not None and terminal_path is None:
+        raise BuildControlError("--retained-held-manual-runs requires --retained-terminal-runs")
+    if terminal_path is None:
+        return None, None
+    from docker_volume_dev import _session_host
+    host = _session_host()
+    def read_array(path, label):
+        raw = host.read_owned_regular(path.absolute(), MAX_INPUT_BYTES)
+        value = json.loads(raw, object_pairs_hook=_unique_object)
+        if not isinstance(value, list):
+            raise BuildControlError(label + " input must be an array")
+        return value
+    terminal = read_array(terminal_path, "Retained terminal run")
+    held = read_array(held_path, "Retained held-manual run") if held_path is not None else None
+    return terminal, held
+
+
+def prepare(
+    control, pins, compose, *,
+    retained_terminal_runs=None, retained_held_manual_runs=None, publish=False
+):
     """Return proof/auth references; publish only after a second frozen read."""
+    if retained_held_manual_runs is not None and retained_terminal_runs is None:
+        raise BuildControlError("V4 held-manual pins require --retained-terminal-runs, including an empty array")
     proof = recovery.prepare_abrupt_stop_proof(
-        control, pins, compose, retained_terminal_runs=retained_terminal_runs
+        control, pins, compose, retained_terminal_runs=retained_terminal_runs,
+        retained_held_manual_runs=retained_held_manual_runs,
     )
     proof_raw = recovery._canonical(proof)
     root = recovery.RECOVERY_RELATIVE_ROOT + "/" + pins["request_id"]
@@ -88,7 +112,8 @@ def prepare(control, pins, compose, *, retained_terminal_runs=None, publish=Fals
         # Both Docker and raw native documents can change while admission is
         # acquired. Rebuild every observation under the group lease.
         fresh = recovery.prepare_abrupt_stop_proof(
-            control, pins, compose, retained_terminal_runs=retained_terminal_runs
+            control, pins, compose, retained_terminal_runs=retained_terminal_runs,
+            retained_held_manual_runs=retained_held_manual_runs,
         )
         if recovery._canonical(fresh) != proof_raw:
             raise BuildControlError("Abrupt-stop evidence changed before publication")
@@ -108,8 +133,12 @@ def main(argv=None):
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--operator-pins", required=True, type=Path)
     parser.add_argument("--retained-terminal-runs", type=Path)
+    parser.add_argument("--retained-held-manual-runs", type=Path)
     parser.add_argument("--publish", action="store_true", help="Publish evidence and operator capability under the group lease; never start services")
     args = parser.parse_args(argv)
+    terminal_pins, held_pins = _read_retained_run_inputs(
+        args.retained_terminal_runs, args.retained_held_manual_runs
+    )
     source = select_checkout(args.repo_root.resolve(strict=True), args.source_root).resolve(strict=True)
     layout = storage.resolve_layout(source)
     identity = compose_project_identity(layout)
@@ -124,15 +153,8 @@ def main(argv=None):
     compose = control.read("development/attempts/" + attempt + "/compose.json")
     if hashlib.sha256(recovery._canonical(compose)).hexdigest() != pins.get("compose_config_sha256"):
         raise BuildControlError("Retained Compose bytes differ from the operator pin")
-    terminal_pins = None
-    if args.retained_terminal_runs is not None:
-        # The same strict bounded JSON parser is used for array input below.
-        from docker_volume_dev import _session_host
-        raw = _session_host().read_owned_regular(args.retained_terminal_runs.absolute(), MAX_INPUT_BYTES)
-        terminal_pins = json.loads(raw, object_pairs_hook=_unique_object)
-        if not isinstance(terminal_pins, list):
-            raise BuildControlError("Retained terminal run input must be an array")
-    print(json.dumps(prepare(control, pins, compose, retained_terminal_runs=terminal_pins, publish=args.publish), indent=2))
+    print(json.dumps(prepare(control, pins, compose, retained_terminal_runs=terminal_pins,
+                             retained_held_manual_runs=held_pins, publish=args.publish), indent=2))
     return 0
 
 
