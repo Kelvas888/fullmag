@@ -1792,7 +1792,7 @@ fn configured_runtime_control_root() -> Result<std::path::PathBuf> {
         .context("FULLMAG_RUNTIME_CONTROL_ROOT is not a managed regular directory")
 }
 
-fn scene_from_definition(bytes: &[u8], specification: &RunSpecification) -> Result<SceneDocument> {
+pub(crate) fn scene_from_definition(bytes: &[u8], specification: &RunSpecification) -> Result<SceneDocument> {
     if fullmag_session::hex_sha256(bytes) != specification.snapshot.definition_sha256 {
         bail!("accepted project definition bytes differ from immutable snapshot digest");
     }
@@ -3299,14 +3299,64 @@ fn restored_preparation_failure_snapshot(
     })
 }
 
+/// Pure live projection shared by independently validated private startup authorities.
+pub(crate) struct AcceptedSnapshotProjection<'a> {
+    pub(crate) run_id: &'a RunId,
+    pub(crate) specification: &'a RunSpecification,
+    pub(crate) scene: &'a SceneDocument,
+    pub(crate) logical_session_id: &'a str,
+    pub(crate) total_steps: usize,
+    pub(crate) terminal_outcome: Option<&'a str>,
+    pub(crate) preparation_failure: Option<&'a Value>,
+    pub(crate) authority_metadata: Value,
+    pub(crate) accepted_plan_metadata: Value,
+}
+
 fn build_snapshot(
     workspace_root: &Path,
     loaded: &LoadedAcceptedRestore,
 ) -> Result<crate::types::SessionStateResponse> {
+    build_accepted_snapshot(workspace_root, AcceptedSnapshotProjection {
+        run_id: &loaded.run_id,
+        specification: &loaded.specification,
+        scene: &loaded.scene,
+        logical_session_id: &loaded.logical_session_id,
+        total_steps: loaded.total_steps,
+        terminal_outcome: loaded.terminal_outcome.as_deref(),
+        preparation_failure: loaded.preparation_failure.as_ref(),
+        accepted_plan_metadata: json!({
+            "run_id": loaded.run_id.as_str(),
+            "project_id": loaded.project_id.as_str(),
+            "source_request_id": &loaded.source_request_id,
+            "source_sha256": &loaded.source_sha256,
+            "startup_provenance_sha256": &loaded.startup_provenance_sha256,
+            "proof_sha256": &loaded.proof_sha256,
+        }),
+        authority_metadata: json!({
+            "accepted_run_reattach": {
+                "schema": INPUT_SCHEMA,
+                "run_id": loaded.run_id.as_str(),
+                "project_id": loaded.project_id.as_str(),
+                "source_request_id": &loaded.source_request_id,
+                "source_sha256": &loaded.source_sha256,
+                "startup_provenance_sha256": &loaded.startup_provenance_sha256,
+                "config_sha256": &loaded.config_sha256,
+                "session_epoch": loaded.session_epoch,
+                "proof_sha256": &loaded.proof_sha256,
+                "terminal_outcome": &loaded.terminal_outcome,
+            }
+        }),
+    })
+}
+
+pub(crate) fn build_accepted_snapshot(
+    workspace_root: &Path,
+    loaded: AcceptedSnapshotProjection<'_>,
+) -> Result<crate::types::SessionStateResponse> {
     let requested = &loaded.specification.requested_execution;
-    let session_id = loaded.logical_session_id.clone();
+    let session_id = loaded.logical_session_id.to_owned();
     let run_id = loaded.run_id.as_str().to_string();
-    let terminal_status = match loaded.terminal_outcome.as_deref() {
+    let terminal_status = match loaded.terminal_outcome {
         Some("interrupted") => "failed",
         Some(outcome) => outcome,
         None if loaded.preparation_failure.is_some() => "failed",
@@ -3358,14 +3408,7 @@ fn build_snapshot(
         finished_at_unix_ms: 0,
         plan_summary: json!({
             "requested_execution": requested,
-            "accepted_run": {
-                "run_id": &run_id,
-                "project_id": loaded.project_id.as_str(),
-                "source_request_id": &loaded.source_request_id,
-                "source_sha256": &loaded.source_sha256,
-                "startup_provenance_sha256": &loaded.startup_provenance_sha256,
-                "proof_sha256": &loaded.proof_sha256,
-            },
+            "accepted_run": loaded.accepted_plan_metadata,
         }),
     };
     let run = RunManifest {
@@ -3387,23 +3430,10 @@ fn build_snapshot(
         session_id,
         session: Some(session),
         session_status: Some(session_status.clone()),
-        metadata: Some(json!({
-            "accepted_run_reattach": {
-                "schema": INPUT_SCHEMA,
-                "run_id": loaded.run_id.as_str(),
-                "project_id": loaded.project_id.as_str(),
-                "source_request_id": &loaded.source_request_id,
-                "source_sha256": &loaded.source_sha256,
-                "startup_provenance_sha256": &loaded.startup_provenance_sha256,
-                "config_sha256": &loaded.config_sha256,
-                "session_epoch": loaded.session_epoch,
-                "proof_sha256": &loaded.proof_sha256,
-                "terminal_outcome": &loaded.terminal_outcome,
-            }
-        })),
+        metadata: Some(loaded.authority_metadata),
         mesh_workspace: None,
         stage_execution: None,
-        simulation_preparation: loaded.preparation_failure.as_ref()
+        simulation_preparation: loaded.preparation_failure
             .map(restored_preparation_failure_snapshot).transpose()?,
         run: Some(RunManifest {
             status: run_status,
@@ -3431,7 +3461,7 @@ fn build_snapshot(
     snapshot.run = request.run;
     snapshot.metadata = request.metadata.map(Into::into);
     snapshot.scene_document = Some(loaded.scene.clone());
-    if let Some(failure) = loaded.preparation_failure.as_ref() {
+    if let Some(failure) = loaded.preparation_failure {
         snapshot.metadata.as_deref_mut()
             .and_then(Value::as_object_mut)
             .context("restored preparation failure metadata is not an object")?

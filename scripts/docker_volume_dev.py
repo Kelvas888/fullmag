@@ -892,6 +892,11 @@ def _empty_stopped_namespace_ledger_generation(control):
     retirement = control.namespace_registry.get("retirement")
     if not isinstance(retirement, Mapping):
         return None
+    if retirement.get("schema") == "fullmag.docker-isolated-session-snapshot.v1":
+        token = retirement["recovery_id"]
+        if control.namespace != "namespaces/" + token:
+            raise BuildControlError("Snapshot fresh-ledger namespace differs")
+        return token
     if retirement.get("schema") != "fullmag.docker-control-namespace-empty-quarantine.v1":
         return None
     token = retirement.get("recovery_id")
@@ -1832,6 +1837,12 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     else:
         control = provided_control
         toolchain, images = _validate_prepared_start_context(prepared)
+    snapshot = (control.namespace_registry or {}).get("retirement", {})
+    if snapshot.get("schema") != "fullmag.docker-isolated-session-snapshot.v1":
+        snapshot = None
+    elif (snapshot["source_root"] != str(selected) or args.script is not None
+          or getattr(args, "fresh_state", False)):
+        raise BuildControlError("Isolated snapshot start must preserve its source and cannot replay a script")
     from docker_volume_cancelled_activation_guard import assert_start_allowed
     assert_start_allowed(control, getattr(args, "request_id", None), reuse_state=reuse_state)
     image = images["backend"]["image_id"]
@@ -1925,18 +1936,31 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             # receipt before it consumes the old configuration digest.
             control.write(operation["root"] + "/receipt.json", operation["receipt"])
         if reuse_state is None:
-            state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
-                                          layout["storage_root"], "session storage")
-            state.mkdir(parents=True, exist_ok=False)
+            if snapshot is not None:
+                if os.name == "nt":
+                    raise BuildControlError("Initial isolated snapshot admission requires Linux")
+                state = storage.validate_path(Path(snapshot["destination_state_root"]),
+                                              layout["runtime_root"], "isolated session storage")
+                if not state.is_dir() or state.resolve(strict=True) != state:
+                    raise BuildControlError("Copied session state is missing or noncanonical")
+            else:
+                state = storage.validate_path(Path(layout["runtime_root"]) / "docker-volume-dev" / token,
+                                              layout["storage_root"], "session storage")
+                state.mkdir(parents=True, exist_ok=False)
             if os.name == "nt":
                 operation["receipt"]["windows_runtime_directories"] = list(
                     _precreate_new_windows_runtime_state(state)
                 )
                 operation["receipt"]["windows_runtime_write_probe"] = "PASS"
-            else:
+            elif snapshot is None:
                 operation["receipt"]["linux_runtime_directories"] = list(
                     host.prepare_runtime_directories(state)
                 )
+            else:
+                operation["receipt"]["isolated_snapshot"] = {
+                    "recovery_id": snapshot["recovery_id"],
+                    "source_manifest_sha256": snapshot["source_manifest_sha256"],
+                }
             certificate_path = _certificate_path(state)
             certificate_path.touch(exist_ok=False)
         else:
@@ -2050,7 +2074,13 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             startup = {"authorization": authorization.as_dict(), "path": str(startup_path),
                        "provenance_sha256": startup_digest, "helper_hashes": startup_hashes,
                        "receipt_key": receipt_key, "receipt_path": receipt_path}
-        user_data = _workspace_state_root(layout, control.project)
+        if snapshot is None:
+            user_data = _workspace_state_root(layout, control.project)
+        else:
+            user_data = storage.validate_path(Path(snapshot["destination_user_data_root"]),
+                                             layout["storage_root"], "isolated workspace data")
+            if not user_data.is_dir() or user_data.resolve(strict=True) != user_data:
+                raise BuildControlError("Copied workspace data is missing or noncanonical")
         if os.name != "nt":
             host.admit_runtime_uid(user_data)
         git_common = _source_git_common_directory(selected)
@@ -2153,6 +2183,19 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST", None)
         backend["environment"].pop("FULLMAG_ACCEPTED_REATTACH_REQUEST_SHA256", None)
         backend["environment"].update(validated_accepted_reattach_environment)
+        backend["environment"].pop("FULLMAG_ISOLATED_SNAPSHOT_START", None)
+        backend["environment"].pop("FULLMAG_ISOLATED_SNAPSHOT_START_SHA256", None)
+        if snapshot is not None:
+            meta_raw = control.read_bytes("isolated-snapshot/start.json")
+            meta_pin = snapshot["control_pins"].get(
+                control.namespace + "/isolated-snapshot/start.json"
+            )
+            if meta_pin is None or hashlib.sha256(meta_raw).hexdigest() != meta_pin:
+                raise BuildControlError("Snapshot startup metadata differs from its published receipt")
+            backend["environment"].update({
+                "FULLMAG_ISOLATED_SNAPSHOT_START": "/opt/fullmag/control/isolated-snapshot/start.json",
+                "FULLMAG_ISOLATED_SNAPSHOT_START_SHA256": meta_pin,
+            })
         if startup is not None:
             backend["environment"].update(FULLMAG_STARTUP_ENABLED="1",
                 FULLMAG_STARTUP_SCRIPT=startup["authorization"]["container_script_path"],

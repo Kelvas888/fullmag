@@ -50,6 +50,7 @@ mod build_info;
 mod coordinator_persistence;
 pub(crate) mod compute_operator_env;
 mod development_accepted_restore;
+mod isolated_snapshot_restore;
 mod development_handoff_validation;
 mod development_owner_control;
 mod development_consumer_readiness;
@@ -2692,6 +2693,16 @@ async fn main() {
         "[fullmag-api] bootstrap phase=app_state state=complete elapsed_ms={}",
         bootstrap_started.elapsed().as_millis()
     );
+    if !runtime_diagnostic_only {
+        if let Err(error) = isolated_snapshot_restore::restore_before_listen(&state).await {
+            eprintln!("[fullmag-api] startup failure phase=isolated-snapshot-restore error={error:#}");
+            state.development_admission.latch_runtime_failure(
+                "Isolated snapshot initialization failed. API remains available; inspect the backend log for the cause. No task was replayed.",
+            );
+            runtime_diagnostic_only = true;
+            diagnostic_reason = Some("isolated-snapshot-restore-failed");
+        }
+    }
     if !runtime_diagnostic_only {
         if let Err(error) = development_accepted_restore::restore_before_listen(&state).await {
             eprintln!("[fullmag-api] startup failure phase=accepted-run-restore error={error:#}");
