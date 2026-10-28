@@ -412,9 +412,25 @@ frontend state volume. Nie tworzy brakującego control volume, nie naprawia
 named volume i nie restartuje usług. Domyślny limit pracy przeglądarki wynosi
 180 sekund, a osobny limit pobrania brakującego obrazu wynosi 1800 sekund;
 parametry `timeout` i `pull_timeout` są ostatnimi argumentami pozycyjnymi
-recepty, po `browser_image`. Nieudane lub
+recepty, po `browser_image`; opcjonalne `saved_playback_item_id` jest kolejnym
+argumentem. Nieudane lub
 niejednoznaczne kontrole kończą się zachowaniem zasobów i wymagają ręcznego
 przeglądu receiptu operacji.
+
+Kontrolę odtwarzania zapisanego wyniku można jawnie skierować na istniejący,
+zarejestrowany workspace item. Podaj jego dziesiętny identyfikator jako ostatni
+argument recepty:
+
+```powershell
+just docker-dev-browser-qa "$source" 3298 "" 180 1800 "<item-id>"
+```
+
+Ta odrębna próba uruchamia przypięty harness w tym samym zarządzanym, tylko do
+odczytu kontenerze Playwright. Nie instaluje przeglądarki na hoście i nie
+uruchamia Solve ani Compute Fields. Receipt zapisuje identyfikator oraz SHA-256
+źródłowego harnessu, a wynik potwierdza odczyt payloadów ramek, widoczny canvas,
+żywy kontekst WebGL i stabilność Inspectora oraz kamery. Tryb SwiftShader jest
+dowodem przeglądarki, nie dowodem sprzętowego GPU ani fizyki FEM.
 
 ## Budżet backendu podczas trwającego startu
 
@@ -592,3 +608,36 @@ drainu ani wykonania fizyki. Następnie obowiązuje zwykły docker-dev up
 wybranego checkoutu i nowe jawne żądanie skryptu. Implementacja i kontrola
 interpretowana nie zastępują dowodu runtime tej trasy: NOT VERIFIED do
 zakończenia rzeczywistego preflight→apply→API→browser.
+
+### Zmiana numeru urządzenia po restarcie WSL
+
+Numer host_device (st_dev) może zmienić się po restarcie WSL. Zwykłe resume
+nadal wymaga pełnej zgodności certyfikatu. Nie poprawiaj ręcznie certyfikatu,
+ownera ani active. Jawne ponowne poświadczenie wybranej zatrzymanej grupy:
+
+```sh
+python3 -B scripts/docker_dev.py --repo-root <checkout> reattest-host-device-volume \
+  --source-root <checkout> --attempt <development-uuid> \
+  --config-sha256 <compose-sha256> --certificate-sha256 <old-file-sha256> \
+  --expected-host-device <current-st_dev>
+```
+
+Pierwsze wywołanie jest podglądem; --apply zapisuje operację pod blokadą grupy.
+Wymagane są zgodne: inode i ścieżka katalogu, silnik Docker, obraz, zakres i
+token właściciela, sentinel i wcześniejszy restart readback. Kontenery muszą
+być dokładnymi zatrzymanymi inkarnacjami z receiptu, bez innych konsumentów
+storage. Operacja zachowuje inode bind-mountowanego certyfikatu, archiwizuje
+stare/nowe bajty i piny w host-device-reattest/<old-sha>/intent.json oraz dopuszcza
+ponowienie wyłącznie tych dwóch wersji po przerwanym zapisie. Zmienia tylko
+host_device; nie potwierdza nowej symulacji ani nie uruchamia API/solvera.
+
+Jeśli po przerwaniu hosta active wskazuje osieroconą iterację, można dodatkowo
+podać --interrupted-iteration <exact-uuid>. Ścieżka jest ograniczona do starej
+głównej przestrzeni kontrolnej, nieobecnego helpera, obu zatrzymanych usług i
+braku zachowanych runów. Helper odzyskiwania pod operation.lock sprawdza dokładny
+hash active i receipt.json, publikuje oddzielny terminal failed-confirmed i
+dopiero wtedy usuwa wyłącznie zgodny wskaźnik active. Oryginalny receipt pozostaje
+niezmieniony. Nie jest to ogólne odzyskiwanie lease ani trasa dla aktywnego runu.
+
+Po sukcesie użyj zwykłego przypiętego resume-volume --restart-backend.
+Inne zmiany tożsamości, aktywny/nieznany konsument albo różne piny blokują zapis.

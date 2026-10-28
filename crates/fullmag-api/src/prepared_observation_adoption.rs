@@ -15,7 +15,7 @@ use crate::prepared_observation_bundle::{PreparedObservationBundle, PREPARED_OBS
 use crate::types::{CurrentLiveFieldFrameRequest, LatestFields, SessionStateResponse};
 
 const MAX_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
-const PROVENANCE_SOURCE: &str = "prepared_state_evaluation";
+pub(crate) const PROVENANCE_SOURCE: &str = "prepared_state_evaluation";
 
 /// Publish the evaluated fields next to the prepared m. Returns whether a
 /// bundle was adopted; absence or a mismatch leaves the snapshot unchanged.

@@ -578,9 +578,9 @@ runtime (`LIVE_RUNTIME_STATUS_EXCLUSIONS` i `LIVE_NON_RUNTIME_*` w
 takich plików weryfikuje istniejący pakiet zamiast go przebudowywać. Pełny
 skrót drzewa różniłby się wtedy trwale, choć binarka i OpenAPI są aktualne.
 Na hoście WSL z Docker Desktop źródło bind mountu ma postać
-`/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/<dystrybucja>/<sha256>`,
-gdzie skrót to SHA-256 dokładnej ścieżki checkoutu; codegen porównuje go z tą
-ścieżką. Zapieczętowane (bez bitów zapisu) binarki pakietu współdzielonego
+`/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/<dystrybucja>/<sha256>`;
+codegen potwierdza je przez ten sam inode aliasu
+`/mnt/wsl/docker-desktop-bind-mounts/…` i wybranego checkoutu. Zapieczętowane (bez bitów zapisu) binarki pakietu współdzielonego
 między grupami mogą mieć wiele hardlinków; ich zawartość jest sprawdzana
 skrótem z receiptu. Opublikowane pliki zachowują poprzedni tryb (domyślnie
 `0644`), aby usługa `frontend` mogła je czytać. Timeout
