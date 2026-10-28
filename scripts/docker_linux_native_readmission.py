@@ -16,9 +16,11 @@ from docker_volume_reconcile import SHA, TOKEN, digest, fingerprint, read_raw, r
 import linux_native_host as host
 
 SCHEMA = "fullmag.docker-linux-device-readmission.v1"
+REPLAY_SCHEMA = "fullmag.docker-linux-device-readmission.v2"
 CONTROLLERS = ("docker_linux_native_readmission.py", "linux_native_host.py",
                "docker_build_control.py", "docker_volume_container_recovery.py",
-               "docker_volume_stop_unadmitted.py", "docker_volume_reconcile.py")
+               "docker_volume_stop_unadmitted.py", "docker_volume_reconcile.py", "just_storage_shell.sh",
+               "docker_dev_browser_qa.py", "docker_volume_activate.py")
 NATIVE_PINS = ("runtime-control/runtime-services/OWNER.json",
                "runtime-control/runtime-services/LAUNCH.json",
                "runtime-control/runtime-service/process-tree.json")
@@ -28,8 +30,17 @@ def validate_request(r):
     fields = {"schema", "source_revision", "controller_inputs", "boot_id", "engine_id",
               "compose_path", "compose_sha256", "failed_resume_path", "failed_resume_sha256",
               "containers", "native_pins", "storage_pins"}
-    require(isinstance(r, dict) and set(r) == fields and r["schema"] == SCHEMA,
+    require(isinstance(r, dict) and r.get("schema") in {SCHEMA, REPLAY_SCHEMA}
+            and set(r) == (fields | ({"retained_preparation"} if r["schema"] == REPLAY_SCHEMA else set())),
             "Exact Linux readmission request required")
+    if r["schema"] == REPLAY_SCHEMA:
+        retained = r["retained_preparation"]
+        require(isinstance(retained, dict) and set(retained) == {"request", "request_sha256", "preparation_sha256", "marker_sha256"}
+                and isinstance(retained["request"], str)
+                and re.fullmatch(r"verification/[a-zA-Z0-9_./-]+\.json", retained["request"])
+                and all(isinstance(retained[k], str) and SHA.fullmatch(retained[k])
+                        for k in ("request_sha256", "preparation_sha256", "marker_sha256")),
+                "Exact retained v1 request/preparation/marker pins required")
     require(isinstance(r["source_revision"], str)
             and re.fullmatch(r"[0-9a-f]{40}", r["source_revision"]), "Invalid source revision")
     require(isinstance(r["boot_id"], str)
@@ -73,8 +84,92 @@ def restore_preparation(p):
     return result
 
 
+WINDOWS_BIND_PROBE = r"""
+$ErrorActionPreference='Stop'
+[Console]::InputEncoding=[Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$requested=([Console]::In.ReadToEnd() | ConvertFrom-Json).path
+$path=[IO.Path]::GetFullPath($requested)
+if ($path -notmatch '^[A-Za-z]:[\\/]') { throw 'local Windows drive required' }
+$cursor=$path
+while ($cursor) {
+    $item=Get-Item -Force -LiteralPath $cursor
+    if (([int]$item.Attributes -band 0x400) -ne 0) { throw 'reparse ancestor refused' }
+    $parent=[IO.Directory]::GetParent($cursor)
+    if ($null -eq $parent) { $cursor=$null } else { $cursor=$parent.FullName }
+}
+$disk=[IO.DriveInfo]::new([IO.Path]::GetPathRoot($path))
+if ([int]$disk.DriveType -ne 3 -or $disk.DriveFormat -notin @('NTFS','ReFS')) { throw 'fixed NTFS/ReFS required' }
+@{schema='fullmag.windows-bind-disjoint.v1';path=$path;filesystem=$disk.DriveFormat;fixed=$true;no_reparse=$true} | ConvertTo-Json -Compress
+"""
+
+
+def live_bind_path(value):
+    """Resolve Desktop's opaque alias only with kernel FSROOT plus inode proof."""
+    from docker_dev_browser_qa import DESKTOP_WSL_BIND_ALIAS_RE, LOCAL_WSL_BIND_MOUNT_ROOT
+    from docker_volume_activate import _canonical_host_path
+    windows = _canonical_host_path(value)
+    if re.fullmatch(r"[A-Za-z]:/.*", windows):
+        # A native, fixed, no-reparse Windows volume cannot alias this ext4
+        # state. UNC/reparse paths are deliberately not admitted by this proof.
+        powershell = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        proof = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-Command", WINDOWS_BIND_PROBE],
+            input=canonical({"path": windows}), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        require(proof.returncode == 0 and len(proof.stdout) <= 65536,
+                "Foreign Windows bind physical isolation is unproven")
+        data = json.loads(proof.stdout.decode("utf-8-sig"))
+        require(isinstance(data, dict) and set(data) == {"schema", "path", "filesystem", "fixed", "no_reparse"}
+                and data["schema"] == "fullmag.windows-bind-disjoint.v1"
+                and _canonical_host_path(data["path"]).casefold() == windows.casefold()
+                and data["filesystem"] in {"NTFS", "ReFS"}
+                and data["fixed"] is True and data["no_reparse"] is True,
+                "Foreign Windows bind is not proven separate from Linux native storage")
+        return None
+    require(isinstance(value, str) and value.startswith("/") and ".." not in Path(value).parts,
+            "Live bind source cannot be proven disjoint")
+    if not value.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/"):
+        return Path(value)
+    match = DESKTOP_WSL_BIND_ALIAS_RE.fullmatch(value)
+    require(match is not None, "Live WSL alias is not canonical")
+    alias = LOCAL_WSL_BIND_MOUNT_ROOT.joinpath(*match.groups())
+    observed = subprocess.run(["findmnt", "--json", "--target", str(alias), "--output", "TARGET,FSROOT"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    require(observed.returncode == 0 and len(observed.stdout) <= 65536,
+            "Live WSL alias kernel mapping is unavailable")
+    rows = json.loads(observed.stdout).get("filesystems")
+    require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+            and rows[0].get("target") == str(alias), "Live WSL alias mount identity differs")
+    root = rows[0].get("fsroot")
+    require(isinstance(root, str) and root.startswith("/") and ".." not in Path(root).parts,
+            "Live WSL alias filesystem root is unsafe")
+    try:
+        same = Path(root).samefile(alias)
+    except OSError as error:
+        raise BuildControlError("Live WSL alias inode identity is unavailable") from error
+    require(same, "Live WSL alias filesystem root does not prove its inode")
+    return Path(root)
+
+
+def retained_preparation_raw(control, r):
+    retained = r["retained_preparation"]
+    previous_raw = read_raw(control, retained["request"])
+    require(digest(previous_raw) == retained["request_sha256"], "Retained request CAS differs")
+    previous = json.loads(previous_raw)
+    validate_request(previous)
+    require(previous["schema"] == SCHEMA, "Replay requires one original v1 preparation")
+    excluded = {"schema", "source_revision", "controller_inputs", "retained_preparation"}
+    require({k: v for k, v in r.items() if k not in excluded}
+            == {k: v for k, v in previous.items() if k not in excluded},
+            "Retained preparation boot/engine/service/storage/native authority differs")
+    path = "verification/linux-native-readmission/" + retained["request_sha256"] + "/preparation.json"
+    raw = read_raw(control, path)
+    require(digest(raw) == retained["preparation_sha256"], "Retained preparation CAS differs")
+    return raw
+
+
 def observe(control, source, layout, r, allowed_helpers=()):
-    from docker_dev import storage
+    import fullmag_storage as storage
+    from docker_dev_browser_qa import _source_mount_matches_selected
     require(not control.namespace, "Namespaced controls need their own recovery")
     require(Path("/proc/sys/kernel/random/boot_id").read_text().strip() == r["boot_id"], "Host rebooted")
     require(docker_capture("info", "--format", "{{.ID}}").stdout.decode().strip() == r["engine_id"],
@@ -110,9 +205,9 @@ def observe(control, source, layout, r, allowed_helpers=()):
     require(set(services) == {"backend", "frontend"}, "Stopped service inventory differs")
     backend = services["backend"]
     mounts = {m["Destination"]: m for m in backend["Mounts"]}
-    require(mounts.get("/state", {}).get("Source") == str(state)
+    require(_source_mount_matches_selected(mounts.get("/state", {}).get("Source"), state)
             and mounts["/state"].get("Type") == "bind"
-            and mounts.get("/opt/fullmag/source", {}).get("Source") == str(source)
+            and _source_mount_matches_selected(mounts.get("/opt/fullmag/source", {}).get("Source"), source)
             and mounts["/opt/fullmag/source"].get("RW") is False
             and backend["Image"] == r["storage_pins"].get("image_id"), "Retained source/storage image differs")
     from docker_volume_stop_unadmitted import _runtime_control_volume_mount
@@ -124,10 +219,9 @@ def observe(control, source, layout, r, allowed_helpers=()):
         if actual.get("Name", "").lstrip("/") in allowed_helpers:
             continue
         for mount in actual.get("Mounts", []):
-            source_path = mount.get("Source", "")
-            overlap = (source_path and source_path.startswith("/")
-                       and (Path(source_path) == state or Path(source_path) in state.parents
-                            or state in Path(source_path).parents))
+            source_path = live_bind_path(mount.get("Source")) if mount.get("Type") == "bind" else None
+            overlap = (source_path is not None and (source_path == state
+                       or source_path in state.parents or state in source_path.parents))
             require(not (mount.get("Name") in protected or overlap), "A live container consumes retained data")
     return state, compose, backend
 
@@ -213,6 +307,10 @@ def run(args):
     pins = dict(r["native_pins"], **{r["compose_path"]: r["compose_sha256"],
                                       r["failed_resume_path"]: r["failed_resume_sha256"],
                                       args.request: args.request_sha256})
+    if r["schema"] == REPLAY_SCHEMA:
+        retained = r["retained_preparation"]
+        pins[retained["request"]] = retained["request_sha256"]
+        pins["verification/linux-native-readmission/" + retained["request_sha256"] + "/preparation.json"] = retained["preparation_sha256"]
     base = "verification/linux-native-readmission/" + args.request_sha256
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -221,18 +319,25 @@ def run(args):
         require(ready.get("state") == "locked", "Readmission guards were not acquired")
         observe(control, source, layout, r, (name,))
         saved = read_raw(control, base + "/preparation.json", optional=True)
-        preparation = (restore_preparation(json.loads(saved)) if saved is not None
-                       else host.prepare_device_readmission(state, r["storage_pins"]))
+        if r["schema"] == REPLAY_SCHEMA:
+            original_saved = retained_preparation_raw(control, r)
+            require(saved is None or saved == original_saved, "Replay archive differs from exact original bytes")
+            saved = original_saved
+        if saved is None:
+            preparation = host.prepare_device_readmission(state, r["storage_pins"])
+            saved = canonical(archive_preparation(preparation)) + b"\n"
+        preparation = restore_preparation(json.loads(saved))
         require(preparation["pins"] == r["storage_pins"], "Archived preparation pins differ")
-        host._readmission_phase(state, preparation)
-        archived = archive_preparation(preparation)
-        write_immutable(control, base + "/preparation.json", canonical(archived) + b"\n")
-        require(restore_preparation(json.loads(read_raw(control, base + "/preparation.json"))) == preparation,
-                "Archived preparation readback differs")
+        replay = ({"archived_marker_sha256": r["retained_preparation"]["marker_sha256"]}
+                  if r["schema"] == REPLAY_SCHEMA else {})
+        host._readmission_phase(state, preparation, **replay)
+        write_immutable(control, base + "/preparation.json", saved)
+        require(read_raw(control, base + "/preparation.json") == saved,
+                "Archived preparation raw readback differs")
         if args.apply:
             require(process.poll() is None, "Readmission guard exited before host publication")
             observe(control, source, layout, r, (name,))
-            result = host.apply_device_readmission(state, preparation)
+            result = host.apply_device_readmission(state, preparation, **replay)
         else:
             result = {"state": "validated-only", "namespace_admitted": False}
         require(process.poll() is None, "Readmission guard exited during host publication")
@@ -241,7 +346,7 @@ def run(args):
         require(after.get("state") == "preserved" and after.get("snapshot") == ready["snapshot"],
                 "Protected data preservation not proven")
         observe(control, source, layout, r, (name,))
-        receipt = {"schema": SCHEMA, "request_sha256": args.request_sha256,
+        receipt = {"schema": r["schema"], "request_sha256": args.request_sha256,
                    "candidate_sha256": preparation["candidate_sha256"],
                    "snapshot": ready["snapshot"], "services_started": False, "solve_replayed": False,
                    "state": result["state"], "namespace_admitted": False}

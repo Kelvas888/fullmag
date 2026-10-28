@@ -384,7 +384,7 @@ def prepare_device_readmission(state, pins):
             "certificate_inode": _readmission_certificate_inode(state)}
 
 
-def _readmission_phase(state, preparation):
+def _readmission_phase(state, preparation, *, archived_marker_sha256=None):
     candidate, raw = _readmission_validate(state, preparation["pins"], preparation["original"])
     if (preparation["candidate"] != candidate or preparation["candidate_raw"] != raw
             or preparation["candidate_sha256"] != _readmission_digest(raw)
@@ -394,6 +394,13 @@ def _readmission_phase(state, preparation):
     for name in READMISSION_FILES[2:]:
         if current[name] != preparation["original"][name]:
             raise ValueError("Readmission protected evidence changed: " + name)
+    archive_order_raw = (json.dumps(candidate, indent=2, ensure_ascii=False, sort_keys=True,
+                                    allow_nan=False) + "\n").encode()
+    if archived_marker_sha256 is not None:
+        if (not isinstance(archived_marker_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", archived_marker_sha256) is None
+                or _readmission_digest(archive_order_raw) != archived_marker_sha256):
+            raise ValueError("Readmission archived marker pin differs from its deterministic encoding")
     pair = (current[CERTIFICATE_NAME], current[OWNER_NAME])
     original = preparation["original"]
     if pair == (original[CERTIFICATE_NAME], original[OWNER_NAME]):
@@ -402,10 +409,12 @@ def _readmission_phase(state, preparation):
         return "marker-published"
     if pair == (raw, raw):
         return "prepared"
+    if archived_marker_sha256 is not None and pair == (original[CERTIFICATE_NAME], archive_order_raw):
+        return "marker-published-archive-order"
     raise ValueError("Readmission certificate/marker bytes are foreign, torn or reversed")
 
 
-def apply_device_readmission(state, preparation):
+def apply_device_readmission(state, preparation, *, archived_marker_sha256=None):
     """Prepare two existing admission files, with no probe or runtime action.
 
     Required caller-held guards and immutable control-volume archive are the
@@ -416,13 +425,13 @@ def apply_device_readmission(state, preparation):
     if (not isinstance(preparation, dict) or set(preparation) != required
             or preparation["schema"] != DEVICE_READMISSION_SCHEMA):
         raise ValueError("Readmission preparation schema differs")
-    phase = _readmission_phase(state, preparation)
-    if phase == "original":
-        publish_evidence(state / OWNER_NAME, preparation["candidate"])
+    phase = _readmission_phase(state, preparation, archived_marker_sha256=archived_marker_sha256)
+    if phase in {"original", "marker-published-archive-order"}:
+        publish_bytes(state / OWNER_NAME, preparation["candidate_raw"])
         if _readmission_phase(state, preparation) != "marker-published":
             raise ValueError("Readmission marker publication did not reach its exact phase")
     if phase != "prepared":
-        write_bound_evidence(state / CERTIFICATE_NAME, preparation["candidate"])
+        write_bound_evidence(state / CERTIFICATE_NAME, _readmission_json(preparation["candidate_raw"]))
     if _readmission_phase(state, preparation) != "prepared":
         raise ValueError("Readmission certificate publication did not reach its exact phase")
     return {"state": "prepared-not-admitted", "namespace_admitted": False,

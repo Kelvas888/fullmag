@@ -296,6 +296,17 @@ case "${recipe}" in
     fi
     exec "${python_cmd}" -B "${script_dir}/docker_dev_recovery_build.py" "${recovery_args[@]}"
     ;;
+  *"scripts/docker_linux_native_readmission.py"*)
+    readmission_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_linux_native_readmission.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --image-id '(sha256:[0-9a-f]{64})'( --apply)?[[:space:]]*$"
+    if [[ ! "${recipe}" =~ ${readmission_pattern} ]]; then
+      echo "[fullmag just] invalid Linux storage readmission recipe" >&2
+      exit 2
+    fi
+    readmission_args=(--request "${BASH_REMATCH[1]}" --request-sha256 "${BASH_REMATCH[2]}"
+      --source-root "${BASH_REMATCH[3]}" --image-id "${BASH_REMATCH[4]}")
+    if [[ -n "${BASH_REMATCH[5]:-}" ]]; then readmission_args+=(--apply); fi
+    exec "${python_cmd}" -B "${script_dir}/docker_linux_native_readmission.py" "${readmission_args[@]}"
+    ;;
   *"scripts/docker_volume_development_interrupted.py"*)
     development_reconcile_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_volume_development_interrupted.py\" --request '([a-zA-Z0-9_./-]+)' --request-sha256 '([0-9a-f]{64})' --source-root '([^']+)'( --apply)?[[:space:]]*$"
     if [[ ! "${recipe}" =~ ${development_reconcile_pattern} ]]; then

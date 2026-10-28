@@ -155,3 +155,54 @@ archiwum i jawna odmowa błędu enumeracji) zostały poprawione przed użyciem.
 Rzeczywiste preview/apply, nowy probe w docelowym backendzie, managed build,
 native mixed-history recovery i odbiór H w WebGL pozostają niewykonane.
 Wynik symulacji zachowuje Failed/unassessed. Nie powtarzano Solve.
+
+
+## Weryfikacja rzeczywistej trasy i jawne wznowienie archiwum v2
+
+Commit `25a3b800558e3dd2ac642a12b28c7d28a5a4c147` zachował pierwszy fragment.
+Rzeczywiste preview wykazało jeszcze brak zamkniętej trasy w
+`just_storage_shell.sh`, nieprawidłowy import resolvera oraz różnicę pomiędzy
+ścieżkami hosta i aliasami bindów Docker Desktop. Trasa jest teraz jawna przed
+hostowym preflight; regresja wykonuje pełną powłokę na prywatnym fixture.
+Wybrany source/state są potwierdzane istniejącą funkcją samefile. Dla żywych
+aliasów podkatalogów kernelowe TARGET/FSROOT i inode muszą dowodzić rozłączności.
+Stary runner Windows pozostaje nietknięty: dwa jego bindy zostały sprawdzone
+natywnym, odczytowym dowodem stałego NTFS/ReFS bez reparse ancestors.
+
+Pełny final preview requestu
+`5dfa89641cca925359bfdafadb44a566086b06356a869dc55c83338b83d2588d`
+przeszedł: 15 919 plików, 537 825 914 B, snapshot
+`a7def36ae039208a98f6bce55f254afab818bf407528c38af8312765e5fceb41`.
+Ledger SHA: `ba6628a5d510d66e40dff31888a68730f0d09e40aa3ef2cdf8ef9638d1e85d8a`.
+Nie uruchomiono usług ani Solve.
+
+Apply tego requestu zatrzymał się po publikacji markera, przed certyfikatem.
+Przyczyną był błąd nowego kodu: canonical archive sortował klucze candidate dict,
+a publisher serializował dict zamiast przypiętych candidate_raw. Semantycznie
+zmieniły się tylko host_device i restart_verified, ale raw readback prawidłowo
+odmówił kontynuacji. Certyfikat zachował oryginalny SHA
+`b9dfce5d6be9ed857b8468f27fcb8be99fe3ad9674e61ca0e3d46f4d7f116c6f`;
+marker ma dokładny archive-order SHA
+`48ceccfaf51b515b7d48e896f77e502f21645e48d60f29e1dd5402c5f9e1f089`.
+Docelowe candidate_raw mają SHA
+`954b615bd9006972afffd7405209c37b9d91acdcbfa752b591659d4f66f8ab62`.
+
+Publisher używa teraz dokładnych candidate_raw; bound certificate odtwarza
+kolejność z tych samych bajtów. Osobny request
+`fullmag.docker-linux-device-readmission.v2` wymaga SHA starego requestu,
+oryginalnego przygotowania oraz dokładnego deterministycznego wariantu markera.
+Boot/engine/container/storage/native pins pozostają identyczne. Archiwum jest
+kopiowane jako surowe bytes; normalizacja markera musi osiągnąć zwykłą fazę
+marker-published przed zapisem certyfikatu. V1 i domyślne wywołania core nadal
+odrzucają archive-order marker; nie ma ogólnej równoważności JSON.
+
+Końcowe 28 regresji interpretowanych: PASS, zero failures/errors/skips.
+Obejmują rzeczywiste canonical archive → restore → publish, jawne wznowienie
+częściowej publikacji i odmowę compact/foreign/reversed bytes oraz błędnych CAS
+lub zmienionych authority pins. Niezależny review: zero Required po poprawkach.
+Dowody: `verification/linux-native-readmission-20261028/v2-source-tests.json`
+i `v2-source-tests.log`. Nie kompilowano lokalnie testów Rust.
+
+V2 preview/apply i potwierdzenie niezmienności danych po wznowieniu pozostają
+wymagane. Storage nie jest jeszcze namespace-admitted; nowy backend build,
+native mixed-history recovery i rzeczywiste H w UI pozostają otwarte.

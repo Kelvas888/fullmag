@@ -103,7 +103,7 @@ class LinuxNativeReadmissionTests(unittest.TestCase):
         prepared = self.prepare()
         host.apply_device_readmission(self.state, prepared)
         before = self.snapshot()
-        with patch.object(host, "publish_evidence") as publish, patch.object(host, "write_bound_evidence") as write:
+        with patch.object(host, "publish_bytes") as publish, patch.object(host, "write_bound_evidence") as write:
             result = host.apply_device_readmission(self.state, prepared)
         publish.assert_not_called()
         write.assert_not_called()
@@ -117,10 +117,51 @@ class LinuxNativeReadmissionTests(unittest.TestCase):
                 host.apply_device_readmission(self.state, prepared)
         self.assertEqual((self.state / host.CERTIFICATE_NAME).read_bytes(), prepared["original"][host.CERTIFICATE_NAME])
         self.assertEqual((self.state / host.OWNER_NAME).read_bytes(), prepared["candidate_raw"])
-        with patch.object(host, "publish_evidence") as publish:
+        with patch.object(host, "publish_bytes") as publish:
             result = host.apply_device_readmission(self.state, prepared)
         publish.assert_not_called()
         self.assertEqual(result["previous_phase"], "marker-published")
+
+    def test_canonical_archive_dict_order_never_changes_published_bytes(self):
+        prepared = self.prepare()
+        from docker_build_control import canonical
+        from docker_linux_native_readmission import archive_preparation, restore_preparation
+        prepared = restore_preparation(json.loads(canonical(archive_preparation(prepared))))
+        host.apply_device_readmission(self.state, prepared)
+        self.assertEqual((self.state / host.CERTIFICATE_NAME).read_bytes(), prepared["candidate_raw"])
+        self.assertEqual((self.state / host.OWNER_NAME).read_bytes(), prepared["candidate_raw"])
+
+    def test_archive_order_marker_requires_exact_explicit_v2_pin(self):
+        prepared = self.prepare()
+        raw = (json.dumps(prepared["candidate"], indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        (self.state / host.OWNER_NAME).write_bytes(raw)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "foreign, torn or reversed"):
+            host.apply_device_readmission(self.state, prepared)
+        self.assertEqual(self.snapshot(), before)
+        with self.assertRaisesRegex(ValueError, "archived marker pin"):
+            host.apply_device_readmission(self.state, prepared, archived_marker_sha256="0" * 64)
+        self.assertEqual(self.snapshot(), before)
+        pin = hashlib.sha256(raw).hexdigest()
+        result = host.apply_device_readmission(self.state, prepared, archived_marker_sha256=pin)
+        self.assertEqual(result["previous_phase"], "marker-published-archive-order")
+        self.assertEqual((self.state / host.CERTIFICATE_NAME).read_bytes(), prepared["candidate_raw"])
+        self.assertEqual((self.state / host.OWNER_NAME).read_bytes(), prepared["candidate_raw"])
+        for name in host.READMISSION_FILES[2:]: self.assertEqual(self.snapshot()[name], before[name])
+
+    def test_v2_pin_does_not_accept_arbitrary_equivalent_json_or_reversed_pair(self):
+        prepared = self.prepare()
+        archive_raw = (json.dumps(prepared["candidate"], indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        compact = json.dumps(prepared["candidate"], sort_keys=True).encode()
+        (self.state / host.OWNER_NAME).write_bytes(compact)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "foreign, torn or reversed"):
+            host.apply_device_readmission(self.state, prepared, archived_marker_sha256=hashlib.sha256(archive_raw).hexdigest())
+        self.assertEqual(self.snapshot(), before)
+        (self.state / host.OWNER_NAME).write_bytes(prepared["original"][host.OWNER_NAME])
+        (self.state / host.CERTIFICATE_NAME).write_bytes(archive_raw)
+        with self.assertRaisesRegex(ValueError, "foreign, torn or reversed"):
+            host.apply_device_readmission(self.state, prepared, archived_marker_sha256=hashlib.sha256(archive_raw).hexdigest())
 
     def test_reversed_pair_is_refused_without_overwriting_either_file(self):
         prepared = self.prepare()
