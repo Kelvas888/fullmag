@@ -866,6 +866,7 @@ jobs:
           python -B scripts/test_docker_isolated_snapshot_copy.py -v
           python -B scripts/test_docker_isolated_snapshot_namespace.py -v
           python -B scripts/test_docker_isolated_session_recovery.py -v
+          python -B scripts/test_docker_isolated_stopped_predecessor.py -v
           python -B scripts/test_docker_isolated_sqlite_fence.py -v
           python -B scripts/test_docker_isolated_control_snapshot.py -v
           python -B scripts/test_docker_isolated_control_prepare.py -v

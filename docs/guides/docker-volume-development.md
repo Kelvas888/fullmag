@@ -804,3 +804,21 @@ natywną bramkę. Operacja dotyczy wyłącznie przypiętej, zatrzymanej grupy ma
 Nowy snapshot ma odrębną generację prywatnego ledgeru, wyprowadzoną z recovery ID;
 stary ledger pozostaje zachowany. Kontrole readmission poza tą jawną ścieżką
 nadal wymagają udanego terminalnego receiptu.
+
+Jeżeli nieudany start zakończył się przed zapisaniem identyfikatorów usług,
+successor nie odgaduje ich z listy kontenerów. Operator musi jawnie przypiąć
+typed journal bezpiecznego zatrzymania diagnostycznego API przez parę opcji
+`--stopped-predecessor-proof` i `--stopped-predecessor-proof-sha256`.
+Adapter przyjmuje tylko `fullmag.docker-preowner-policy-stop.v1` dla tej samej
+nieudanej próby: potwierdzone zatrzymanie po odmowie polityki zasobów,
+brak bieżącej sesji API i zachowane dane. Sprawdza surowy hash journala,
+niezmienny plan oraz udany terminal operacji Stop, a także zachowane piny
+OWNER, procesu i provenance. Journal nie stanowi dowodu native drain.
+
+Brakujące lub null identyfikatory terminala uzupełnia wyłącznie w pamięci;
+inne pola i istniejące identyfikatory muszą pozostać zgodne. Oryginalne bajty
+terminala, current i wszystkich dokumentów dowodu pozostają pinami końcowego
+CAS. Każdy ponowny odczyt zatrzymanej pary sprawdza identyfikator, obraz,
+fingerprint, `StartedAt` oraz poprawne zakończenie kontenera. Dotychczasowe
+bramki natywnego admission, ledgeru i magazynu wszystkich runów nadal obowiązują.
+Opcje nie są dostępne dla zwykłego readmission ani udanego terminala.

@@ -55,3 +55,22 @@
   ma zachować certyfikat, owner, pakiet i wszystkie dane; dopiero potem wolno wznowić build.
 - Integracja, native admission, Stop w przeglądarce i widoczny H_demag w pustych
   komórkach aktualnego renderera nadal wymagają dowodów runtime.
+
+## Checkpoint integracji i diagnostycznego poprzednika
+
+- PR #316 scalony jako `9c6253fd81b94781a2969bb22643bac02dd5f70b`.
+  Wszystkie trzy workflow dla head `f19e5863d5f5d3a4cebe47e6c6c97e37b4fa5aea`
+  przeszły; niezależny review bez pozostałych P1/P2.
+- Lifecycle i Git MAIN należą do skoordynowanego właściciela mastera. Jego
+  aktualny failed-confirmed terminal nie zawiera ID usług. Oddzielny adapter
+  przyjmuje wyłącznie jawnie przypięty typed journal bezpiecznego Stop i uzupełnia
+  brakujące ID w pamięci. Oryginalne dokumenty pozostają niezmienione i przypięte
+  do CAS; każda obserwacja pary sprawdza również jej inkarnację.
+- Testy adaptera i integracji: 54 Python regression cases, exit 0; niezależny
+  review bez P1/P2. Realny journal przeszedł preflight, a pełny readonly preview
+  potwierdził 16 terminalnych i 2 held-manual runy bez kopii, startu ani Solve.
+  Apply i ponowny start pozostają u właściciela grupy.
+- Własna grupa 3318 zakończyła build aplikacji i admission na f19. Zwykły recreate
+  zachował historyczny held run, ale nie publikuje go automatycznie jako bieżącej
+  sesji. Nie zastępuje to testu odtworzonego Stop w UI; nie odtwarzać skryptu w celu
+  udawania tej weryfikacji. Publiczny test nowego Stop i FDM jest osobnym dowodem.
