@@ -11,6 +11,7 @@ import {
 } from "@/kernel/workspace/planarMonitorFramePreview";
 
 import type { Viewport3DColors } from "../hooks/useViewport3DColors";
+import { registerViewport3DProbeGizmo } from "../viewport3dEventManager";
 import {
   closestAxisParameter,
   planarFrameCenter,
@@ -85,7 +86,11 @@ export function PlanarMonitorNormalHandle({
     };
   }, []);
 
-  if (editorMonitorId !== preview.monitorId || preview.visible === false) return null;
+  const shown = editorMonitorId === preview.monitorId && preview.visible !== false;
+  // Pointer-down reaches gizmos before orbit only while one is registered.
+  useEffect(() => (shown ? registerViewport3DProbeGizmo() : undefined), [shown]);
+
+  if (!shown) return null;
   const { center, length, normal, quaternion } = geometry;
   const rayParameter = (event: ThreeEvent<PointerEvent>, axisPoint: Vec3) =>
     closestAxisParameter(
@@ -104,6 +109,7 @@ export function PlanarMonitorNormalHandle({
     >
       <mesh
         position={[0, length / 2, 0]}
+        userData={{ gizmo: "planar-normal", monitorId: preview.monitorId }}
         onPointerDown={(event) => {
           event.stopPropagation();
           const startParameter = rayParameter(event, center);
