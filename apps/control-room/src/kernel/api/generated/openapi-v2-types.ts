@@ -12082,6 +12082,11 @@ export interface components {
             points: boolean;
             probes: boolean;
             raster: boolean;
+            /**
+             * @description In-plane streamlines of the vector raster (presentation only, note 0970
+             *     `eq-planar-streamlines`); absent in state persisted before the layer.
+             */
+            streamlines?: boolean;
             vectors: boolean;
         };
         PlanarMeshOverlayDescriptor: {

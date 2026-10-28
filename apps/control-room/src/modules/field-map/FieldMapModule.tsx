@@ -244,7 +244,8 @@ function useFieldMapModuleController() {
         canonicalPlanar?.resolution.width ?? 0,
         canonicalPlanar?.resolution.height ?? 0,
       ],
-      showVectors: canonicalPlanar?.layers.vectors ?? false,
+      // Streamlines trace the same frame-vector raster as the quiver.
+      showVectors: (canonicalPlanar?.layers.vectors ?? false) || (canonicalPlanar?.layers.streamlines ?? false),
       colorByDirection: isDirectionColormap(canonicalPlanar?.colormap) || clientComponents,
       snapshotId: selectedFieldContext.snapshotId,
       stageId: selectedFieldContext.stageId,
@@ -426,6 +427,7 @@ function useFieldMapModuleController() {
         points: presentationPlanar.layers.points,
         probes: presentationPlanar.layers.probes,
         raster: presentationPlanar.layers.raster,
+        streamlines: presentationPlanar.layers.streamlines ?? false,
         vectors: presentationPlanar.layers.vectors,
       },
       mask: maskValues,
