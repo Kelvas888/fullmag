@@ -57,7 +57,7 @@ Status: **zaimplementowane, runtime zablokowany** (2026-10-28). Nawigator nad ma
 
 ## B5. Gizmo płaszczyzny w 3D
 
-Status: **zrobione częściowo** (2026-10-28). Uchwyt przesunięcia wzdłuż normalnej na podglądzie ramki monitora planarnego; Inspector rejestruje się jako właściciel szkicu, a uchwyt proponuje nowy `origin_m` tą samą ścieżką aktualizacji szkicu (jeden szkic, jeden właściciel); `Esc` przywraca położenie początkowe; orbita wstrzymana w trakcie gestu. Dowód przeglądarkowy (przeciągnięcie zmienia `Origin Z` w Inspectorze 5 → 32,88 nm). Nie zrobione: pierścienie obrotu, pick-from-face, `Shift+[`/`Shift+]`.
+Status: **zrobione** (2026-10-28). Uchwyt przesunięcia wzdłuż normalnej, dwa pierścienie obrotu (wokół u i v; Shift przyciąga do 5°), `Shift+[`/`Shift+]` (obrót wokół u o 5°) i pick-from-face („Pick face in 3D” w Inspectorze: normalna ściany przez punkt trafienia). Inspector rejestruje się jako właściciel szkicu, a gizmo proponuje zmiany ramki tą samą ścieżką aktualizacji szkicu; `Esc` przywraca ramkę; ramki reortonormalizowane (v = n × u). Dowody przeglądarkowe dla wszystkich czterech interakcji w `docs/diagnostics/viewport-2d-level-b-b4-b6-2026-10-28/`.
 
 | Aspekt | Projekt |
 |---|---|
@@ -68,7 +68,7 @@ Status: **zrobione częściowo** (2026-10-28). Uchwyt przesunięcia wzdłuż nor
 
 ## B6. Indeks przestrzenny i gather na GPU
 
-Status: **zrobione częściowo** (2026-10-28). BVH po AABB wybranych elementów dla wsadowej lokalizacji punktów (profil liniowy od 32 punktów), kandydaci w rosnącej kolejności elementów, więc wynik równy skanowi bezpośredniemu (nota 0970 § Spatial index for point location; nowa bramka PM-N28 spełniona w runtime: 61 punktów profilu bitowo równych sondzie; PM-N17 dla operatora płaszczyzny pozostaje otwarta). Nie zrobione: indeks dla operatora płaszczyzny i cache BVH między żądaniami; gather na GPU **BLOCKED** (tor FEM GPU zablokowany).
+Status: **zrobione częściowo** (2026-10-28). BVH po AABB wybranych elementów dla wsadowej lokalizacji punktów (profil liniowy od 32 punktów), kandydaci w rosnącej kolejności elementów, więc wynik równy skanowi bezpośredniemu (nota 0970 § Spatial index for point location; nowa bramka PM-N28 spełniona w runtime: 61 punktów profilu bitowo równych sondzie; operator płaszczyzny rasteryzuje tylko elementy, których pudełko przecina płaszczyznę, z BVH cache'owanego po fingerprincie topologii — PM-N17: test pokrycia na 10k Tet4 oraz A/B runtime 12/12 przekrojów bitowo identycznych; pomiary 200k/2M otwarte). Gather na GPU **BLOCKED** (tor FEM GPU zablokowany).
 
 - BVH po AABB elementów (budowane raz na `topology_fingerprint`) dla płaszczyzn skośnych, sondy i profili; obecnie płaszczyzna rasteryzuje element po elemencie, a sonda skanuje elementy liniowo.
 - Gather operatora (rzadkie mnożenie) na urządzeniu dla FEM GPU, aby nie kopiować całego pola przy każdym kroku; wymaga noty i kwalifikacji parytetu z CPU.
