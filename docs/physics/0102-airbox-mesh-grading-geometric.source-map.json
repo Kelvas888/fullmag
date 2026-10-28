@@ -271,7 +271,7 @@
     {
       "id": "body-target-regression",
       "path": "packages/fullmag-py/tests/test_shared_domain_body_hmax.py",
-      "symbol": "SharedDomainBodyHmaxTests",
+      "symbol": "class SharedDomainBodyHmaxTests",
       "responsibility": "Two spheres with airbox_hmax above the body target realize and follow the body target.",
       "evidence_status": "interpreted-gmsh-regression"
     },
