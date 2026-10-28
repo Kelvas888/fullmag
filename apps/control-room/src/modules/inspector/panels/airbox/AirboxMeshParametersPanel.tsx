@@ -11,6 +11,7 @@ import {
   sessionRequestScopeKey,
 } from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import { useRuntimeCommandControlResourceData } from "@/kernel/resources/studyRuntimeResources";
 import {
   MESH_BUILD_CURRENT_RESOURCE_KEY,
   MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
@@ -55,6 +56,7 @@ import {
   draftFromUniverseMeshPolicyResource,
   draftIdentityKeyForUniverseMeshPolicyResource,
   draftKeyForUniverseMeshPolicyResource,
+  rebaseAirboxMeshPolicyDraft,
   type AirboxMeshPolicyDraft,
   type AirboxLengthPolicyField,
   type AirboxLengthUnit,
@@ -292,14 +294,20 @@ export function AirboxMeshParametersPanel({
     isDirty: airboxMeshPolicyDraftDirty,
     state: draftState,
   });
+  // Mesh commands resolve their lane from the session status in the context.
+  const runtimeResourceData = useRuntimeCommandControlResourceData({
+    includeSharedDomainReadiness: false,
+    includeStageExecution: false,
+  });
   const commandContext = useMemo(
     () =>
       createCommandContext("inspector", kernel, {
+        resourceData: runtimeResourceData,
         sessionScopeKey,
         sourceDetail: "airbox-mesh-parameters",
         input: { origin: "airbox" },
       }),
-    [kernel, sessionScopeKey],
+    [kernel, runtimeResourceData, sessionScopeKey],
   );
   const inspectorEditSession = useInspectorEditSession();
   const effectiveMode = draft.airboxMode.trim() || "auto";
@@ -404,7 +412,7 @@ export function AirboxMeshParametersPanel({
     });
     try {
       const submission = await submitAirboxPolicyDraft(
-        draft,
+        rebaseAirboxMeshPolicyDraft(draft, policy.data ?? null),
         (request, requestOptions) => api.meshing.replaceUniversePolicy(request, requestOptions),
         { lane, sessionScopeKey: operationSessionScopeKey },
       );
