@@ -1,5 +1,6 @@
 import type {
   PlanarFieldProbeQuery,
+  PlanarFieldProfileQuery,
   PlanarFieldQuery,
   PlanarFieldSource,
 } from "@/kernel/api/apiTypes";
@@ -124,4 +125,20 @@ export function buildFieldMapProbeQuery(
   vM: number,
 ): PlanarFieldProbeQuery {
   return { ...query, u_m: uM, v_m: vM } as PlanarFieldProbeQuery;
+}
+
+/** Profile segment on the raster's sample identity (F6 B1, note 0970). */
+export function buildFieldMapProfileQuery(
+  query: PlanarFieldQuery,
+  segment: { u0: number; v0: number; u1: number; v1: number },
+  samples: number,
+): PlanarFieldProfileQuery {
+  return {
+    ...query,
+    samples,
+    u0_m: segment.u0,
+    u1_m: segment.u1,
+    v0_m: segment.v0,
+    v1_m: segment.v1,
+  } as PlanarFieldProfileQuery;
 }

@@ -14,6 +14,7 @@ import {
   usePlanarMaskResource,
   usePlanarMeshOverlayResource,
   usePlanarProbeResource,
+  usePlanarProfileResource,
   usePlanarScalarResource,
   usePlanarVectorResource,
 } from "@/kernel/resources/planarFieldResources";
@@ -41,11 +42,14 @@ import { isDirectionColormap } from "@/shared/visualization/directionColor";
 import { FieldMapToolbar, type FieldMapToolbarQuantity } from "./components/FieldMapToolbar";
 import { PlanarColorLegend } from "./components/PlanarColorLegend";
 import { PlanarPinnedProbe } from "./components/PlanarPinnedProbe";
+import { PlanarProfileChart } from "./components/PlanarProfileChart";
+import { quantityDisplayName } from "@/kernel/api/quantityIds";
 import { PlanarSectionStrip } from "./components/PlanarSectionStrip";
 
 import {
   buildFieldMapDataPlan,
   buildFieldMapProbeQuery,
+  buildFieldMapProfileQuery,
 } from "./model/fieldMapDataPlan";
 import {
   buildFieldMapRenderModel,
@@ -64,13 +68,16 @@ import {
   type PlanarEvidenceStatus,
   type PlanarRenderEvidence,
 } from "./model/fieldMapEvidence";
-import { PlanarSurface } from "./renderer/PlanarSurface";
+import { PlanarSurface, type PlanarProfileSegment } from "./renderer/PlanarSurface";
 import { createCoalescedFramePublisher } from "./renderer/planarFrameScheduler";
 import { useRetainedPlanarFrame } from "./hooks/useRetainedPlanarFrame";
 import { fieldMapSurfaceStore as fieldMapStore } from "@/kernel/visualization/fieldMapSurfaceStore";
 
 type SectionDefaultSlice = NonNullable<VisualizationStateResource["planar"]>["default_slice"];
 type PlanarPatch = NonNullable<Parameters<ReturnType<typeof useKernel>["visualizationSync"]["queuePatch"]>[0]["planar"]>;
+
+/** Uniform samples per line profile; FEM adds the element-face crossings. */
+const PROFILE_SAMPLES = 512;
 
 function useFieldMapModuleController() {
   const { layout, visualizationSync } = useKernel();
@@ -463,6 +470,43 @@ function useFieldMapModuleController() {
       ),
     };
   }, [probe.data, renderModel]);
+  // F6 B1: a line profile is a derived resource of the current sample. The
+  // segment belongs to one view identity, so a new source, plane or quantity
+  // drops it, while a layer step re-evaluates it on the new sample.
+  const [profileSegment, setProfileSegment] = useState<{
+    key: string | null;
+    segment: PlanarProfileSegment;
+  } | null>(null);
+  const activeProfileSegment = profileSegment?.key === planarViewIdentityKey
+    ? profileSegment.segment
+    : null;
+  const onProfileSegment = useCallback(
+    (segment: PlanarProfileSegment | null) =>
+      setProfileSegment(segment ? { key: planarViewIdentityKey, segment } : null),
+    [planarViewIdentityKey],
+  );
+  const profile = usePlanarProfileResource(
+    plan.quantityId,
+    plan.source,
+    activeProfileSegment && canonicalSampleReady
+      ? buildFieldMapProfileQuery(dataQuery, activeProfileSegment, PROFILE_SAMPLES)
+      : null,
+    { enabled: plan.enabled },
+  );
+  const profileLengthUnit = useMemo(() => renderModel
+    ? resolvePlanarAxes(
+        {
+          normal: renderModel.frame.normal,
+          origin: renderModel.frame.origin,
+          uAxis: renderModel.frame.uAxis,
+          vAxis: renderModel.frame.vAxis,
+        },
+        renderModel.bounds,
+        renderModel.viewport,
+        1,
+        1,
+      ).displayLengthUnit
+    : null, [renderModel]);
 
 
   const evidenceStatus: PlanarEvidenceStatus = resolvePlanarEvidenceStatus({
@@ -568,10 +612,14 @@ function useFieldMapModuleController() {
     onPlanarPatch,
     onRenderEvidence,
     onSectionChange,
+    activeProfileSegment,
+    onProfileSegment,
     pinnedAxisState,
     plan,
     presentationPlanar,
     probe,
+    profile,
+    profileLengthUnit,
     renderModel,
     scalar,
     metaSection,
@@ -599,10 +647,14 @@ export default function FieldMapModule() {
     onPlanarPatch,
     onRenderEvidence,
     onSectionChange,
+    activeProfileSegment,
+    onProfileSegment,
     pinnedAxisState,
     plan,
     presentationPlanar,
     probe,
+    profile,
+    profileLengthUnit,
     renderModel,
     scalar,
     metaSection,
@@ -692,7 +744,7 @@ export default function FieldMapModule() {
     : null;
 
   return (
-    <section className="fm-field-map">
+    <section className={activeProfileSegment ? "fm-field-map fm-field-map--with-profile" : "fm-field-map"}>
       <output
         aria-label="Planar field evidence"
         data-planar-component={evidence.component}
@@ -747,7 +799,9 @@ export default function FieldMapModule() {
           model={renderModel}
           onInteraction={onInteraction}
           onPin={(u, v) => setPinned([u, v])}
+          onProfileSegment={onProfileSegment}
           onRenderEvidence={onRenderEvidence}
+          profileSegment={activeProfileSegment}
           probeOverlay={presentationPlanar.layers.probes && probe.data ? (
             <PlanarPinnedProbe
               axisState={pinnedAxisState}
@@ -777,6 +831,20 @@ export default function FieldMapModule() {
           />
         ) : null}
       </div>
+      {activeProfileSegment ? (
+        <PlanarProfileChart
+          display={{
+            lengthScale: profileLengthUnit?.scale ?? 1,
+            lengthUnit: profileLengthUnit?.symbol ?? "m",
+            legendUnit: renderModel.display.legendUnit,
+            probeScale: renderModel.display.probeScale,
+          }}
+          onClear={() => onProfileSegment(null)}
+          profile={profile.data ?? null}
+          quantityLabel={quantityDisplayName(plan.quantityId)}
+          status={profile.status === "error" ? `unavailable: ${String((profile.error as Error | null)?.message ?? "error")}` : "loading"}
+        />
+      ) : null}
       {renderModel.diagnostics.length ? (
         <div className="fm-field-map__diagnostics" role="status" aria-label="Planar presentation diagnostics">
           {renderModel.diagnostics.map((message) => <p key={message}>{message}</p>)}

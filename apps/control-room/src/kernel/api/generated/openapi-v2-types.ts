@@ -2132,6 +2132,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/sessions/current/data/fields/{quantity_id}/planar-default/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["data_get_sessions_current_data_fields_quantity_id_planar_default_profile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/sessions/current/data/fields/{quantity_id}/planar-default/render.png": {
         parameters: {
             query?: never;
@@ -2236,6 +2252,22 @@ export interface paths {
             cookie?: never;
         };
         get: operations["data_get_sessions_current_data_fields_quantity_id_planar_monitors_monitor_id_probe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/sessions/current/data/fields/{quantity_id}/planar-monitors/{monitor_id}/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["data_get_sessions_current_data_fields_quantity_id_planar_monitors_monitor_id_profile"];
         put?: never;
         post?: never;
         delete?: never;
@@ -11951,6 +11983,26 @@ export interface components {
             vector?: number[] | null;
             world_m: number[];
         };
+        PlanarFieldProfileResource: {
+            component: string;
+            /** Format: double */
+            length_m: number;
+            points: components["schemas"]["PlanarProfilePointResource"][];
+            quantity_id: string;
+            /** @description Identity of the planar sample the profile was evaluated on. */
+            sample_token: string;
+            sampling_method: string;
+            source: components["schemas"]["PlanarSampleSourceResource"];
+            source_entity_kind: string;
+            /** Format: double */
+            u0_m: number;
+            /** Format: double */
+            u1_m: number;
+            /** Format: double */
+            v0_m: number;
+            /** Format: double */
+            v1_m: number;
+        };
         /** @enum {string} */
         PlanarFramePresetSchema: "xy" | "xz" | "yz";
         PlanarFrameSchema: {
@@ -12065,6 +12117,29 @@ export interface components {
             opacity: number;
             /** Format: double */
             size: number;
+        };
+        PlanarProfilePointResource: {
+            /**
+             * Format: int32
+             * @description Cell or element id, per `source_entity_kind`.
+             */
+            entity_id?: number | null;
+            /** @description `uniform` or `element_face` (a FEM element face inside the plane). */
+            kind: string;
+            /** @description `occupied`, `empty` (outside the target) or `outside` (outside the frame). */
+            occupancy: string;
+            /**
+             * Format: double
+             * @description Arc length from the segment start.
+             */
+            s_m: number;
+            /** Format: double */
+            scalar?: number | null;
+            /** Format: double */
+            u_m: number;
+            /** Format: double */
+            v_m: number;
+            vector?: number[] | null;
         };
         /** @enum {string} */
         PlanarReductionSchema: "mean_occupied" | "thickness_integral" | "rms" | "min" | "max" | "abs_max";
@@ -23146,6 +23221,93 @@ export interface operations {
             };
         };
     };
+    data_get_sessions_current_data_fields_quantity_id_planar_default_profile: {
+        parameters: {
+            query: {
+                u0_m: number;
+                v0_m: number;
+                u1_m: number;
+                v1_m: number;
+                /**
+                 * @description Uniform samples along the segment (2..=4096, default 256); FEM
+                 *     profiles add every in-plane element-face crossing.
+                 */
+                samples?: number;
+                sample_token?: string;
+                component?: string;
+                resolution_x?: number;
+                resolution_y?: number;
+                quality?: string;
+                scope_kind?: string;
+                scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
+                stage_id?: string;
+                snapshot_id?: string;
+                expected_scene_revision?: string;
+                expected_monitor_revision?: string;
+                expected_source_revision?: string;
+                expected_mesh_revision?: string;
+                expected_carrier_revision?: string;
+                expected_field_revision?: string;
+            };
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                quantity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanarFieldProfileResource"];
+                };
+            };
+            /** @description Invalid planar query or segment */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Field or domain missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Stale source */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Unsupported planar sampling or too many profile points */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     data_get_sessions_current_data_fields_quantity_id_planar_default_render_png: {
         parameters: {
             query?: {
@@ -23730,6 +23892,94 @@ export interface operations {
                 };
             };
             /** @description Unsupported planar sampling */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    data_get_sessions_current_data_fields_quantity_id_planar_monitors_monitor_id_profile: {
+        parameters: {
+            query: {
+                u0_m: number;
+                v0_m: number;
+                u1_m: number;
+                v1_m: number;
+                /**
+                 * @description Uniform samples along the segment (2..=4096, default 256); FEM
+                 *     profiles add every in-plane element-face crossing.
+                 */
+                samples?: number;
+                sample_token?: string;
+                component?: string;
+                resolution_x?: number;
+                resolution_y?: number;
+                quality?: string;
+                scope_kind?: string;
+                scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
+                stage_id?: string;
+                snapshot_id?: string;
+                expected_scene_revision?: string;
+                expected_monitor_revision?: string;
+                expected_source_revision?: string;
+                expected_mesh_revision?: string;
+                expected_carrier_revision?: string;
+                expected_field_revision?: string;
+            };
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+            };
+            path: {
+                quantity_id: string;
+                monitor_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlanarFieldProfileResource"];
+                };
+            };
+            /** @description Invalid planar query or segment */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Field or monitor missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Stale source */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Unsupported planar sampling or too many profile points */
             422: {
                 headers: {
                     [name: string]: unknown;

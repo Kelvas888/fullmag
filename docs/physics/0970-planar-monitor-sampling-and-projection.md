@@ -874,6 +874,32 @@ value), `empty` (inside the frame, outside the selected target; no value) or
 raster edge, and the reported position and value always refer to the same
 point.
 
+(planar-monitor-line-profile)=
+### Line profile sampling
+
+A line profile is a sequence of point evaluations along the straight segment
+from $\mathbf a=(u_0,v_0)$ to $\mathbf b=(u_1,v_1)$ in the frame of one planar
+sample. With $L=\lVert\mathbf b-\mathbf a\rVert$ and the arc length $s\in[0,L]$,
+
+```{math}
+:label: eq-planar-line-profile
+\mathbf p(s)=\mathbf o+\bigl(u_0+\tfrac{s}{L}(u_1-u_0)\bigr)\mathbf e_u+\bigl(v_0+\tfrac{s}{L}(v_1-v_0)\bigr)\mathbf e_v,\qquad
+q_h(s)=\sum_a N_a\bigl(\boldsymbol\xi_e(\mathbf p(s))\bigr)\,q_a ,
+```
+
+evaluated with the same locator, basis and component derivation as the probe
+({ref}`planar-monitor-probe-evaluation`). The sample set is $N\ge 2$ uniform
+arc lengths $s_k=kL/(N-1)$ and, on FEM carriers, every arc length at which the
+segment crosses an edge of the published section polygons, i.e. an element
+face inside the plane. Because the P1/Prism6 interpolant is linear along a
+straight segment inside one element section (and smooth for Hex8/Pyramid5),
+the profile drawn through these points is the exact trace on affine elements
+rather than a resampling. On FDM carriers the value is the cell value of the
+containing cell (piecewise constant); no smoothing or interpolation across
+cells is applied. Points outside the frame are `outside`, points outside the
+sampled target are `empty`, and neither carries a value. A profile is a derived
+resource of one sample (`sample_token`); it never resamples the raster.
+
 (planar-monitor-implementation-mapping)=
 ## Implementation mapping
 
@@ -963,6 +989,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N22 | default section on even/odd FDM grids at $\phi\in\{0,0.5,1\}$ | published $k$ and $p_n^{\mathrm{res}}$ follow {eq}`eq-planar-default-layer`; requested coordinate preserved |
 | PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
 | PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
+| PM-N25 | line profile through an affine FEM field across several elements, and through an FDM field | FEM values equal the affine field at uniform and face-crossing points within $10^{-12}$ relative; every in-plane element-face crossing is present; FDM values equal the containing cell values; outside/empty points carry no value |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |
 | PM-D02 | default position validation | `position_fraction` is finite and in $[0,1]$; resolved `position_m` is finite and inside the selected normal bounds |
 | PM-D03 | default/authored sampler parity | after source resolution, both source identities use the same interpolation and measure-weighted reduction; source provenance remains distinct |
