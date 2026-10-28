@@ -152,13 +152,16 @@ export function resolvePlanarInspectorCapabilities(input: {
                     : "boundaries_not_exact",
         };
 
+  // A disabled scope is the exact reason for every carrier-dependent layer.
+  const scoped = (capability: FieldMapCapability): FieldMapCapability =>
+    scope.enabled ? capability : { enabled: false, reasonCode: scope.reasonCode };
   return {
     boundaries,
     bounds,
-    contours: base.contours,
-    mesh: base.mesh,
+    contours: scoped(base.contours),
+    mesh: scoped(base.mesh),
     points,
-    raster: base.contours,
-    vectors: base.vectors,
+    raster: scoped(base.contours),
+    vectors: scoped(base.vectors),
   };
 }

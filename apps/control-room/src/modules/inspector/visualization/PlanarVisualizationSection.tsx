@@ -106,8 +106,12 @@ function capabilityReason(capability: FieldMapCapability): string | undefined {
       return "The selected scalar quantity has no vector components.";
     case "quantity_not_spatial":
       return "The selected quantity is not spatially sampleable.";
+    case "airbox_carrier_unresolved":
+      return "Waiting for the backend to resolve the Airbox carrier.";
     default:
-      return "This control is unavailable for the selected planar sample.";
+      return capability.reasonCode
+        ? `Unavailable for the selected planar sample: ${capability.reasonCode}`
+        : "This control is unavailable for the selected planar sample.";
   }
 }
 
