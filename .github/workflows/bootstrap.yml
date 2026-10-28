@@ -152,6 +152,8 @@ jobs:
           cargo test -p fullmag-api --bin fullmag-api live_retirement --no-fail-fast
           cargo test -p fullmag-api --bin fullmag-api session_output_target_tests --no-fail-fast
           cargo test -p fullmag-api --bin fullmag-api live_accepted_execution::tests
+          cargo test -p fullmag-api --bin fullmag-api live_execution_binding::tests
+          cargo test -p fullmag-api --bin fullmag-api isolated_snapshot_restore::tests
           cargo test -p fullmag-api --bin fullmag-api development_accepted_restore::tests
           cargo test -p fullmag-runtime-control --lib scheduler::accepted_start_tests
           cargo test -p fullmag-api --bin fullmag-api live_accepted_projection::tests
@@ -864,6 +866,7 @@ jobs:
           python -B scripts/test_docker_isolated_snapshot_copy.py -v
           python -B scripts/test_docker_isolated_snapshot_namespace.py -v
           python -B scripts/test_docker_isolated_session_recovery.py -v
+          python -B scripts/test_docker_isolated_stopped_predecessor.py -v
           python -B scripts/test_docker_isolated_sqlite_fence.py -v
           python -B scripts/test_docker_isolated_control_snapshot.py -v
           python -B scripts/test_docker_isolated_control_prepare.py -v
@@ -909,6 +912,7 @@ jobs:
           python -B scripts/test_docker_helper_source_transition.py -v
           python -B scripts/test_just_development_recovery_shell.py -v
           python -B scripts/test_docker_volume_reconcile.py -v
+          python -B scripts/test_docker_volume_network_failure_reconcile.py -v
           python -B scripts/test_docker_volume_development_interrupted.py -v
           python -B scripts/test_docker_volume_resume_interrupted.py -v
           python -B scripts/test_linux_native_readmission.py -v

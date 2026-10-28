@@ -1134,6 +1134,10 @@ fn retry_host_worker_launch<T>(
                         || cause.is::<
                             fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable,
                         >()
+                        // The sampler refreshes the compute-node sample.
+                        || cause.is::<
+                            fullmag_session::host_resource_ledger::ComputeNodeSampleNotCurrent,
+                        >()
                 }) && Instant::now() < deadline =>
             {
                 on_retry();
@@ -1143,6 +1147,7 @@ fn retry_host_worker_launch<T>(
                 attempt.hash(&mut hasher);
                 let inventory_unavailable = error.chain().any(|cause| {
                     cause.is::<fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable>()
+                        || cause.is::<fullmag_session::host_resource_ledger::ComputeNodeSampleNotCurrent>()
                 });
                 let delay = if inventory_unavailable {
                     Duration::from_secs(1)
@@ -3116,7 +3121,8 @@ mod tests {
                     "solver_config": {"preset_id": "s", "version": "v1"},
                     "discretization": {"recipe_id": "d", "version": "v1"},
                     "execution_profile": {"profile_id": "e", "version": "v1"},
-                    "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive"
+                    "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive",
+                    "completion_dependencies": []
                 }]
             })).unwrap();
             let problems = StudyProblemCatalog::from_entries(&study, vec![
@@ -3132,7 +3138,9 @@ mod tests {
                     plan_version: STUDY_PLAN_SCHEMA_VERSION.into(), plan_sha256: study_ref.clone() },
                 catalog_ref.clone(), serde_json::json!({}),
                 RequestedExecution { backend: "fdm".into(), device: "cpu".into(), precision: "double".into(),
-                    mode: "strict".into(), minimum_resources: None },
+                    mode: "strict".into(), minimum_resources: Some(fullmag_application::RequestedResourceBudget {
+                        cpu_millis: 100, memory_bytes: 1024, gpu_memory_bytes: 0, storage_bytes: 1024,
+                    }) },
             );
             let mut intent = fullmag_session::FmsRunIntent::new(specification.run_id.as_str(),
                 "reported-failure-fixture", serde_json::to_value(&specification).unwrap());
@@ -3186,11 +3194,12 @@ mod tests {
             prior_lease.resource_id = "prior-cpu".into();
             prior_lease.lease_token = "prior-lease".into();
             store.commit_resource_lease(&prior_lease).unwrap();
+            let prior_object = store.cas().put(b"prior result").unwrap();
             let artifact = fullmag_session::FmsArtifactCatalogEntry {
                 artifact_id: "prior-result".into(), task_id: prior_lease.task_id.clone(),
                 attempt_id: prior_lease.attempt_id.clone(), ownership_epoch: prior_lease.ownership_epoch,
                 logical_path: "prior-result.bin".into(), artifact_type: "diagnostic".into(),
-                content_sha256: "a".repeat(64), object_ref: None,
+                content_sha256: prior_object.clone(), object_ref: Some(prior_object.clone()),
                 status: fullmag_session::FmsArtifactStatus::Published, required: false, study_output: None,
             };
             store.append_artifact_catalog_entries_for_lease(&prior_lease, &[artifact.clone()]).unwrap();

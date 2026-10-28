@@ -1743,7 +1743,8 @@ export function useFrequencyDomainResponseSweepResource({
   const { api } = useKernel();
   const load = useCallback(
     ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
-      api.analysis.frequencyDomain.responseMagneticSweep({ sessionScopeKey, signal }),
+      api.analysis.frequencyDomain.responseMagneticSweep({ sessionScopeKey, signal })
+        .catch(ignoreMissingResource<FrequencyDomainJsonArtifactResource>),
     [api],
   );
   return useFrequencyDomainJsonResource(
@@ -1769,7 +1770,8 @@ export function useFrequencyDomainResponseProgressResource({
   );
   const load = useCallback(
     ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
-      api.analysis.frequencyDomain.responseProgressV1({ sessionScopeKey, signal }),
+      api.analysis.frequencyDomain.responseProgressV1({ sessionScopeKey, signal })
+        .catch(ignoreMissingResource<FrequencyDomainSweepProgressResource>),
     [api],
   );
   return useSessionScopedResource<FrequencyDomainSweepProgressResource | null>({

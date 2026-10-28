@@ -2308,7 +2308,7 @@ async fn publish_current_live_realtime_scalar_sample_now(
     .await
 }
 
-async fn queue_current_live_realtime_scalar_sample(
+pub(crate) async fn queue_current_live_realtime_scalar_sample(
     state: &AppState,
     sample: PendingRealtimeScalarSample,
 ) -> Result<(), ApiError> {

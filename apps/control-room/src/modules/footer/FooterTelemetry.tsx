@@ -129,11 +129,16 @@ export function FooterTelemetry({
     [scene.data, selectedObjectId],
   );
   const objectMetrics = useObjectMetricsResource(generalTelemetryEnabled ? objectId : null);
+  // Frequency-response artifacts exist only for studies with such a stage;
+  // polling them elsewhere only produces 404s.
+  const loadsFrequencyResponse =
+    generalTelemetryEnabled &&
+    studyHasFrequencyResponseStage(solverStatus.data?.stage_kind, stageExecution.data);
   const responseProgress = useFrequencyDomainResponseProgressResource({
-    enabled: generalTelemetryEnabled,
+    enabled: loadsFrequencyResponse,
   });
   const responseSweep = useFrequencyDomainResponseSweepResource({
-    enabled: generalTelemetryEnabled,
+    enabled: loadsFrequencyResponse,
   });
   const currentRun = useCurrentRunResource({ enabled: generalTelemetryEnabled });
   const userSolvePhase = status
@@ -1046,6 +1051,19 @@ function activeStageRecord(
   return stageExecution?.stages[index] ?? null;
 }
 
+function studyHasFrequencyResponseStage(
+  solverStageKind: string | null | undefined,
+  stageExecution: StageExecutionResource | null | undefined,
+): boolean {
+  return (
+    isFrequencyResponseStageKind(solverStageKind) ||
+    isFrequencyResponseStageKind(stageExecution?.active_stage_kind) ||
+    (stageExecution?.stages ?? []).some((stage) =>
+      isFrequencyResponseStageKind(stage.kind),
+    )
+  );
+}
+
 function isFrequencyResponseStageKind(kind: string | null | undefined): boolean {
   if (!kind) return false;
   return kind === "frequency_response" || kind === "flat_frequency_response";
@@ -1377,10 +1395,12 @@ function selectLatestFooterScalarSample(
   resourceSample: FooterScalarResourceSample | null | undefined,
 ): FooterLiveScalarSample | FooterScalarResourceSample | null {
   if (!resourceSample) return liveSample;
+  // At equal revision the live row includes optional diagnostics omitted from
+  // the history projection. A newer history row still supersedes it in full.
   if (
     !liveSample ||
     typeof liveSample.revision !== "number" ||
-    resourceSample.revision >= liveSample.revision
+    resourceSample.revision > liveSample.revision
   ) {
     return resourceSample;
   }
@@ -1390,7 +1410,7 @@ function selectLatestFooterScalarSample(
 export function resolveFooterMagneticModelPresent(
   scene: Pick<ResourceResult<SceneResource>, "data" | "status">,
 ): boolean | null {
-  if (scene.status !== "ready" || !Array.isArray(scene.data?.objects)) return null;
+  if ((scene.status !== "ready" && scene.status !== "stale") || !Array.isArray(scene.data?.objects)) return null;
   return !scene.data.objects.every(hasEmptyObjectMagneticModel);
 }
 
