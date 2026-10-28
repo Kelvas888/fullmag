@@ -98,3 +98,13 @@ Po kontrolowanej zbiórce published artifact refs i strumieniowym SHA rzeczywist
 Regresje po ostatnich zmianach: abrupt-stop 24, prepare wrapper 8, bridge v3/v4 15, legacy container recovery 13, legacy runtime bridge 5 — wszystkie PASS. Test strumieniowego hashowania obejmuje 81 MiB przy limicie pamięci subprocessu 64 MiB, drift mtime i oversized object. Niezależne review protokołu i snapshotu nie wykazało dalszych P1/P2 po naprawie obecności held field przy v3.
 
 Adapter Windows–WSL ma osobny ownership w skoordynowanym zadaniu sprzątania Dockera, które otrzymało bezpośrednie polecenie użytkownika dokończenia tego adaptera bez przerywania innych zadań. Ten etap nie zawiera niekwalifikowanego adaptera ani migracji; małe call sites zostaną uzgodnione po jego kwalifikacji. Recovery mastera, build/start i browser Airbox nadal NOT VERIFIED.
+
+## Checkpoint strażnika aliasów przed wpięciem Windows
+
+PR #302 scalono jako `2c67d8f904b1dede9268bbbc8bf6257cbe33aa4f`; main i zachowany worktree przeszły fast-forward do tego wyniku. Następna kontrola ujawniła dwie luki hostowego guarda: znany surowy alias store nie był porównywany jako chroniona ścieżka, a ścieżki namespace Docker Desktop mogły przejść porównanie leksykalne jako lokalny POSIX. Reprodukcje wykazały brak wymaganej odmowy przed poprawką.
+
+Poprawka dodaje raw alias i jego przodków/potomków do wczesnej ochrony przed resolverem; Docker Desktop drive namespaces wymagają odrębnej atestacji, bez lokalnego fallbacku. Review ujawniło dodatkowo wariant `//`; jest odrzucany jako niekanoniczny przed każdym resolverem. Readmission 25/25 i abrupt-stop 25/25 PASS, niezależny review bez otwartych P1/P2. Wyjątek dokładnie uwierzytelnionego własnego helpera oraz obecne canonical/kernel proof pozostają zachowane. To checkpoint fail-closed; nie kwalifikuje jeszcze adaptera Windows.
+
+Adapter drugiego zadania ma już wykonalny odczyt actual mount przez same-UID, cap-drop-ALL observer i pełne VPD83 GUID jako powiązanie VHDX, lecz nadal wymaga negatywnych testów oraz kwalifikacji całości. Nie ma zgody na stop/restart cudzych grup, a migracje pozostają na ich kolejne świadome uruchomienie.
+
+Podczas dalszych odczytów silnik Docker stał się niedostępny. Jeden odczyt `info` potwierdził brak połączenia; ten wątek nie wysłał stop/restart/down/start usług. Stare PID/incarnation/backing observations nie kwalifikują przyszłego wykonania po tej zmianie stanu. Przed runtime wymagane są świeże dowody; sesja i wyniki pozostają bez mutacji z tego zadania.

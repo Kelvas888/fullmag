@@ -18,7 +18,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import uuid
 
@@ -43,6 +43,9 @@ OPERATOR_AUTHORIZATION_SCHEMA = (
 )
 ABRUPT_OPERATOR_SCHEMA = "fullmag.docker-container-recovery-operator-authorization.v2"
 ABRUPT_PROOF_SCHEMA = "fullmag.docker-abrupt-stop-proof.v1"
+_DESKTOP_HOST_PREFIXES = (
+    "/run/desktop/mnt/host/", "/host_mnt/", "/mnt/host/",
+)
 ABRUPT_PROOF_HELD_MANUAL_SCHEMA = "fullmag.docker-abrupt-stop-proof.v2"
 TERMINAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v3"
 HELD_MANUAL_REQUEST_SCHEMA = "runtime_service_container_recovery_request.v4"
@@ -1747,6 +1750,14 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
             if kind == "bind":
                 source = mount.get("Source")
                 if isinstance(source, str) and re.fullmatch(r"[A-Za-z]:[\\/].+", source):
+                    windows_source = PureWindowsPath(source)
+                    if any(kind == "bind" and isinstance(path, str)
+                            and re.fullmatch(r"[A-Za-z]:[\\/].+", path)
+                            and (windows_source == PureWindowsPath(path)
+                                 or windows_source in PureWindowsPath(path).parents
+                                 or PureWindowsPath(path) in windows_source.parents)
+                            for kind, path in protected):
+                        _fail("a foreign Docker container references the recovery store/control/ledger")
                     try:
                         from docker_windows_bind_isolation import (
                             prove_windows_bind_disjoint, validate_windows_bind_disjoint_proof)
@@ -1756,7 +1767,7 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                     except Exception as error:
                         _fail("foreign Windows bind has unresolved storage identity: " + str(error))
                     continue
-                if (not isinstance(source, str) or not source.startswith("/")
+                if (not isinstance(source, str) or not source.startswith("/") or source.startswith("//")
                         or ".." in PurePosixPath(source).parts
                         or str(PurePosixPath(source)) != source):
                     _fail("foreign Docker consumer bind source is unsafe")
@@ -1783,6 +1794,13 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                     for kind, path in protected)
             if raw_overlap:
                 _fail("a foreign Docker container references the recovery store/control/ledger")
+            if (isinstance(alias, str)
+                    and any(alias == prefix.rstrip("/") or alias.startswith(prefix)
+                            for prefix in _DESKTOP_HOST_PREFIXES)
+                    and not alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
+                # Docker Desktop host-drive paths belong to the daemon's
+                # Windows namespace; they are not local POSIX source proof.
+                _fail("foreign Windows Docker Desktop bind has unresolved storage identity")
             if (isinstance(alias, str)
                     and alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
                 # Alias hashes are not identities. A missing/denied registered

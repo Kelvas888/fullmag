@@ -406,3 +406,33 @@ Dalszy krok zależny: rozstrzygnięcie tego rozszerzenia, jego regresje i rzeczy
 preflight, dopiero potem już przygotowana recepta buildu i native v4 recovery.
 Brak przejścia preflightu nie jest dowodem braku kodu solvera ani poprawnej
 kwalifikacji zapisanych danych. Pełny E0–E12 pozostaje aktywny.
+
+
+## Integracja ochrony bindów z aktualnego mastera
+
+Po pushu c1f8f10602812ebc2b35affd0741b01eb881b5ae GitHub zgłosił PR jako
+mergeable=false / dirty, bez check runs dla tego commita. Pobranie origin
+potwierdziło nowy master `855a4db407b8a8e5330375e8e8a0e9d8b512b707`, zawierający
+PR #303 i poprawkę `a9c0b9da5d2d866a73af1489a00723beea5a21ed`.
+
+Rozstrzygnięto jeden konflikt w `docker_volume_container_recovery.py`.
+Zachowano masterowe odrzucanie ścieżek // oraz nierozwiązanych Windows Desktop
+host-drive aliases. Literalne ścieżki Windows nadal wymagają całego istniejącego
+dowodu file-only. Dodatkowo surowa zgodność chronionego Windows source oraz jego
+rodzica/potomka jest sprawdzana przed wywołaniem dowodu, z semantyką wielkości
+liter i separatorów PureWindowsPath. Regresja sprawdza także, że resolver
+nie zostaje wtedy wywołany. Masterowa ochrona state_alias_sources podczas
+host readmission jest zachowana bez rozluźnienia.
+
+145 interpretowanych testów merge (abrupt/host readmission/Windows file-only,
+recovery build/preparation/legacy): PASS, zero failures/errors. AST Python3.8
+i git diff --check: PASS. Dowody z hashami źródeł:
+`verification/master-bind-guards-integration-20261028/tests.json` i tests.log
+w control volume grupy. Komunikaty mocked readmission w logu są testami
+fixture; nie wykonano readmission ani startu rzeczywistego runtime.
+
+Moduł Windows pozostał byte-identical, SHA256
+`4411410a48c18b49dbdfb982683853e3937aabb375d4f36680cfea9a74b372dd`.
+Odrzucona obsługa katalogowych dowiązań LX nie jest częścią integracji.
+Pytanie o konkretną propozycję nadal pozostaje otwarte. Plik FMS użytkownika
+pozostaje poza indeksem; brak nowego buildu aplikacji lub Solve.
