@@ -42,6 +42,19 @@ class IsolatedCommitTests(unittest.TestCase):
                 self.assertNotEqual(self.run_commit(root,payload).returncode,0)
                 self.assertEqual((root/'namespaces/current.json').read_bytes(),before)
 
+    def test_owner_control_pins_validated_config_image_without_mutating_control(self):
+        control=mock.Mock(image='nvidia/cuda:base@sha256:'+'a'*64,
+                          namespace='namespaces/'+'b'*32)
+        backend={'Image':'sha256:'+'c'*64}
+        owner=recovery._owner_control(control,backend)
+        self.assertIsNot(owner,control)
+        self.assertEqual(owner.image,backend['Image'])
+        self.assertEqual(owner.namespace,control.namespace)
+        self.assertEqual(control.image,'nvidia/cuda:base@sha256:'+'a'*64)
+        for invalid in ({}, {'Image':'nvidia/cuda:latest'}):
+            with self.assertRaises(BuildControlError):
+                recovery._owner_control(control,invalid)
+
     def test_removal_refuses_live_container_without_stop(self):
         record={'old_container_ids':{'backend':'a'*64},'old_image_id':'sha256:'+'b'*64,'compose_project':'fullmag-master'}
         row={'Id':'a'*64,'Image':record['old_image_id'],'State':{'Status':'running','Running':True}}

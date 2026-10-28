@@ -61,6 +61,16 @@ def _stopped_pair(context, pins, compose):
     return result
 
 
+def _owner_control(control, validated_backend):
+    """Pin the already-authenticated backend config digest for OWNER locking."""
+    image = validated_backend.get('Image')
+    if not isinstance(image, str) or re.fullmatch(r'sha256:[0-9a-f]{64}', image) is None:
+        raise BuildControlError('OWNER helper requires the validated immutable backend image')
+    result = copy.copy(control)
+    result.image = image
+    return result
+
+
 def _data_root(compose, layout):
     mounts=compose['services']['backend']['volumes']
     selected=[m for m in mounts if isinstance(m,dict) and m.get('target')=='/user-data']
@@ -211,7 +221,7 @@ def recover(args):
         raise BuildControlError('Snapshot destination already exists; inspect retained partial copy')
     # These locks never alter OWNER, writer records or SQLite bytes. Existing
     # active readers/writers cause a refusal instead of being interrupted.
-    with retained._owner_lock(control), hold_source_writer(state/'runs/docker-all/session-store') as store_fd, hold_managed_workspace_database(control,pair['backend'],user_data) as workspace_fence:
+    with retained._owner_lock(_owner_control(control,pair['backend'])), hold_source_writer(state/'runs/docker-all/session-store') as store_fd, hold_managed_workspace_database(control,pair['backend'],user_data) as workspace_fence:
         def verify_store_binding():
             pinned=os.fstat(store_fd); current=(state/'runs/docker-all/session-store').stat()
             if (pinned.st_dev,pinned.st_ino)!=(current.st_dev,current.st_ino):
