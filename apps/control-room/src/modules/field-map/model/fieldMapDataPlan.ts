@@ -1,3 +1,4 @@
+import { tensorProjectionOutputKind } from "@/kernel/api/tensorFieldProjection";
 import type {
   PlanarFieldProbeQuery,
   PlanarFieldQuery,
@@ -49,6 +50,7 @@ export interface FieldMapDataPlanInput {
   source: PlanarFieldSource;
   quality: "interactive" | "export";
   quantityId: string;
+  projectionAllowed?: boolean;
   resolution: readonly [number, number];
   showVectors: boolean;
   /** The raster is coloured by vector direction, which needs the vector payload. */
@@ -80,15 +82,16 @@ export function buildFieldMapDataPlan(
     discretization: input.discretization,
     scopeKind: viewScope.kind,
   });
+  const projectionAllowed = input.projectionAllowed !== false;
   const unavailableReason = !scope.enabled
     ? scope.reasonCode === "fem_layer_scope_not_supported"
       ? "native layer scope requires an FDM multilayer carrier."
       : "structured FDM grid planar sampling does not support mesh-part scope."
-    : null;
-  const enabled =
-    input.active && scope.enabled;
-  const needsVectors = input.showVectors || input.colorByDirection === true;
-  const availability: FieldMapDataPlanAvailability = !scope.enabled
+    : !projectionAllowed ? "The selected tensor projection is not available in the canonical catalog." : null;
+  const enabled = input.active && scope.enabled && projectionAllowed;
+  const needsVectors = tensorProjectionOutputKind(input.component) !== "scalar" &&
+    (input.showVectors || input.colorByDirection === true);
+  const availability: FieldMapDataPlanAvailability = !scope.enabled || !projectionAllowed
     ? "not-applicable"
     : enabled
       ? "ready"

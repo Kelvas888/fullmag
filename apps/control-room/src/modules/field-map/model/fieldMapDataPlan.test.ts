@@ -209,6 +209,35 @@ describe("field-map data plan", () => {
     }
   });
 
+  it.each([
+    ["magnitude", true, true],
+    ["frobenius", true, false],
+    ["c4", true, false],
+    ["spin_flow_z", true, true],
+    ["spin_flow_z", false, false],
+  ])("combines direction colouring with the %s projection gate", (component, colorByDirection, requestVectors) => {
+    const plan = buildFieldMapDataPlan({
+      active: true, component, colorByDirection, discretization: "fem",
+      includeMesh: false, source: { kind: "default" }, quality: "interactive",
+      quantityId: "tensor", resolution: [32, 32], showVectors: false,
+      vectorBudget: 256, viewScope: { kind: "airbox" },
+    });
+    expect(plan.requestVectors).toBe(requestVectors);
+    expect(plan.query.vector_budget).toBe(requestVectors ? 256 : 0);
+  });
+
+  it("refuses every payload when the catalog rejects a tensor projection", () => {
+    const plan = buildFieldMapDataPlan({
+      active: true, component: "spin_flow_z", colorByDirection: true,
+      projectionAllowed: false, discretization: "fem", includeMesh: true,
+      source: { kind: "default" }, quality: "interactive", quantityId: "tensor",
+      resolution: [32, 32], showVectors: true, vectorBudget: 256,
+      viewScope: { kind: "airbox" },
+    });
+    expect(plan).toMatchObject({ availability: "not-applicable", enabled: false,
+      requestMask: false, requestMesh: false, requestScalar: false, requestVectors: false });
+  });
+
   it("adds probe coordinates without dropping raster identity", () => {
     const query = {
       component: "normal",

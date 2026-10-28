@@ -607,6 +607,7 @@ def serve():
         )
         return 0
     try:
+        terminal_preflight = service.terminal_observation_preflight(paths)
         accepted_preflight = service.accepted_reattach_preflight(paths)
         container_recovery = service.recover_container_namespace(paths)
         # These legacy paths still require explicit authorization. Ordinary
@@ -626,7 +627,9 @@ def serve():
     failure_fence = service.process_receipt_path(paths).parent / (
         "api-failure-" + uuid.uuid4().hex + ".json"
     )
-    with service.accepted_reattach_api_input(paths, preflight=accepted_preflight) as (api_environment, restore_input):
+    with service.terminal_observation_api_input(
+        paths, terminal_preflight=terminal_preflight, accepted_preflight=accepted_preflight
+    ) as (api_environment, restore_input, terminal_launch):
         api_environment = _api_environment_with_operator_capability(api_environment)
         api_environment["FULLMAG_API_RUNTIME_FAILURE_FENCE"] = str(failure_fence)
         api = subprocess.Popen(["/opt/fullmag/package/bin/fullmag-api"],
@@ -652,7 +655,7 @@ def serve():
         service._atomic_json(receipt_path, receipt, "process tree receipt")
         api_startup_timeout = (
             service.ACCEPTED_REATTACH_API_STARTUP_TIMEOUT_SECONDS
-            if accepted_preflight is not None
+            if accepted_preflight is not None or terminal_preflight is not None
             else None
         )
         handle = service.start(paths, api_port=8081, expected_binding=bootstrap["binding"],
@@ -673,6 +676,11 @@ def serve():
                 paths, preflight=accepted_preflight, handle=handle
             )
             receipt["accepted_reattach"] = accepted_runtime
+            service._atomic_json(receipt_path, receipt, "process tree receipt")
+        if terminal_preflight is not None:
+            receipt["terminal_observation"] = service.terminal_observation_runtime_receipt(
+                paths, preflight=terminal_preflight, launch=terminal_launch, handle=handle
+            )
             service._atomic_json(receipt_path, receipt, "process tree receipt")
         last_full_api_probe = time.monotonic()
         try:

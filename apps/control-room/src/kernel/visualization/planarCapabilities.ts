@@ -1,3 +1,10 @@
+import { quantityCatalogEntrySupportsSpatialVisualization, type QuantityCatalogEntry } from "../api/quantityIds";
+import {
+  isFlowMajorTensorDescriptor,
+  tensorProjectionOutputKind,
+  type TensorFieldDescriptor,
+} from "../api/tensorFieldProjection";
+
 export interface FieldMapCapability {
   enabled: boolean;
   reasonCode: string | null;
@@ -52,18 +59,21 @@ export function resolveFieldMapCapabilities(input: {
     enabled: false,
     reasonCode,
   });
+  const supportedShape = input.vectorComponents === 1 ||
+    input.vectorComponents === 2 || input.vectorComponents === 3;
   return {
-    contours: input.spatial
+    contours: input.spatial && supportedShape
       ? { enabled: true, reasonCode: null }
-      : unsupported("quantity_not_spatial"),
+      : unsupported(input.spatial ? "quantity_shape_unsupported" : "quantity_not_spatial"),
     mesh: input.meshOverlayAvailable
       ? { enabled: true, reasonCode: null }
       : unsupported("mesh_overlay_unavailable"),
     vectors:
-      input.spatial && input.vectorComponents >= 2
+      input.spatial && (input.vectorComponents === 2 || input.vectorComponents === 3)
         ? { enabled: true, reasonCode: null }
         : unsupported(
-            input.spatial ? "quantity_not_vector" : "quantity_not_spatial",
+            !input.spatial ? "quantity_not_spatial"
+              : supportedShape ? "quantity_not_vector" : "quantity_shape_unsupported",
           ),
   };
 }
@@ -76,6 +86,9 @@ export function resolvePlanarInspectorCapabilities(input: {
   /** Exact backend reason when the planar metadata request failed. */
   metaErrorCode?: string | null;
   occupancyAvailable?: boolean;
+  component?: string | null;
+  tensor?: TensorFieldDescriptor | null;
+  catalogQuantity?: QuantityCatalogEntry | null;
   quantity: {
     available: boolean;
     components: number;
@@ -107,10 +120,20 @@ export function resolvePlanarInspectorCapabilities(input: {
     descriptor?.available === true &&
     (descriptor.codec === "fmcs.v4" ||
       (descriptor.codec === "fmfg.v1" && descriptor.geometrySource === "fdm_structured_grid"));
+  let vectorComponents = input.quantity?.components ?? 0;
+  const tensorProjection = tensorProjectionOutputKind(input.component);
+  if (input.tensor != null || vectorComponents === 9 || tensorProjection !== null) {
+    vectorComponents = isFlowMajorTensorDescriptor(input.tensor) &&
+      vectorComponents === 9 && tensorProjection !== null &&
+      input.catalogQuantity != null &&
+      quantityCatalogEntrySupportsSpatialVisualization(input.catalogQuantity, input.component)
+      ? tensorProjection === "vector" ? 3 : 1
+      : 0;
+  }
   const base = resolveFieldMapCapabilities({
     meshOverlayAvailable,
     spatial: spatial && scope.enabled,
-    vectorComponents: input.quantity?.components ?? 0,
+    vectorComponents,
   });
   const bounds = spatial && scope.enabled && metaAvailable
     ? { enabled: true, reasonCode: null }

@@ -104,6 +104,59 @@
         "type": "object"
       },
       "AcceptedAntennaInspectionResource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AcceptedExternalLeadInspectionResource"
+          },
+          {
+            "$ref": "#/components/schemas/AcceptedClosedLoopInspectionResource"
+          }
+        ]
+      },
+      "AcceptedClosedLoopInspectionResource": {
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayCapabilities"
+          },
+          "closed_loop_display": {
+            "description": "Existing verified, bounded closed-loop descriptors; numerical arrays stay binary."
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "output_id": {
+            "type": "string"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/AcceptedAntennaInspectionIdentity"
+          },
+          "port_mode_id": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "project_id",
+          "owner",
+          "port_mode_id",
+          "output_id",
+          "capabilities",
+          "normalization",
+          "closed_loop_display"
+        ],
+        "type": "object"
+      },
+      "AcceptedExternalLeadInspectionResource": {
         "properties": {
           "display": {
             "$ref": "#/components/schemas/AntennaInspectionDisplayDataResource"
@@ -208,6 +261,34 @@
           "domain_generation_id",
           "topology_revision",
           "source_step"
+        ],
+        "type": "object"
+      },
+      "AcceptedRunExportSource": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "run_catalog_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "run_id",
+          "run_catalog_revision",
+          "artifact_catalog_revision"
         ],
         "type": "object"
       },
@@ -3059,6 +3140,30 @@
         ],
         "type": "object"
       },
+      "AntennaInspectionDiscoveryResource": {
+        "properties": {
+          "reason_code": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AntennaInspectionDiscoveryState"
+          }
+        },
+        "required": [
+          "state",
+          "reason_code"
+        ],
+        "type": "object"
+      },
+      "AntennaInspectionDiscoveryState": {
+        "description": "Discovery of a registered inspection owner, not validation of its numerical payload.",
+        "enum": [
+          "retained",
+          "absent",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "AntennaInspectionDisplayCapabilities": {
         "properties": {
           "current_density": {
@@ -3600,6 +3705,41 @@
         ],
         "type": "string"
       },
+      "AntennaOperationProgressResource": {
+        "description": "Operation progress is independent of the LLG integration clock.",
+        "properties": {
+          "completed_targets": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "elapsed_seconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "source_cells": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_targets": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "phase",
+          "completed_targets",
+          "total_targets",
+          "source_cells",
+          "elapsed_seconds"
+        ],
+        "type": "object"
+      },
       "AntennaPortBranchResource": {
         "additionalProperties": false,
         "properties": {
@@ -3640,6 +3780,16 @@
           "id": {
             "type": "string"
           },
+          "normalization": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaPortNormalizationResource"
+              }
+            ]
+          },
           "normalization_current_a": {
             "format": "double",
             "type": "number"
@@ -3659,6 +3809,32 @@
           "branches"
         ],
         "type": "object"
+      },
+      "AntennaPortNormalizationResource": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "source_cut_rt0"
+                ],
+                "type": "string"
+              },
+              "orientation": {
+                "$ref": "#/components/schemas/AntennaSourceCutOrientationResource"
+              },
+              "source_cut_ref": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_cut_ref",
+              "orientation",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "AntennaQuadratureEvidenceRefResource": {
         "additionalProperties": false,
@@ -3760,6 +3936,12 @@
             "$ref": "#/components/schemas/AntennaFieldSolutionRefResource"
           }
         ]
+      },
+      "AntennaSourceCutOrientationResource": {
+        "enum": [
+          "minus_outward"
+        ],
+        "type": "string"
       },
       "AntennaSourceSpectrumResource": {
         "properties": {
@@ -4593,6 +4775,17 @@
           },
           "owner": {
             "$ref": "#/components/schemas/ArtifactFieldOwnerBinding"
+          },
+          "sample_carrier": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaSampleCarrierResource",
+                "description": "Verified producer sampling provenance, independent of the source conductor.\nAbsence preserves legacy inspection and provides no Universe mesh-adoption proof."
+              }
+            ]
           },
           "sample_count": {
             "format": "int64",
@@ -30441,6 +30634,17 @@
             "description": "Canonical or source-preserving `.fms` bytes for the next host adapter.",
             "type": "string"
           },
+          "authoring_scene_document": {
+            "additionalProperties": {},
+            "description": "Validated runtime-free authoring scene, available only on eligible Open.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "dirty": {
             "type": "boolean"
           },
@@ -30564,6 +30768,17 @@
           },
           {
             "properties": {
+              "scene_document": {
+                "additionalProperties": {},
+                "description": "Exact authoring scene embedded in this archive; new imports always provide it.",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
               "script_import": {
                 "$ref": "#/components/schemas/ProjectScriptImportResource"
               }
@@ -31768,6 +31983,35 @@
         ],
         "type": "string"
       },
+      "QuantityProjectionCapability": {
+        "properties": {
+          "components": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_shape": {
+            "type": "string"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/QuantityPublicationCapability"
+          },
+          "render": {
+            "$ref": "#/components/schemas/QuantityRenderCapability"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "components",
+          "output_shape",
+          "render",
+          "publication"
+        ],
+        "type": "object"
+      },
       "QuantityProviderCapability": {
         "enum": [
           "available",
@@ -32891,6 +33135,12 @@
           "precision": {
             "type": "string"
           },
+          "projections": {
+            "items": {
+              "$ref": "#/components/schemas/QuantityProjectionCapability"
+            },
+            "type": "array"
+          },
           "provider": {
             "$ref": "#/components/schemas/QuantityProviderCapability"
           },
@@ -33100,7 +33350,9 @@
           "exact_resume",
           "logical_resume",
           "initial_condition_import",
-          "config_only"
+          "saved_fields_read_only",
+          "config_only",
+          "unsupported"
         ],
         "type": "string"
       },
@@ -35642,6 +35894,11 @@
               "boolean",
               "null"
             ]
+          },
+          "visualization_hint": {
+            "additionalProperties": true,
+            "description": "Authored presentation metadata; it does not select physics modules.",
+            "type": "object"
           }
         },
         "required": [
@@ -36370,6 +36627,31 @@
               },
               "kind": {
                 "enum": [
+                  "homogeneous_spin_potential_gradient"
+                ],
+                "type": "string"
+              },
+              "surfaces": {
+                "items": {
+                  "$ref": "#/components/schemas/SceneSurfaceRef"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "id",
+              "surfaces",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
                   "spin_insulating"
                 ],
                 "type": "string"
@@ -36559,6 +36841,16 @@
               "ferromagnet_side": {
                 "$ref": "#/components/schemas/SceneRegionRef"
               },
+              "ferromagnet_surface": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SceneSurfaceRef"
+                  }
+                ]
+              },
               "formula_version": {
                 "type": "string"
               },
@@ -36593,6 +36885,16 @@
               },
               "normal_side": {
                 "$ref": "#/components/schemas/SceneRegionRef"
+              },
+              "normal_surface": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SceneSurfaceRef"
+                  }
+                ]
               },
               "normal_to_ferromagnet": {
                 "items": {
@@ -38719,6 +39021,17 @@
       },
       "SessionExportRequest": {
         "properties": {
+          "accepted_run": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AcceptedRunExportSource",
+                "description": "Explicit immutable historical source. Solved downloads only; the current\nauthoring workspace is not changed or used as historical result evidence."
+              }
+            ]
+          },
           "compression": {
             "oneOf": [
               {
@@ -40736,6 +41049,72 @@
         },
         "type": "object"
       },
+      "SolverProfileOperationResource": {
+        "properties": {
+          "accounting_issue": {
+            "type": "boolean"
+          },
+          "execution_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SolverProfileCommandConfig",
+                "description": "Immutable configuration that produced this operation sample. The\nenclosing resource config may describe a later admission request."
+              }
+            ]
+          },
+          "native_call_wall_ns": {
+            "description": "Entire native ABI call, containing the surface operator duration.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "native_operator_wall_ns": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "phases": {
+            "items": {
+              "$ref": "#/components/schemas/SolverProfilePhaseResource"
+            },
+            "type": "array"
+          },
+          "sequence": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_wall_time_ns": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "operation_id",
+          "outcome",
+          "total_wall_time_ns",
+          "phases",
+          "accounting_issue"
+        ],
+        "type": "object"
+      },
       "SolverProfileOverheadDiagnosticsResource": {
         "properties": {
           "heartbeat_seed_deep_clone_count": {
@@ -40887,6 +41266,12 @@
                 "$ref": "#/components/schemas/LivePublisherDiagnosticsResource"
               }
             ]
+          },
+          "operation_samples": {
+            "items": {
+              "$ref": "#/components/schemas/SolverProfileOperationResource"
+            },
+            "type": "array"
           },
           "overhead": {
             "$ref": "#/components/schemas/SolverProfileOverheadDiagnosticsResource"
@@ -42450,6 +42835,26 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "antenna_inspection": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaInspectionDiscoveryResource"
+              }
+            ]
+          },
+          "antenna_progress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaOperationProgressResource"
+              }
             ]
           },
           "antenna_solve_stage_id": {

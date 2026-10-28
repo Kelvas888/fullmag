@@ -4,6 +4,9 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 
 import { useKernel } from "@/kernel/KernelContext";
 import { decodeFieldVector } from "@/kernel/api/codecs";
+import { normalizeTensorProjection } from "@/kernel/api/tensorFieldProjection";
+import { quantityCatalogEntrySpatialProjections, quantityCatalogEntrySupportsSpatialVisualization } from "@/kernel/api/quantityIds";
+import { useQuantityCatalogResource } from "@/kernel/resources/studyRuntimeResources";
 import type {
   PlanarFieldSource,
   VisualizationStateResource,
@@ -108,17 +111,6 @@ function useFieldMapModuleController() {
   }, [canonicalSliceKey, canonicalSourceKind, canonicalSourceMonitorId]);
   const domain = useDomainMetaResource({ enabled: active });
   const fieldCatalog = useFieldCatalogResource({ enabled: active });
-  const toolbarQuantities = useMemo<FieldMapToolbarQuantity[]>(
-    () => (fieldCatalog.data?.quantities ?? [])
-      .filter((quantity) => quantity.available)
-      .map((quantity) => ({
-        components: quantity.components ?? 3,
-        label: quantity.label,
-        quantityId: quantity.quantity_id,
-        unit: quantity.unit,
-      })),
-    [fieldCatalog.data],
-  );
   const runtime = useSessionStatusSelector(
     (status) => resolveSessionDiscretization(status.data),
     { enabled: active },
@@ -169,6 +161,35 @@ function useFieldMapModuleController() {
     visualization.data?.targets,
   ]);
 
+  const quantityCatalog = useQuantityCatalogResource({
+    enabled: active,
+    stageId: selectedFieldContext.stageId,
+  });
+  const toolbarQuantities = useMemo<FieldMapToolbarQuantity[]>(
+    () => (fieldCatalog.data?.quantities ?? [])
+      .filter((quantity) => quantity.available)
+      .map((quantity) => {
+        const entry = quantityCatalog.data?.quantities.find((candidate) => candidate.id === quantity.quantity_id);
+        return {
+          components: quantity.components ?? 3,
+          label: quantity.label,
+          quantityId: quantity.quantity_id,
+          unit: quantity.unit,
+          tensor: entry?.tensor != null || entry?.shape === "tensor_field" || quantity.components === 9,
+          projections: quantityCatalogEntrySpatialProjections(entry),
+        };
+      }),
+    [fieldCatalog.data, quantityCatalog.data],
+  );
+  const selectedQuantity = quantityCatalog.data?.quantities.find(
+    (entry) => entry.id === canonicalPlanar?.quantity_id,
+  );
+  const requiresTensorProjection = selectedQuantity?.tensor != null ||
+    selectedQuantity?.shape === "tensor_field" ||
+    normalizeTensorProjection(canonicalPlanar?.component) !== null;
+  const projectionAllowed = !requiresTensorProjection || Boolean(
+    selectedQuantity && quantityCatalogEntrySupportsSpatialVisualization(selectedQuantity, canonicalPlanar?.component),
+  );
   const plan = useMemo(
     () => buildFieldMapDataPlan({
       active: active && canonicalPlanar !== undefined && canonicalPlanar.visible !== false,
@@ -179,6 +200,7 @@ function useFieldMapModuleController() {
       source,
       quality: canonicalPlanar?.quality ?? "interactive",
       quantityId: canonicalPlanar?.quantity_id ?? "",
+      projectionAllowed,
       resolution: [
         canonicalPlanar?.resolution.width ?? 0,
         canonicalPlanar?.resolution.height ?? 0,
@@ -194,6 +216,7 @@ function useFieldMapModuleController() {
       active,
       domain.data?.discretization,
       canonicalPlanar,
+      projectionAllowed,
       runtime,
       source,
       selectedFieldContext.snapshotId,
@@ -591,7 +614,6 @@ export default function FieldMapModule() {
     canonicalSampleError,
     domainMeta,
     evidence,
-    evidenceStatus,
     mask,
     meshOverlay,
     meta,
@@ -767,10 +789,10 @@ export default function FieldMapModule() {
             range={renderModel.range}
             rangeState={
               renderModel.range
-                ? evidenceStatus === "ready"
+                ? evidence.status === "ready"
                   ? "current"
                   : "stale-compatible"
-                : evidenceStatus === "loading"
+                : evidence.status === "loading"
                   ? "pending"
                   : "unavailable"
             }

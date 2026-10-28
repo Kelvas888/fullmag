@@ -2547,6 +2547,10 @@ def _parser() -> argparse.ArgumentParser:
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    resume_parser.add_argument("--build-for-recovery", help="Pinned control-volume request; build behind the closed storage gate without serving")
+    resume_parser.add_argument("--build-for-recovery-sha256", help="SHA-256 of the exact recovery build request")
+    resume_parser.add_argument("--prestart-reconciliation", help="Exact confirmed prestart iteration UUID")
+    resume_parser.add_argument("--prestart-reconciliation-sha256", help="SHA-256 of its terminal receipt")
     activate_parser = subparsers.add_parser(
         "activate-script",
         help="activate one Python script in the already-running retained backend",
@@ -2576,6 +2580,13 @@ def _parser() -> argparse.ArgumentParser:
         help="optional frontend port override; conflicting defaults fail closed",
     )
     script_parser.add_argument("--request-id", help="optional stable request fence")
+    frontend_refresh = subparsers.add_parser("refresh-frontend-volume", help="Replace only the pinned frontend metadata generation")
+    frontend_refresh.add_argument("--attempt", required=True)
+    frontend_refresh.add_argument("--config-sha256", required=True)
+    frontend_refresh.add_argument("--source-root", type=Path, required=True)
+    frontend_refresh.add_argument("--port", type=int, required=True)
+    frontend_refresh.add_argument("--frontend-frozen-resume")
+    frontend_refresh.add_argument("--frontend-frozen-resume-sha256")
     run_script_parser = subparsers.add_parser(
         "run-script",
         help="run one script in the managed DEV group and observe its result; keep API/frontend running",
@@ -2599,6 +2610,9 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    idle_restart.add_argument("--saved-authoring-checkpoint")
+    idle_restart.add_argument("--saved-authoring-checkpoint-sha256")
+    idle_restart.add_argument("--stop-only", action="store_true", help="Drain and stop the pinned backend without restarting it")
     idle_restart.add_argument(
         "--allow-prepared-session", action="store_true",
         help="allow graceful drain with never-started manual Studies, including held queue entries after a terminal task; retain accepted inputs and never release Solve",
@@ -2656,6 +2670,7 @@ def _parser() -> argparse.ArgumentParser:
     stop_diagnostic.add_argument("--config-sha256", required=True)
     stop_diagnostic.add_argument("--source-root", type=Path, required=True)
     stop_diagnostic.add_argument("--port", type=int, required=True)
+    stop_diagnostic.add_argument("--preview", action="store_true")
     stop_diagnostic.add_argument(
         "--resume-attempt",
         help="exact successful retained resume attempt that pins the current backend start time",
@@ -2744,6 +2759,12 @@ def _parser() -> argparse.ArgumentParser:
             "and is never resolved as a host path"
         ),
     )
+    recreate_volume.add_argument("--completed-recreation-attempt", help="Continue this exact succeeded removal without repeating rm")
+    recreate_volume.add_argument("--completed-recreation-sha256", help="SHA-256 of the completed removal terminal receipt")
+    recreate_volume.add_argument("--drained-successor-proof", help="Exact control-volume proof of a later successful managed drain")
+    recreate_volume.add_argument("--drained-successor-proof-sha256", help="SHA-256 of the exact drained-successor proof")
+    recreate_volume.add_argument("--terminal-observation-proof", help="Exact private control-volume proof of one terminal observation")
+    recreate_volume.add_argument("--terminal-observation-proof-sha256", help="SHA-256 of the exact terminal observation proof")
     recreate_volume.add_argument(
         "--offline-reconciliation", metavar="OPERATION_TOKEN",
         help="consume the exact completed offline control repair without replaying its old operation",
@@ -2955,6 +2976,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.port = selected.port
         if args.action == "build":
             build(args)
+        elif args.action == "refresh-frontend-volume":
+            from docker_volume_dev import refresh_frontend
+            refresh_frontend(args)
         elif args.action == "maintain-cache":
             from docker_volume_cache_maintenance import maintain
             maintain(args)
@@ -3002,6 +3026,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = stop_bootstrap(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
+            if bool(args.terminal_observation_proof) != bool(args.terminal_observation_proof_sha256):
+                raise _fail("Terminal observation requires paired proof and SHA-256")
+            if args.terminal_observation_proof and any((args.fresh_state, args.recovery_authorization, args.resume_recreation, args.completed_recreation_attempt, args.drained_successor_proof)):
+                raise _fail("Terminal observation requires plain retained recreation without another restore or recovery request")
+            if bool(args.completed_recreation_attempt) != bool(args.completed_recreation_sha256):
+                raise _fail("completed recreation requires both attempt and terminal SHA-256")
+            if args.completed_recreation_attempt and (args.fresh_state or args.recovery_authorization or args.resume_recreation):
+                raise _fail("completed recreation cannot combine fresh state, recovery authorization, or resume recreation")
             import docker_helper_source as helper_source
             try:
                 helper_pair = helper_source.validate_option_pair(

@@ -1,5 +1,6 @@
 import type { CommandContext, CommandContribution, CommandResult } from "@/kernel/commands/commandTypes";
 import { obsoleteSessionResult } from "@/kernel/commands/commandSessionScope";
+import { normalizeTensorProjection, tensorProjectionOutputKind } from "@/kernel/api/tensorFieldProjection";
 import { VISUALIZATION_STATE_PATH } from "@/kernel/api/apiPaths";
 import { decodeFieldVector } from "@/kernel/api/codecs/fieldVectorCodec";
 import type {
@@ -170,11 +171,17 @@ function runViewCommand(id: ViewCommandId, context: CommandContext): Promise<Com
   }
   const preset = COMPONENT_PRESETS[id];
   if (preset) {
+    if (normalizeTensorProjection(planar.component) !== null) {
+      return unavailable("Choose a catalogued tensor projection in the 2D controls; vector presets do not apply to tensors.");
+    }
     context.visualizationSync.queuePatch({ planar: planarComponentPresetPatch(preset, planar.range) });
     return { status: "completed" };
   }
   const layer = LAYER_TOGGLES[id];
   if (layer) {
+    if (layer === "vectors" && tensorProjectionOutputKind(planar.component) === "scalar" && !planar.layers.vectors) {
+      return unavailable("The selected tensor projection is scalar and has no vector arrows.");
+    }
     context.visualizationSync.queuePatch({
       planar: { layers: { ...planar.layers, [layer]: !planar.layers[layer] } },
     });

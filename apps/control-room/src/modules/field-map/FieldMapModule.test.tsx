@@ -174,13 +174,15 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
 
 vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   useFieldCatalogResource: () => ({ data: null, error: null, status: "idle" }),
+  useQuantityCatalogResource: () => ({ data: null, error: null, status: "idle" }),
 }));
 
 vi.mock("@/kernel/resources/useGeometryRealizationResource", () => ({
   useGeometryRealizationResource: () => ({ data: null, error: null, status: "idle" }),
 }));
 
-vi.mock("@/kernel/resources/useSessionStatus", () => ({
+vi.mock("@/kernel/resources/useSessionStatus", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/kernel/resources/useSessionStatus")>()),
   useSessionStatusSelector: () => null,
 }));
 
