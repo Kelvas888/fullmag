@@ -10,7 +10,7 @@ import {
   type PlanarMonitorFramePreview,
 } from "@/kernel/workspace/planarMonitorFramePreview";
 
-import type { Viewport3DColors } from "../hooks/useViewport3DColors";
+import type { Viewport3DColors } from "../viewport3dTypes";
 import { registerViewport3DProbeGizmo } from "../viewport3dEventManager";
 import {
   closestAxisParameter,
