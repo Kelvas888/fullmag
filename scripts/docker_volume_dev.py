@@ -4887,6 +4887,12 @@ def _native_failed_stop_recovery_context(
     if journal_raw is None:
         return None
     journal = _json(journal_raw, "native failed-stop journal")
+    if journal.get("failure_kind") == "native-runtime-supervision-linux-retained":
+        from docker_volume_linux_supervision_stop import retained_context
+        return retained_context(
+            control, previous, journal, journal_raw, backend_id, fresh_state,
+            removed_container_proof=removed_container_proof,
+        )
     if journal.get("failure_kind") == "native-runtime-supervision-failure":
         from docker_volume_stop_failed import _supervision_failed_restart_context
         return _supervision_failed_restart_context(
@@ -7366,9 +7372,11 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
             and native_restart.get("image_id") == image
             and native_restart.get("claim_pending") is False
         )
+        from docker_volume_linux_supervision_stop import LinuxSupervisionContext
+        linux_supervision_stop = isinstance(recovery_context, LinuxSupervisionContext)
         if (not fresh_state and pre_activation_stop is None and not pre_api_stopped
                 and not original_after_ready_stop and not native_init_successor and not drained_successor
-                and not startup_diagnostic_stopped
+                and not startup_diagnostic_stopped and not linux_supervision_stop
                 and certificate.get("restart_verified") is True):
             retained_environment = document["services"]["backend"]["environment"]
             retained_reattach_declared = (
