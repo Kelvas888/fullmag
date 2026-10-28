@@ -48,6 +48,32 @@ class DockerDevCodegenTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(result.stdout)[-3:], ["codegen-openapi", "--source-root", source])
 
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires executable POSIX shell fixture")
+    def test_just_wrapper_admits_only_pinned_cache_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            interpreter = Path(directory) / "python-probe"
+            interpreter.write_text(f"#!{sys.executable}\nimport json,sys\n"
+                                   "if sys.argv[1:2] != ['-c']: print(json.dumps(sys.argv[1:]))\n")
+            interpreter.chmod(0o700)
+            root = Path(__file__).resolve().parents[1]
+            source = "/example/selected checkout"
+            prefix = f'python3 "{root}/scripts/docker_dev.py" --repo-root "{root}" '
+            body = f"maintain-cache --attempt '{'a'*32}' --config-sha256 '{'b'*64}' --source-root '{source}'"
+            def invoke(value):
+                return subprocess.run(["bash",str(root/"scripts/just_storage_shell.sh"),prefix+value],
+                                      env={**os.environ,"FULLMAG_STORAGE_PYTHON":str(interpreter)},
+                                      text=True,capture_output=True)
+            result=invoke(body)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(json.loads(result.stdout)[3:],
+                             ["maintain-cache","--attempt","a"*32,"--config-sha256","b"*64,"--source-root",source])
+            for rejected in (body+"; true",body+" --max-shared-entries '1'",body.replace("a"*32,"a"*31)):
+                with self.subTest(rejected=rejected):
+                    result=invoke(rejected)
+                    self.assertEqual(result.returncode,2)
+                    self.assertEqual(result.stdout,"")
+
     def test_frontend_requires_readonly_control_but_writable_build_state(self) -> None:
         document = {"Mounts": [
             {"Destination": "/opt/fullmag/source", "Type": "bind", "RW": False},
@@ -67,6 +93,17 @@ class DockerDevCodegenTests(unittest.TestCase):
             "/run/desktop/mnt/host/c/git/fullmag/fullmag",
         ):
             self.assertEqual(expected, codegen._path_identity(alias))
+
+    def test_desktop_wsl_source_alias_requires_same_inode(self) -> None:
+        alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/" + "a" * 64
+        selected = Path("/selected/checkout")
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", return_value=True):
+            self.assertTrue(codegen._source_mount_matches_selected(alias, selected))
+            self.assertFalse(codegen._source_mount_matches_selected(alias + "/../other", selected))
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", return_value=False):
+            self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", side_effect=OSError("missing")):
+            self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
 
     def test_source_probe_uses_backend_module_root(self) -> None:
         self.assertIn('sys.path.insert(0, "/opt/fullmag")', codegen.SOURCE_PROBE_SCRIPT)
@@ -136,9 +173,8 @@ class DockerDevCodegenTests(unittest.TestCase):
                         "project", "backend", identity, Path(r"C:\git\fullmag\fullmag")
                     )
 
-    def _admitted_wsl_services(self):
+    def _wsl_services(self):
         from bootstrap_docker_toolchain import control_volume_name
-        from docker_build_control import canonical
         selected = Path("/home/kking/git/fullmag/worktrees/antenna")
         alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/" + "5d" * 32
         identity = {"project_id":"project-id", "worktree_id":"worktree-id", "checkout_kind":"worktree"}
@@ -179,164 +215,48 @@ class DockerDevCodegenTests(unittest.TestCase):
                 "Config":{"Image":image,"Labels":labels,"Env":[k + "=" + v for k,v in environment.items()]},
                 "HostConfig":{"ReadonlyRootfs":True,"Privileged":False,
                     "Tmpfs":{owner:owner_options} if role == "frontend" else {}},"Mounts":mounts}
-        receipt = {"schema":"fullmag.docker-build-operation.v1","phase":"development","state":"succeeded",
-            "attempt":"c" * 32,"compose_project":"project","backend_container":ids["backend"],
-            "frontend_container":ids["frontend"],"inputs":{"source_root":str(selected),
-                **{"source_" + k:v for k,v in identity.items()}},"config_sha256":codegen._sha256(canonical(compose))}
-        return selected, identity, compose, actual, receipt
+        return selected, identity, actual
 
-    def _select_admitted_wsl_service(self, role, fixture, *, terminal=None, changed_verified=None,
-                                     linked=None, changed_records=None):
-        selected, identity, compose, actual, receipt = fixture
-        receipt_raw = codegen._canonical_json(receipt)
-        root = "development/attempts/" + receipt["attempt"]
-        records = {
-            "development/current.json": receipt_raw,
-            "development/verified.json": receipt_raw,
-            root + "/terminal.json": receipt_raw if terminal is None else terminal,
-            root + "/compose.json": codegen._canonical_json(compose),
-        }
-        if linked is not None:
-            stale = {**receipt, "state":"succeeded", "attempt":"0" * 32,
-                     "backend_container":"0" * 64, "frontend_container":"0" * 64}
-            records["development/verified.json"] = codegen._canonical_json(stale)
-            stale_root = "development/attempts/" + stale["attempt"]
-            records[stale_root + "/terminal.json"] = codegen._canonical_json(stale)
-            records[stale_root + "/compose.json"] = codegen._canonical_json(compose)
-            records["iteration/verified.json"] = codegen._canonical_json(linked)
-            records["iteration/current.json"] = codegen._canonical_json(linked)
-            records["iteration/attempts/" + linked["attempt"] + "/terminal.json"] = codegen._canonical_json(linked)
-        reads = {}
-        def capture(arguments, **_kwargs):
-            target = next(a.rsplit("=",1)[1] for a in arguments if a.startswith("label=com.docker.compose.service="))
-            return actual[target]["Id"].encode() + b"\n", b""
-        def inspect(identifier):
-            if identifier.startswith("sha256:"):
-                return {"Id":identifier,"Config":{}}
-            return next(document for document in actual.values() if document["Id"] == identifier)
-        def execute(container, arguments, **_kwargs):
-            self.assertEqual(container, actual["backend"]["Id"])
-            self.assertEqual(arguments[:4], ("/bin/bash","-euo","pipefail","-c"))
-            script = arguments[4]
-            relative = next((name for name in records if "/opt/fullmag/control/" + name in script), None)
-            if relative is None:
-                raise codegen.CodegenError("missing control record", exit_code=44)
-            reads[relative] = reads.get(relative, 0) + 1
-            if changed_records and relative in changed_records and reads[relative] > 1:
-                return changed_records[relative], b""
-            if relative == "development/verified.json" and changed_verified is not None and reads[relative] > 1:
-                return changed_verified, b""
-            return records[relative], b""
-        with mock.patch.object(codegen,"_capture",side_effect=capture), mock.patch.object(
-                codegen,"_inspect",side_effect=inspect), mock.patch.object(codegen,"_exec",side_effect=execute):
-            result = codegen._running_service("project",role,identity,selected)
-        return result
+    def _select_wsl_service(self, role, fixture, *, same_inode=True):
+        selected, identity, actual = fixture
+        with mock.patch.object(codegen, "_capture", return_value=(actual[role]["Id"].encode() + b"\n", b"")), mock.patch.object(
+                codegen, "_inspect", return_value=actual[role]), mock.patch.object(
+                Path, "is_dir", return_value=True), mock.patch.object(
+                Path, "samefile", return_value=same_inode), mock.patch.object(
+                codegen, "_exec", side_effect=AssertionError("source identity must not fetch alternate admission receipts")):
+            return codegen._running_service("project", role, identity, selected)
 
-    def _admitted_wsl_iteration(self):
-        fixture = self._admitted_wsl_services()
-        receipt = fixture[4]
-        receipt["state"] = "failed-confirmed"
-        receipt["inputs"]["image_id"] = fixture[3]["backend"]["Image"]
-        linked = {
-            "schema":"fullmag.docker-build-operation.v1", "phase":"iteration", "state":"succeeded",
-            "attempt":"d" * 32, "compose_project":"project",
-            "config_sha256":receipt["config_sha256"],
-            "backend_container":fixture[3]["backend"]["Id"],
-            "frontend_container":fixture[3]["frontend"]["Id"],
-            "inputs":{"attempt":receipt["attempt"], "config_sha256":receipt["config_sha256"],
-                      "source_root":str(fixture[0]), "image_id":fixture[3]["backend"]["Image"]},
-            "source_commit":"a" * 40, "source_digest":"b" * 64,
-            "source_snapshot_sha256":"c" * 64, "backend_build_receipt_sha256":"e" * 64,
-        }
-        receipt.pop("config_sha256")
-        return fixture, linked
-
-    def test_wsl_alias_admits_linked_iteration_after_failed_development(self):
+    def test_wsl_alias_selection_requires_source_inode_for_both_services(self):
         for role in ("backend", "frontend"):
             with self.subTest(role=role):
-                fixture, linked = self._admitted_wsl_iteration()
-                container, _ = self._select_admitted_wsl_service(role, fixture, linked=linked)
-                self.assertEqual(container, fixture[3][role]["Id"])
+                fixture = self._wsl_services()
+                container, actual = self._select_wsl_service(role, fixture)
+                self.assertEqual(container, fixture[2][role]["Id"])
+                self.assertIs(actual, fixture[2][role])
+                with self.assertRaisesRegex(codegen.CodegenError, "source mount differs"):
+                    self._select_wsl_service(role, fixture, same_inode=False)
 
-    def test_linked_iteration_refuses_source_config_image_and_container_drift(self):
-        for field in ("source_root", "config_sha256", "image_id", "attempt",
-                      "backend_container", "frontend_container", "compose_project", "state", "schema"):
-            with self.subTest(field=field):
-                fixture, linked = self._admitted_wsl_iteration()
-                if field in ("source_root", "config_sha256", "image_id", "attempt"):
-                    linked["inputs"][field] = "/foreign" if field == "source_root" else "f" * 64
-                else:
-                    linked[field] = "foreign"
-                with self.assertRaises(codegen.CodegenError):
-                    self._select_admitted_wsl_service("backend", fixture, linked=linked)
-
-    def test_linked_iteration_refuses_receipt_changes_during_validation(self):
-        for relative in ("development/current.json", "iteration/verified.json", "iteration/current.json",
-                         "iteration/attempts/" + "d" * 32 + "/terminal.json"):
-            with self.subTest(relative=relative):
-                fixture, linked = self._admitted_wsl_iteration()
-                with self.assertRaisesRegex(codegen.CodegenError, "changed"):
-                    self._select_admitted_wsl_service("backend", fixture, linked=linked,
-                                                     changed_records={relative:b"{}"})
-
-    def test_wsl_daemon_alias_requires_exact_succeeded_admission_for_both_services(self):
-        for role in ("backend","frontend"):
-            with self.subTest(role=role):
-                fixture = self._admitted_wsl_services()
-                container, document = self._select_admitted_wsl_service(role,fixture)
-                self.assertEqual(container, fixture[3][role]["Id"])
-                self.assertIs(document,fixture[3][role])
-                self.assertNotEqual(codegen._path_identity(document["Mounts"][0]["Source"]),
-                    codegen._path_identity(str(fixture[0])))
-
-    def test_admitted_wsl_alias_refuses_daemon_or_compose_drift(self):
-        from docker_build_control import canonical
-        for change in ("daemon", "daemon-case", "configured-source", "pin", "readonly", "control", "stopped", "image", "labels"):
-            with self.subTest(change=change):
-                fixture = self._admitted_wsl_services()
-                compose, actual = fixture[2:4]
-                if change == "daemon": actual["backend"]["Mounts"][0]["Source"] += "different"
-                elif change == "daemon-case": actual["backend"]["Mounts"][0]["Source"] = actual["backend"]["Mounts"][0]["Source"].upper()
-                elif change == "configured-source": compose["services"]["backend"]["volumes"][0]["source"] = "/foreign"
-                elif change == "pin": compose["services"]["backend"]["x-fullmag-daemon-binds"]["/opt/fullmag/source"] += "different"
-                elif change == "readonly": actual["frontend"]["Mounts"][0]["RW"] = True
-                elif change == "control": next(m for m in actual["backend"]["Mounts"] if m["Destination"] == "/opt/fullmag/control")["Name"] = "foreign-control"
-                elif change == "stopped": actual["frontend"]["State"]["Running"] = False
-                elif change == "image": actual["frontend"]["Image"] = "sha256:" + "d" * 64
-                else: actual["frontend"]["Config"]["Labels"] = {"com.docker.compose.project":"foreign"}
-                if change in ("configured-source", "pin"):
-                    fixture[4]["config_sha256"] = codegen._sha256(canonical(compose))
-                with self.assertRaises(codegen.CodegenError):
-                    self._select_admitted_wsl_service("backend",fixture)
-
-    def test_admitted_wsl_alias_refuses_foreign_source_or_wrong_receipt(self):
-        for key, value in (("schema","wrong"),("phase","image-dev"),("state","failed"),
-                ("attempt","../foreign"),("compose_project","foreign"),("config_sha256","d" * 64),
-                ("backend_container","e" * 64),("frontend_container","e" * 64)):
-            with self.subTest(key=key):
-                fixture = self._admitted_wsl_services()
-                fixture[4][key] = value
-                with self.assertRaises(codegen.CodegenError):
-                    self._select_admitted_wsl_service("frontend",fixture)
-        fixture = list(self._admitted_wsl_services())
-        fixture[0] = Path("/home/kking/git/foreign")
-        for role, name in (("backend","FULLMAG_SOURCE_HOST_ROOT"),("frontend","FULLMAG_SOURCE_ROOT")):
-            fixture[3][role]["Config"]["Env"] = [name + "=" + str(fixture[0])]
-        with self.assertRaises(codegen.CodegenError):
-            self._select_admitted_wsl_service("frontend",fixture)
-
-    def test_wsl_alias_refuses_metadata_without_pins_and_changed_admission(self):
-        fixture = self._admitted_wsl_services()
-        fixture[2]["services"]["backend"].pop("x-fullmag-daemon-binds")
-        from docker_build_control import canonical
-        fixture[4]["config_sha256"] = codegen._sha256(canonical(fixture[2]))
-        with self.assertRaisesRegex(codegen.CodegenError,"daemon bind"):
-            self._select_admitted_wsl_service("backend",fixture)
-        fixture = self._admitted_wsl_services()
-        with self.assertRaisesRegex(codegen.CodegenError,"terminal"):
-            self._select_admitted_wsl_service("backend",fixture,terminal=b"{}")
-        with self.assertRaisesRegex(codegen.CodegenError,"changed"):
-            self._select_admitted_wsl_service("backend",fixture,changed_verified=b"{}")
+    def test_wsl_alias_selection_refuses_source_and_service_drift(self):
+        for role in ("backend", "frontend"):
+            for change in ("source-env", "invalid-alias", "writable-source", "foreign-label", "stopped", "control-bind"):
+                with self.subTest(role=role, change=change):
+                    fixture = self._wsl_services()
+                    actual = fixture[2][role]
+                    if change == "source-env":
+                        key = "FULLMAG_SOURCE_HOST_ROOT" if role == "backend" else "FULLMAG_SOURCE_ROOT"
+                        actual["Config"]["Env"] = [key + "=/foreign/checkout"]
+                    elif change == "invalid-alias":
+                        actual["Mounts"][0]["Source"] += "/../foreign"
+                    elif change == "writable-source":
+                        actual["Mounts"][0]["RW"] = True
+                    elif change == "foreign-label":
+                        actual["Config"]["Labels"]["com.docker.compose.project"] = "foreign"
+                    elif change == "stopped":
+                        actual["State"]["Running"] = False
+                    else:
+                        next(m for m in actual["Mounts"] if m["Destination"] == "/opt/fullmag/control")["Type"] = "bind"
+                    with self.assertRaises(codegen.CodegenError):
+                        self._select_wsl_service(role, fixture)
 
     def test_backend_provenance_requires_receipt_and_binary_binding(self) -> None:
         receipt_sha = "a" * 64
@@ -536,33 +456,42 @@ class DockerDevCodegenTests(unittest.TestCase):
             outputs = {name: name.encode() for name in names}
             published = codegen._publish_outputs(source, outputs, before)
             self.assertEqual(set(published), set(names))
+            for name in names:
+                self.assertTrue((source / "apps/control-room/src/kernel/api/generated" / name).stat().st_mode & 0o040)
+
             self.assertEqual({name: (generated / name).read_bytes() for name in names}, outputs)
 
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
-    def test_published_sources_are_world_readable_before_atomic_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary)
-            generated = source / "apps/control-room/src/kernel/api/generated"
-            generated.mkdir(parents=True)
-            names = ("openapi-v2.json", "openapi-v2-types.ts", "openapi-v2-client.ts", "openapi-v2-paths.ts")
-            before = codegen._output_baseline(source, names)
-            replace = os.replace
-            observed = []
-            def publish(prepared, destination):
-                self.assertEqual(stat.S_IMODE(prepared.stat().st_mode), 0o644)
-                observed.append(destination.name)
-                replace(prepared, destination)
-            with mock.patch.object(codegen.os, "replace", side_effect=publish):
-                codegen._publish_outputs(source, {name:name.encode() for name in names}, before)
-            self.assertEqual(observed, list(names))
-            for name in names:
-                self.assertEqual(stat.S_IMODE((generated / name).stat().st_mode), 0o644)
-                self.assertEqual((generated / name).read_bytes(), name.encode())
+    def test_published_sources_preserve_group_readability_before_atomic_replace(self) -> None:
+        for existing_mode in (None, 0o640):
+            with self.subTest(existing_mode=existing_mode), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                generated = source / "apps/control-room/src/kernel/api/generated"
+                generated.mkdir(parents=True)
+                names = ("openapi-v2.json", "openapi-v2-types.ts", "openapi-v2-client.ts", "openapi-v2-paths.ts")
+                if existing_mode is not None:
+                    for name in names:
+                        (generated / name).write_bytes(b"previous")
+                        (generated / name).chmod(existing_mode)
+                before = codegen._output_baseline(source, names)
+                replace = os.replace
+                observed = []
+                expected_mode = 0o644 if existing_mode is None else existing_mode | stat.S_IRGRP
+                def publish(prepared, destination):
+                    self.assertEqual(stat.S_IMODE(prepared.stat().st_mode), expected_mode)
+                    observed.append(destination.name)
+                    replace(prepared, destination)
+                with mock.patch.object(codegen.os, "replace", side_effect=publish):
+                    codegen._publish_outputs(source, {name:name.encode() for name in names}, before)
+                self.assertEqual(observed, list(names))
+                for name in names:
+                    self.assertEqual(stat.S_IMODE((generated / name).stat().st_mode), expected_mode)
+                    self.assertEqual((generated / name).read_bytes(), name.encode())
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
-    def test_chmod_failure_and_source_collision_preserve_existing_outputs(self) -> None:
-        for failure in ("chmod", "collision"):
+    def test_fchmod_failure_and_source_collision_preserve_existing_outputs(self) -> None:
+        for failure in ("fchmod", "collision"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 source = Path(temporary)
                 generated = source / "apps/control-room/src/kernel/api/generated"
@@ -576,8 +505,8 @@ class DockerDevCodegenTests(unittest.TestCase):
                     (generated / names[0]).write_bytes(b"concurrent edit")
                 preserved = {name:((generated / name).read_bytes(), (generated / name).stat().st_mode) for name in names}
                 outputs = {name:name.encode() for name in names}
-                if failure == "chmod":
-                    with mock.patch.object(codegen.os, "chmod", side_effect=PermissionError("refused")):
+                if failure == "fchmod":
+                    with mock.patch.object(codegen.os, "fchmod", side_effect=PermissionError("refused")):
                         with self.assertRaises(PermissionError):
                             codegen._publish_outputs(source, outputs, before)
                 else:

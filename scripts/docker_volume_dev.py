@@ -5475,6 +5475,12 @@ def _validate_removed_recreation_proof(
         raise BuildControlError("Recreation helper-source pin cannot be resumed: " + str(error)) from error
     if stored_helper_source is not None:
         expected_operation_inputs["helper_source"] = stored_helper_source
+    offline_attempt = getattr(args, "offline_reconciliation", None)
+    retained_offline = operation_terminal.get("offline_reconciliation")
+    if retained_offline is not None or offline_attempt is not None:
+        if retained_offline != offline_attempt or not isinstance(offline_attempt, str):
+            raise BuildControlError("Recreation resume must retain its exact offline reconciliation pin")
+        expected_operation_inputs["offline_reconciliation"] = offline_attempt
     if (
         operation_terminal.get("schema") != "fullmag.docker-build-operation.v1"
         or operation_terminal.get("phase") != "recreate-services"
@@ -5489,6 +5495,12 @@ def _validate_removed_recreation_proof(
         or operation_terminal.get("fresh_state") is not False
     ):
         raise BuildControlError("Recreation operation receipt does not prove this exact completed replacement")
+    if offline_attempt is not None:
+        from docker_volume_offline_reconcile import validate_recreate_resume
+        if not validate_recreate_resume(
+            control, operation_terminal, expected_offline_attempt=offline_attempt,
+        ):
+            raise BuildControlError("Recreation resume lost its completed offline reconciliation proof")
     namespace = getattr(control, "namespace", None)
     if namespace:
         if (operation_terminal.get("control_namespace") != namespace
@@ -6894,17 +6906,31 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
         # stopped backend; the reconciler preserves the unknown activation
         # marker and only lets that helper release its own technical lease.
         from docker_volume_activation_reconcile import reconcile_unknown_activation
-        reconciliation = reconcile_unknown_activation(
-            control,
-            previous=previous,
-            document=document,
-            selected_source=str(selected),
-            config_sha256=args.config_sha256,
-            image_id=image,
-            backend_id=actual["backend"].get("Id"),
-            native_restart_metadata=recovery_context.get("native_restart_metadata"),
-            fresh_state=fresh_state,
-        )
+        offline_attempt = getattr(args, "offline_reconciliation", None)
+        if offline_attempt is not None:
+            if fresh_state or getattr(args, "script", None) is not None:
+                raise BuildControlError("Offline reconciliation must preserve the session and cannot replay a script")
+            from docker_volume_offline_reconcile import validate_for_recreate
+            if not validate_for_recreate(
+                control, previous, document, actual, selected, args.config_sha256,
+                expected_operation_attempt=offline_attempt,
+            ):
+                raise BuildControlError("The requested offline reconciliation proof is absent")
+            # Terminal runs and their results are preserved in place. They
+            # are not a held accepted run requiring automatic reattachment.
+            reconciliation = None
+        else:
+            reconciliation = reconcile_unknown_activation(
+                control,
+                previous=previous,
+                document=document,
+                selected_source=str(selected),
+                config_sha256=args.config_sha256,
+                image_id=image,
+                backend_id=actual["backend"].get("Id"),
+                native_restart_metadata=recovery_context.get("native_restart_metadata"),
+                fresh_state=fresh_state,
+            )
         accepted_reattach_context = {}
         accepted_store_root = None
         if reconciliation is not None:
@@ -7119,7 +7145,16 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                            **operator_probe_record}
         if helper_source_binding is not None:
             recreate_inputs["helper_source"] = helper_source_binding
+        if offline_attempt is not None:
+            recreate_inputs["offline_reconciliation"] = offline_attempt
         with control.operation("recreate-services", recreate_inputs) as operation:
+            if offline_attempt is not None:
+                if not validate_for_recreate(
+                    control, previous, document, actual, selected, args.config_sha256,
+                    expected_operation_attempt=offline_attempt, current_operation=operation,
+                ):
+                    raise BuildControlError("Offline reconciliation proof disappeared before recreation")
+                operation["receipt"]["offline_reconciliation"] = offline_attempt
             if helper_source_binding is not None:
                 operation["receipt"]["helper_source"] = helper_source_binding
                 control.write(operation["root"] + "/helper-source-binding.json", helper_source_binding)

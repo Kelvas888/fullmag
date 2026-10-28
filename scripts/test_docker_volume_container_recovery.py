@@ -47,7 +47,7 @@ class ContainerRecoveryTests(unittest.TestCase):
     @staticmethod
     def terminal_request(**overrides):
         pin={"run_id":"run-terminal", "run_intent_sha256":"1"*64,
-             "run_catalog_sha256":"2"*64, "terminal_evidence_sha256":"3"*64}
+             "run_catalog_sha256":"2"*64, "artifact_catalog_sha256":"3"*64}
         value={"schema_version":recovery.TERMINAL_REQUEST_SCHEMA,"retained_terminal_runs":[pin]}
         value.update(overrides)
         return value
@@ -62,114 +62,31 @@ class ContainerRecoveryTests(unittest.TestCase):
             with self.subTest(count=count),self.assertRaises(recovery.ContainerRecoveryError):
                 recovery.expected_recovery_outcome(self.terminal_request(retained_terminal_runs=request['retained_terminal_runs']*count))
         pin=request['retained_terminal_runs'][0]
-        for key in ['run_intent_sha256','run_catalog_sha256','terminal_evidence_sha256']:
-            for invalid in [None,"short","0"*64,"F"*64]:
+        for key in ['run_intent_sha256','run_catalog_sha256','artifact_catalog_sha256']:
+            for invalid in (["short","0"*64,"F"*64] if key == 'artifact_catalog_sha256' else [None,"short","0"*64,"F"*64]):
                 with self.subTest(key=key,invalid=invalid),self.assertRaises(recovery.ContainerRecoveryError):
                     recovery.expected_recovery_outcome(self.terminal_request(retained_terminal_runs=[{**pin,key:invalid}]))
         with self.assertRaises(recovery.ContainerRecoveryError):
             recovery.expected_recovery_outcome(self.terminal_request(retained_cancelled_runs=[]))
-        for pins in [[pin,pin],[{k:v for k,v in pin.items() if k!='terminal_evidence_sha256'}],[{**pin,'run_id':'../escape'}]]:
+        for pins in [[pin,pin],[{k:v for k,v in pin.items() if k!='artifact_catalog_sha256'}],[{**pin,'run_id':'../escape'}]]:
             with self.assertRaises(recovery.ContainerRecoveryError):
                 recovery.expected_recovery_outcome(self.terminal_request(retained_terminal_runs=pins))
 
     def test_cancelled_only_contract_remains_v2(self):
         pin=self.terminal_request()['retained_terminal_runs'][0]
-        cancelled={k:v for k,v in pin.items() if k!='terminal_evidence_sha256'}
+        cancelled={k:v for k,v in pin.items() if k!='artifact_catalog_sha256'}
         request={'schema_version':recovery.RETAINED_REQUEST_SCHEMA,'retained_cancelled_runs':[cancelled]}
         self.assertEqual(recovery.expected_recovery_outcome(request),'retained_cancelled_runs_recovered')
         with self.assertRaises(recovery.ContainerRecoveryError):
             recovery.expected_recovery_outcome({**request,'retained_cancelled_runs':[pin]})
         self.assertEqual(recovery.expected_recovery_outcome({'schema_version':recovery.REQUEST_SCHEMA}),'empty_namespace_recovered')
 
-    def terminal_operator(self):
-        return recovery.validate_operator_authorization(self.operator(
-            schema_version=recovery.TERMINAL_OPERATOR_SCHEMA,
-            retained_terminal_runs=self.terminal_request()['retained_terminal_runs']))
 
-    def diagnostic_journal(self,authorization):
-        from test_docker_volume_stop_failed import ready_owner
-        return {'schema':'fullmag.docker-api-diagnostic-stop.v1','state':'stopped-execution-unknown',
-                'attempt':authorization['development_attempt'],
-                'backend_container_id':authorization['backend_container_id'],
-                'frontend_container_id':authorization['frontend_container_id'],
-                'backend_image_id':authorization['old_image_id'],
-                'config_sha256':authorization['compose_config_sha256'],
-                'runtime_config_sha256':authorization['config_sha256'],
-                'failed_owner_sha256':authorization['owner_sha256'],
-                'terminal_process_receipt_sha256':authorization['process_receipt_sha256'],
-                'runtime_owner_state':'unknown-preserved','execution_state':'unknown','resource_leases':'untouched',
-                'backend_started_at':'start','backend_finished_at':'finish','api_instance_id':'instance',
-                'shutdown_error':'runtime service owner is not ready',
-                'failure_process_receipt_sha256':'a'*64,'api_failure_fence_sha256':'b'*64,
-                'api_exit_code':-15,'backend_exit_code':0,'retained_ready_owner':ready_owner()}
 
-    def test_terminal_operator_requires_diagnostic_stop_and_keeps_v1_separate(self):
-        authorization=self.terminal_operator();journal=self.diagnostic_journal(authorization)
-        recovery._validate_pre_admission_stop_journal(journal,authorization,authorization['attempt'])
-        for key,value in [('execution_state','drained'),('runtime_owner_state','failed-preserved'),
-                          ('resource_leases','released'),('terminal_process_receipt_sha256','a'*64),
-                          ('config_sha256','b'*64),('backend_container_id','c'*64),('api_exit_code',None)]:
-            with self.subTest(key=key),self.assertRaises(recovery.ContainerRecoveryError):
-                recovery._validate_pre_admission_stop_journal({**journal,key:value},authorization,authorization['attempt'])
-        with self.assertRaises(recovery.ContainerRecoveryError):
-            recovery._validate_pre_admission_stop_journal(journal,
-                recovery.validate_operator_authorization(self.operator()),authorization['attempt'])
-        with self.assertRaises(recovery.ContainerRecoveryError):
-            recovery.validate_operator_authorization(self.operator(retained_terminal_runs=authorization['retained_terminal_runs']))
-        with self.assertRaises(recovery.ContainerRecoveryError):
-            recovery.validate_operator_authorization(self.operator(schema_version=recovery.TERMINAL_OPERATOR_SCHEMA))
 
-    def test_terminal_backend_must_match_the_exact_stopped_incarnation(self):
-        authorization=self.terminal_operator();journal=self.diagnostic_journal(authorization)
-        backend={'Id':journal['backend_container_id'],'Image':journal['backend_image_id'],
-                 'State':{'StartedAt':journal['backend_started_at'],'FinishedAt':journal['backend_finished_at'],
-                          'ExitCode':journal['backend_exit_code'],'Status':'exited','Running':False,'Pid':0,'OOMKilled':False}}
-        recovery._validate_terminal_backend_incarnation(authorization,journal,backend)
-        for field,value in [('StartedAt','other'),('FinishedAt','other'),('ExitCode',42),('Pid',1),('OOMKilled',True)]:
-            with self.subTest(field=field),self.assertRaises(recovery.ContainerRecoveryError):
-                recovery._validate_terminal_backend_incarnation(authorization,journal,
-                    {**backend,'State':{**backend['State'],field:value}})
 
-    def frontend_fixture(self):
-        authorization=self.terminal_operator()
-        actual={'Id':authorization['frontend_container_id'],'Image':authorization['old_image_id'],
-                'Mounts':[],'Config':{},'HostConfig':{},
-                'State':{'StartedAt':'start','Running':True,'Status':'running','Pid':42}}
-        operation={'root':'operation','daemon_pending':False}
-        return authorization,actual,operation
 
-    def test_terminal_frontend_stop_rechecks_identity_and_records_real_exit(self):
-        from unittest.mock import Mock
-        authorization,actual,operation=self.frontend_fixture();expected=copy.deepcopy(actual)
-        control=SimpleNamespace(write=Mock());calls=[]
-        def docker(*args,**kwargs):
-            calls.append(args)
-            if args[0]=='stop':
-                actual['State'].update(Status='exited',Running=False,Pid=0,FinishedAt='finish')
-                return SimpleNamespace(stdout=b'')
-            return SimpleNamespace(stdout=json.dumps([actual]).encode())
-        with patch.object(recovery,'docker_capture',side_effect=docker):
-            recovery._stop_terminal_frontend(control,operation,authorization,expected)
-        self.assertEqual([c for c in calls if c[0]=='stop'],[('stop','--time','60',authorization['frontend_container_id'])])
-        self.assertFalse(operation['daemon_pending'])
-        self.assertEqual(control.write.call_args.args[1]['state'],'exited')
 
-    def test_terminal_frontend_drift_refuses_and_unknown_stop_retains_guard(self):
-        from unittest.mock import Mock
-        authorization,actual,operation=self.frontend_fixture();expected=copy.deepcopy(actual)
-        actual['State']['StartedAt']='restarted'
-        with patch.object(recovery,'docker_capture',return_value=SimpleNamespace(stdout=json.dumps([actual]).encode())) as capture:
-            with self.assertRaises(recovery.ContainerRecoveryError):
-                recovery._stop_terminal_frontend(SimpleNamespace(write=Mock()),operation,authorization,expected)
-        self.assertEqual(capture.call_count,1)
-        actual['State']['StartedAt']='start'
-        def docker(*args,**kwargs):
-            if args[0]=='stop':raise recovery.BuildControlError('transport unknown')
-            return SimpleNamespace(stdout=json.dumps([actual]).encode())
-        with patch.object(recovery,'docker_capture',side_effect=docker):
-            with self.assertRaises(recovery.BuildControlError):
-                recovery._stop_terminal_frontend(SimpleNamespace(write=Mock()),operation,authorization,expected)
-        self.assertTrue(operation['daemon_pending'])
 
     def test_operator_authorization_binds_prior_journal_not_shutdown_receipt(self):
         value = recovery.validate_operator_authorization(self.operator())
@@ -247,7 +164,7 @@ class ContainerRecoveryTests(unittest.TestCase):
 
     def test_terminal_storage_probe_preserves_pins_and_checks_exact_input_inventory(self):
         pin=self.terminal_request()['retained_terminal_runs'][0]
-        records=[{k:v for k,v in pin.items() if k!='terminal_evidence_sha256'}]
+        records=[pin]
         backend={'Image':'sha256:'+'f'*64,'Mounts':[
             {'Destination':'/state','Type':'bind','Source':'/state/source','RW':True},
             {'Destination':'/host-ledger','Type':'bind','Source':'/ledger/source','RW':True}]}
@@ -258,7 +175,8 @@ class ContainerRecoveryTests(unittest.TestCase):
             recovery._ledger_and_store_snapshot(SimpleNamespace(project='fullmag-test'),backend,retained_terminal_runs=[pin])
         observation=json.loads(capture.call_args.args[0][-1])
         self.assertEqual(observation['retained_terminal_runs'],[pin])
-        self.assertIsNone(observation['retained_cancelled_runs'])
+        self.assertEqual(observation['retained_cancelled_runs'],[pin])
+        self.assertTrue(observation['terminal_mode'])
         result.stdout=json.dumps({**value,'run_records':[]}).encode()
         with patch.object(recovery,'bounded_capture',return_value=result):
             with self.assertRaises(recovery.ContainerRecoveryError):
@@ -478,7 +396,7 @@ class ContainerRecoveryTests(unittest.TestCase):
                 return "/control/" + relative
 
         pin=self.terminal_request()['retained_terminal_runs'][0]
-        for retained in [{}, {'retained_cancelled_runs':[{k:v for k,v in pin.items() if k!='terminal_evidence_sha256'}]},
+        for retained in [{}, {'retained_cancelled_runs':[{k:v for k,v in pin.items() if k!='artifact_catalog_sha256'}]},
                          {'retained_terminal_runs':[pin]}]:
             with patch.object(recovery, "_control_json", return_value=(None, None)):
                 request = recovery._build_request(
@@ -523,7 +441,7 @@ class ContainerRecoveryTests(unittest.TestCase):
             if 'retained_terminal_runs' in retained:
                 self.assertEqual(request['schema_version'],recovery.TERMINAL_REQUEST_SCHEMA)
                 self.assertEqual(recovery.expected_recovery_outcome(request),'retained_terminal_runs_recovered')
-                with self.assertRaisesRegex(recovery.ContainerRecoveryError,'v2'):
+                with self.assertRaisesRegex(recovery.ContainerRecoveryError,'unexpected fields'):
                     recovery.validate_attestation({'schema_version':recovery.ABSENCE_ATTESTATION_SCHEMA},request,'1'*64)
 
     def test_prepared_transition_is_resumable_before_absence_sidecar(self):

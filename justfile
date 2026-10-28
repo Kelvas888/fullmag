@@ -91,8 +91,8 @@ docker-dev-recover-package source_root backend_container_id image_id request req
 # Reuse the exact pinned image or acquire it through this Compose group's
 # BuildControl operation; no browser install or source/build/cache write happens
 # on the host.
-docker-dev-browser-qa source_root="" port="" browser_image="" timeout="180" pull_timeout="1800":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_dev_browser_qa.py" --repo-root "{{repo_root}}" {{if source_root == "" { "" } else { "--source-root " + quote(source_root) } }} {{if port == "" { "" } else { "--port " + quote(port) } }} --timeout {{quote(timeout)}} --pull-timeout {{quote(pull_timeout)}} {{if browser_image == "" { "" } else { "--browser-image " + quote(browser_image) } }}
+docker-dev-browser-qa source_root="" port="" browser_image="" timeout="180" pull_timeout="1800" saved_playback_item_id="":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_dev_browser_qa.py" --repo-root "{{repo_root}}" {{if source_root == "" { "" } else { "--source-root " + quote(source_root) } }} {{if port == "" { "" } else { "--port " + quote(port) } }} --timeout {{quote(timeout)}} --pull-timeout {{quote(pull_timeout)}} {{if browser_image == "" { "" } else { "--browser-image " + quote(browser_image) } }} {{if saved_playback_item_id == "" { "" } else { "--saved-playback-item-id " + quote(saved_playback_item_id) } }}
 
 # Resume observation of one retained volume DEV start without restarting backend.
 docker-dev-resume attempt config_sha256 source_root port="3197" restart_backend="false" prestart_reconciliation="" prestart_reconciliation_sha256="":

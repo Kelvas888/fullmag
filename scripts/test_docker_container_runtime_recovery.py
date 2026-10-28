@@ -23,7 +23,7 @@ def _sha(raw: bytes) -> str:
 
 
 class ContainerRuntimeRecoveryBridgeTests(unittest.TestCase):
-    def test_terminal_request_matches_host_contract_and_forbids_absence_attestation(self):
+    def test_terminal_request_matches_host_contract_and_rejects_incomplete_absence_attestation(self):
         import docker_volume_container_recovery as host
         from test_docker_volume_container_recovery import ContainerRecoveryTests
         request=ContainerRecoveryTests.terminal_request()
@@ -34,13 +34,13 @@ class ContainerRuntimeRecoveryBridgeTests(unittest.TestCase):
                  {**request,'retained_cancelled_runs':[]},
                  {**request,'retained_terminal_runs':[pin,pin]},
                  {**request,'retained_terminal_runs':[]},
-                 {**request,'retained_terminal_runs':[{k:v for k,v in pin.items() if k!='terminal_evidence_sha256'}]},
-                 {**request,'retained_terminal_runs':[{**pin,'terminal_evidence_sha256':'bad'}]}]
+                 {**request,'retained_terminal_runs':[{k:v for k,v in pin.items() if k!='artifact_catalog_sha256'}]},
+                 {**request,'retained_terminal_runs':[{**pin,'artifact_catalog_sha256':'bad'}]}]
         for value in invalid:
             with self.subTest(value=value):
                 with self.assertRaises(host.ContainerRecoveryError):host.expected_recovery_outcome(value)
                 with self.assertRaises(runtime_service.RuntimeServiceError):runtime_service._container_recovery_expected_outcome(value)
-        with self.assertRaisesRegex(runtime_service.RuntimeServiceError,'v2'):
+        with self.assertRaisesRegex(runtime_service.RuntimeServiceError,'unexpected fields'):
             runtime_service._validate_container_recovery_attestation_document(request,'1'*64,
                 {'schema_version':runtime_service.CONTAINER_RECOVERY_ABSENCE_ATTESTATION_SCHEMA},'2'*64)
 

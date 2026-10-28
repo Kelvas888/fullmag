@@ -383,10 +383,12 @@ function securityHeaders() {
       key: "Content-Security-Policy",
       value: [
         "default-src 'self'",
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:",
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data: blob:",
-        "font-src 'self' data:",
+        // Bundled Sphinx documentation pages load MathJax from jsDelivr,
+        // Google Fonts stylesheets/glyphs, and the README logo asset.
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://cdn.jsdelivr.net",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "img-src 'self' data: blob: https://raw.githubusercontent.com",
+        "font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net",
         "connect-src 'self' http: https: ws: wss:",
         "worker-src 'self' blob:",
         // Session tabs show other local instances in frames (ADR 0069).

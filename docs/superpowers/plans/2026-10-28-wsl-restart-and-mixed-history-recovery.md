@@ -232,3 +232,56 @@ się od checkoutu: backend_dev.py SHA `dcea3be09d4be564b406eb9c3287b0ae642c09bae
 entrypoint.py SHA `55a97db9c023a4324695364a030464f5be2cd67d09593333b17add0e862d300c`.
 Sprawdzony kod obrazu publikuje pakiet przed Linux admission i cgroup gate;
 nie można zastąpić tej weryfikacji samym odczytem nowego checkoutu.
+
+
+## Rozstrzygnięcia integracji mastera z 28.10.2026
+
+Integracja obejmuje `origin/master` o pełnym SHA
+`2c67d8f904b1dede9268bbbc8bf6257cbe33aa4f` oraz wcześniejszy HEAD zadania
+`ab5ac8491ff18722dd21b653409b4ccbe40778ca`. Rozstrzygnięto 13 konfliktów
+źródeł; zapis merge i potwierdzenie bieżącego HEAD są osobnymi krokami Git.
+Nie zmieniono FMS użytkownika, statusów runów, release ani natywnego OWNER.
+
+Przyjęto kanoniczne recovery v4 mastera, jego walidator manual-held i budżet
+agregatu 1 GiB, zachowując limit pojedynczego obiektu oraz budżety legacy.
+Usunięto zastąpiony duplikat `retained_mixed_runs.rs`. Held request używa
+`run_id`, `run_intent_sha256`, `run_catalog_sha256`, `start_release: absent`;
+terminal request używa kanonicznego opcjonalnego `artifact_catalog_sha256`.
+Read-only CLI inspekcji terminal/held pozostaje dostępne, lecz jego dodatkowy
+hash diagnostyczny nie jest polem requestu v4. Faktyczny odczyt obu run_catalog
+runów `36bd51495…` i `6a1ab0dfe…` potwierdził Accepted/Blocked i brak artefaktów,
+a więc wcześniejsze podejrzenie Queued nie jest bieżącą blokadą.
+
+Masterowe wznowienie hosta i nasze ukończone przygotowanie pozostają oddzielne:
+bieżący certyfikat ma już device 2128 i restart_verified=false. Nie wolno
+ponownie wykonywać świeżej migracji host_device ani przepisywać tej flagi na
+true. Dalsze admission wymaga autentycznego nowego probe docelowego namespace.
+Testy ukończonego przygotowania zachowano pod jednoznaczną nazwą
+`test_linux_native_device_preparation.py`; nazwa
+`test_linux_native_readmission.py` należy do kanonicznego modułu mastera.
+
+API zachowuje `RetirementAuthority::with_evidence` oraz masterowy ograniczony
+retry typed StoreWriterBusy wyłącznie przed wejściem do pointer transition.
+Imported observation nie uzyskuje natywnej authority. Niezależny przegląd tego
+rozstrzygnięcia nie wykazał wymaganej poprawki; pełne zachowanie tej kombinacji
+nadal wymaga runtime/CI i nie jest dowiedzione samym parserem.
+
+Weryfikacja scalonych źródeł w helperze przypisanym do własnej grupy:
+
+- 58 regresji przygotowania urządzenia, readmisji i wrappera: PASS;
+- 174 regresje recovery/bridge v3/v4, codegen, WSL, offline network,
+  foreign-bind i readmission: PASS;
+- łącznie 232 testy interpretowane, zero failures/errors/skips;
+- 10 plików Rust przechodzi parser rustfmt; nie kompilowano lokalnie testów;
+- `bash -n`, `git diff --check` oraz parser `justfile`: PASS. Parser just
+  ujawnił nieprawidłowe przylegające delimitery w masterowej recepturze
+  browser-qa; poprawiono zapis, zachowując argument saved_playback_item_id.
+
+Dowody i hashe źródeł znajdują się wyłącznie w control volume grupy pod
+`verification/master-integration-20261028/`: `device-and-shell-tests.json`,
+`merge-recovery-contracts.json`, odpowiadające logi i `syntax-diagnostics.json`.
+Testy fixtures nie oznaczają recovery rzeczywistego store ani wizualizacji.
+Obie usługi nadal Exited, bez nowych buildów i Solve. Kolejne bramki:
+commit/push integracji, zarządzany build, świeży namespace probe, natywne
+recovery pełnych 43 runów, cold-load H oraz rzeczywisty odbiór WebGL.
+Cały zakres E0–E12 pozostaje aktywny; zapisany wynik nadal Failed/unassessed.

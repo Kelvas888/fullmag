@@ -449,14 +449,37 @@ async fn retire_current_live_checked(
         current.display_selection.revision,
     )
     .await;
-    let final_result = authority.with_evidence(&state, &request.run_id, Some(&proof.terminal_outcome), |final_evidence| {
-        if final_evidence
-            != initial_evidence
-        {
-            bail!("terminal evidence changed after archive publication");
+    // The archive is durable here. A busy host-ledger or store writer while
+    // taking the fence must not turn that into an unknown outcome: retry the
+    // fence until the pointer transition starts, never after it.
+    let pointer_transition_started = std::cell::Cell::new(false);
+    let fence_deadline = std::time::Instant::now() + RETIREMENT_EVIDENCE_WRITER_WAIT;
+    let final_result = loop {
+        let attempt = authority.with_evidence(
+            &state,
+            &request.run_id,
+            Some(&proof.terminal_outcome),
+            |final_evidence| {
+                pointer_transition_started.set(true);
+                if final_evidence != initial_evidence {
+                    bail!("terminal evidence changed after archive publication");
+                }
+                clear_current_workspace_pointer(&state, &current_fence)
+            },
+        );
+        match attempt {
+            Err(error)
+                if !pointer_transition_started.get()
+                    && error
+                        .chain()
+                        .any(|cause| cause.is::<fullmag_session::StoreWriterBusy>())
+                    && std::time::Instant::now() < fence_deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            result => break result,
         }
-        clear_current_workspace_pointer(&state, &current_fence)
-    });
+    };
     if let Err(error) = final_result {
         return Err(ApiError::conflict_with_code(
             "live_retirement_current_changed_after_publication",

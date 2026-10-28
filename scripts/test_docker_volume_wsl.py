@@ -96,8 +96,8 @@ class VolumeWslTests(unittest.TestCase):
                     lambda *args, **kwargs: json.dumps(inspected) if args[0] == "inspect" else "maintenance logs"))
                 remove = stack.enter_context(patch.object(dev, "docker_capture"))
                 control = Mock(project="fullmag-master", volume="control", namespace="")
-                control.read.return_value = None
-                control.subpath.return_value = ""
+                control.subpath.side_effect = lambda relative="": relative
+                control.read.return_value = None  # No retained optional capacity/Compose records in this fixture.
                 operation = {"root": "test", "receipt": {"attempt": "owned-attempt"}}
                 layout = {"storage_root": "/home/operator/storage", "project_id": "project"}
                 if changed:
