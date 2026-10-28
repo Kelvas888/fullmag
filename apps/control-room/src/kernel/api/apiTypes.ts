@@ -136,6 +136,8 @@ export type PlanarSampleSourceResource =
   components["schemas"]["PlanarSampleSourceResource"];
 export type PlanarFieldProbeResource =
   components["schemas"]["PlanarFieldProbeResource"];
+export type PlanarFieldProfileResource =
+  components["schemas"]["PlanarFieldProfileResource"];
 export type PostprocessingDataRef = components["schemas"]["PostprocessingDataRef"];
 export type PostprocessingDefinition = components["schemas"]["PostprocessingDefinition"];
 export type AnalyticReferenceModelCollectionResource =
@@ -219,6 +221,14 @@ export interface PlanarFieldProbeQuery
   > {
   u_m: number;
   v_m: number;
+}
+/** Line profile of one planar sample (note 0970, `eq-planar-line-profile`). */
+export interface PlanarFieldProfileQuery extends Omit<PlanarFieldProbeQuery, "u_m" | "v_m"> {
+  samples?: number;
+  u0_m: number;
+  u1_m: number;
+  v0_m: number;
+  v1_m: number;
 }
 export type CrossSectionPlane = "xy" | "xz" | "yz";
 export type CrossSectionQualityMetric =

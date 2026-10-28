@@ -153,6 +153,7 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
   usePlanarMaskResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarMeshOverlayResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarProbeResource: () => ({ data: mocks.probeData, error: null, status: mocks.probeData ? "ready" : "idle" }),
+  usePlanarProfileResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarScalarResource: () => mocks.renderReady && !mocks.scalarPending
     ? { data: mocks.scalarData, error: null, status: "ready" }
     : { data: null, error: null, status: "idle" },
