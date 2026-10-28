@@ -271,6 +271,7 @@ const PLANAR_FIELD_QUERY_ORDER = [
   "resolution_y",
   "scope_id",
   "scope_kind",
+  "scope_region_id",
   "snapshot_id",
   "stage_id",
   "vector_budget",

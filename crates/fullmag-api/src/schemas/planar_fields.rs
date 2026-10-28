@@ -17,6 +17,8 @@ pub struct PlanarFieldQuery {
     pub component: Option<String>,
     pub scope_kind: Option<String>,
     pub scope_id: Option<String>,
+    /// Region id within the `scope_id` object when `scope_kind=region`.
+    pub scope_region_id: Option<String>,
     pub stage_id: Option<String>,
     pub snapshot_id: Option<String>,
     pub resolution_x: Option<u32>,
@@ -56,6 +58,8 @@ pub struct PlanarFieldProbeQuery {
     pub quality: Option<String>,
     pub scope_kind: Option<String>,
     pub scope_id: Option<String>,
+    /// Region id within the `scope_id` object when `scope_kind=region`.
+    pub scope_region_id: Option<String>,
     pub stage_id: Option<String>,
     pub snapshot_id: Option<String>,
     #[serde(default, with = "crate::schemas::decimal_u64::optional")]
@@ -197,6 +201,8 @@ pub struct PlanarFieldMetaResource {
     pub field_precision: Option<String>,
     pub scope_kind: String,
     pub scope_id: Option<String>,
+    /// Region within the `scope_id` object for `region` scopes.
+    pub scope_region_id: Option<String>,
     pub frame: PlanarFieldFrameResource,
     /// Section of the session `Default` slice; null for authored monitors.
     pub section: Option<PlanarSectionResource>,

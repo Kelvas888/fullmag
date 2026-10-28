@@ -191,6 +191,8 @@ export interface PlanarFieldQuery {
   resolution_y?: number;
   scope_id?: string;
   scope_kind?: string;
+  /** Region within the `scope_id` object when `scope_kind` is `region`. */
+  scope_region_id?: string;
   snapshot_id?: string;
   stage_id?: string;
   vector_budget?: number;
@@ -211,6 +213,7 @@ export interface PlanarFieldProbeQuery
     | "resolution_y"
     | "scope_id"
     | "scope_kind"
+    | "scope_region_id"
     | "snapshot_id"
     | "stage_id"
   > {

@@ -11970,6 +11970,8 @@ export interface components {
             schema_version: string;
             scope_id?: string | null;
             scope_kind: string;
+            /** @description Region within the `scope_id` object for `region` scopes. */
+            scope_region_id?: string | null;
             section?: null | components["schemas"]["PlanarSectionResource"];
             source: components["schemas"]["PlanarSampleSourceResource"];
         };
@@ -12254,6 +12256,11 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "layer";
+            scope_id: string;
+        } | {
+            /** @enum {string} */
+            kind: "region";
+            region_id: string;
             scope_id: string;
         };
         PlanarVisualizationPatch: {
@@ -22902,6 +22909,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -22986,6 +22995,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23077,6 +23088,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23167,6 +23180,8 @@ export interface operations {
                 quality?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 expected_scene_revision?: string;
@@ -23240,6 +23255,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23317,6 +23334,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23401,6 +23420,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23485,6 +23506,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23570,6 +23593,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23655,6 +23680,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23746,6 +23773,8 @@ export interface operations {
                 quality?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 expected_scene_revision?: string;
@@ -23820,6 +23849,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23898,6 +23929,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;
@@ -23983,6 +24016,8 @@ export interface operations {
                 component?: string;
                 scope_kind?: string;
                 scope_id?: string;
+                /** @description Region id within the `scope_id` object when `scope_kind=region`. */
+                scope_region_id?: string;
                 stage_id?: string;
                 snapshot_id?: string;
                 resolution_x?: number;

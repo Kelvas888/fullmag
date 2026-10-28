@@ -717,6 +717,10 @@ def _backend_cache(control, operation, layout, selected, image, toolchain):
         source_root=selected, toolchain_image=toolchain, active_consumers=consumers,
         control_volume_name=control.volume, control_namespace=control.namespace,
         shared_packages=True)
+    snapshot = (getattr(control, "namespace_registry", None) or {}).get("retirement", {})
+    if snapshot.get("schema") == "fullmag.docker-isolated-session-snapshot.v1":
+        from docker_isolated_control_prepare import prepare_snapshot_control
+        prepare_snapshot_control(control, snapshot, operation=operation)
     overlay = cache.maintenance_overlay(profile)
     overlay["name"] = control.project
     control.write(operation["root"] + "/cache-maintenance-compose.json", overlay)
@@ -899,6 +903,28 @@ def _group_ledger(control, operation, image, *, new_render=False):
         raise BuildControlError("Retained group ledger identity changed during partial resume")
     control.write(operation["root"] + "/group-ledger.json", record)
     return profile["backend"], profile
+
+
+def _snapshot_certificate_placeholder(control, state, certificate_path, snapshot):
+    """Retain only the empty pre-admission placeholder from the known cache refusal."""
+    import linux_native_host as host
+    if not os.path.lexists(certificate_path):
+        certificate_path.touch(exist_ok=False)
+        return
+    previous = control.read("development/current.json", optional=True)
+    if (not isinstance(previous, Mapping)
+            or previous.get("state") != "failed-confirmed"
+            or previous.get("control_namespace") != control.namespace
+            or previous.get("namespace_registry_sha256") != control.namespace_registry_sha256
+            or previous.get("inputs", {}).get("source_root") != snapshot["source_root"]
+            or previous.get("backend_container") or previous.get("frontend_container")
+            or "runtime-control control namespace is nonempty without its owner marker"
+               not in str(previous.get("error", ""))
+            or Path(state) != Path(snapshot["destination_state_root"])
+            or os.path.lexists(Path(state) / host.OWNER_NAME)
+            or control.read_bytes("isolated-snapshot/native-validation.json", optional=True) is not None
+            or host.read_owned_regular(certificate_path, 1) != b""):
+        raise BuildControlError("Existing snapshot certificate is not the pinned pre-admission placeholder")
 
 
 def _empty_stopped_namespace_ledger_generation(control):
@@ -2075,7 +2101,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
                     "source_manifest_sha256": snapshot["source_manifest_sha256"],
                 }
             certificate_path = _certificate_path(state)
-            certificate_path.touch(exist_ok=False)
+            if snapshot is not None:
+                _snapshot_certificate_placeholder(control, state, certificate_path, snapshot)
+            else:
+                certificate_path.touch(exist_ok=False)
         else:
             try:
                 state = storage.validate_path(

@@ -10,6 +10,8 @@ import type {
 import {
   formatSectionLength,
   fullThicknessSlabOperator,
+  matchObjectLayer,
+  objectLayerSlice,
   resolvePlanarSectionGeometry,
   resolvedSectionCoordinate,
   sectionLayerCount,
@@ -19,11 +21,19 @@ import {
   sectionStopPosition,
   stepSectionFraction,
   withSectionStops,
+  type ObjectSectionLayer,
   type PlanarSectionPlane,
   type PlanarSectionReduction,
 } from "@/kernel/visualization/planarSectionModel";
 import { Button } from "@/shared/ui/Button";
 import { SegmentedControl } from "@/shared/ui/SegmentedControl";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/shared/ui/Select";
 
 type DefaultSlice = NonNullable<VisualizationStateResource["planar"]>["default_slice"];
 
@@ -34,6 +44,7 @@ const PLANES = [
 ] as const;
 
 const FRACTION_STEPS = 1000;
+const FREE_SECTION = "__free_section__";
 
 /**
  * Section controls above the planar surface (MuMax3-style): plane, single
@@ -43,12 +54,15 @@ const FRACTION_STEPS = 1000;
 export function PlanarSectionStrip({
   defaultSlice,
   domain,
+  objectLayers = [],
   section = null,
   shownCoordinate = null,
   onChange,
 }: {
   defaultSlice: DefaultSlice;
   domain: DomainMetaResource | null | undefined;
+  /** Realized objects along the current normal; each is a named slab layer. */
+  objectLayers?: readonly ObjectSectionLayer[];
   /** Backend section of the current sample; supplies FEM node-plane stops. */
   section?: PlanarFieldMetaResource["section"] | null;
   /** Normal coordinate of the frame currently on screen (may lag a new request). */
@@ -58,6 +72,7 @@ export function PlanarSectionStrip({
   const plane = defaultSlice.plane as PlanarSectionPlane;
   const geometry = withSectionStops(resolvePlanarSectionGeometry(domain, plane), section);
   const reduction = sectionReduction(defaultSlice.operator, geometry);
+  const objectLayer = matchObjectLayer(defaultSlice, geometry, objectLayers);
   const layerCount = sectionLayerCount(geometry);
   const layerNoun = geometry?.stops ? "node plane" : "layer";
   const [draft, setDraft] = useState<{ key: string; value: number } | null>(null);
@@ -145,6 +160,26 @@ export function PlanarSectionStrip({
         value={reduction}
         onValueChange={setReduction}
       />
+      {geometry && objectLayers.length > 0 ? (
+        <Select
+          value={objectLayer?.objectId ?? FREE_SECTION}
+          onValueChange={(value) => {
+            setDraft(null);
+            const layer = objectLayers.find((item) => item.objectId === value);
+            change(layer ? objectLayerSlice(geometry, layer) : { operator: { kind: "plane_sample" } });
+          }}
+        >
+          <SelectTrigger aria-label="Object layer" className="fm-field-map__object-layer" density="compact">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={FREE_SECTION}>Free section</SelectItem>
+            {objectLayers.map((layer) => (
+              <SelectItem key={layer.objectId} value={layer.objectId}>{layer.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ) : null}
       {reduction === "average" ? (
         <span className="fm-field-map__section-caption">
           Mean over {axis.toUpperCase()}
@@ -200,6 +235,10 @@ export function PlanarSectionStrip({
               ? `‹ › step ${formatSectionLength(geometry.navigationStepM)}: median height of the cut elements (navigation aid, not a data layer)`
               : undefined}
           >
+            {objectLayer && !drafting ? (
+              `${objectLayer.name} · ${axis} ∈ [${formatSectionLength(objectLayer.min)}, ${formatSectionLength(objectLayer.max)}] · slab`
+            ) : (
+              <>
             {pendingCoordinate
               ? `showing ${axis} = ${formatSectionLength(shownCoordinate)} · loading `
               : `${axis}: `}
@@ -211,6 +250,8 @@ export function PlanarSectionStrip({
               : betweenStops
                 ? ` · between ${layerNoun}s`
                 : ` · ${layerNoun} ${step} / ${layerCount - 1}`}
+              </>
+            )}
           </span>
         </>
       )}
