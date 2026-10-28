@@ -1217,6 +1217,17 @@ class DockerDevBrowserQaContractTests(unittest.TestCase):
             encoded(payload), public_url, browser_url, item_id, script_sha256,
         )
         self.assertEqual(parsed["frame_sha256"], payload["frame_sha256"])
+        fem = {**payload, "geometry_kind": "fem", "frame_count": 3, "frame_indices": [0, 1, 2]}
+        self.assertEqual(self.qa._parse_saved_playback_result(
+            encoded(fem), public_url, browser_url, item_id, script_sha256,
+        )["frame_indices"], [0, 1, 2])
+        for change in ({"frame_count": True}, {"frame_count": 2}, {"frame_count": 100001},
+                       {"frame_indices": [0, 0, 2]}, {"geometry_kind": "unknown"}):
+            with self.assertRaises(self.qa.BuildControlError):
+                self.qa._parse_saved_playback_result(
+                    encoded({**fem, **change}), public_url, browser_url, item_id, script_sha256,
+                )
+
 
         for key, value in (
             ("item_id", "74"),

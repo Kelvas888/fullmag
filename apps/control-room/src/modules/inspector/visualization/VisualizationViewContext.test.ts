@@ -75,4 +75,24 @@ describe("visualization view context", () => {
       }),
     ).toEqual({ kind: "airbox" });
   });
+
+  it("maps an FDM multilayer layer selection to the native layer scope", () => {
+    expect(
+      planarViewScopeForSelection({
+        kind: "mesh.grid.layer",
+        label: "Bottom layer",
+        moduleSource: "inspector",
+        nodeId: "layer-node",
+        objectId: null,
+        ref: {
+          kind: "mesh.grid.layer",
+          layerId: "bottom",
+          nodeId: "layer-node",
+          scope: "layer",
+          type: "fdm-domain",
+          visualizationTargetId: "fdm-native-layer:bottom",
+        },
+      }),
+    ).toEqual({ kind: "layer", scope_id: "bottom" });
+  });
 });

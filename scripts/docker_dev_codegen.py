@@ -98,8 +98,11 @@ def digest_binary(name):
     descriptor = os.open("/opt/fullmag/package/bin/" + name, FLAGS)
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise RuntimeError("runtime binary is not one regular file")
+        # Sealed immutable packages are legitimately hardlinked by the shared
+        # store. Mutable handoff JSON above still requires a unique inode.
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink < 1
+                or (metadata.st_nlink != 1 and metadata.st_mode & 0o222)):
+            raise RuntimeError("runtime binary is not a regular or sealed shared file")
         digest = hashlib.sha256()
         total = 0
         while True:
@@ -110,6 +113,13 @@ def digest_binary(name):
             if total > 16 * 1024 * 1024 * 1024:
                 raise RuntimeError("runtime binary exceeds its size bound")
             digest.update(block)
+        after = os.fstat(descriptor)
+        signature = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                   value.st_mtime_ns, value.st_mode)
+        if signature(metadata) != signature(after):
+            raise RuntimeError("runtime binary changed while hashing")
+        # Link-count changes from shared-cache retention do not change bytes.
+        # The caller binds this hash to both build receipt and provenance.
         return digest.hexdigest()
     finally:
         os.close(descriptor)
@@ -873,10 +883,17 @@ def _probe_source(container: str, token: str) -> tuple[dict[str, Any], str]:
 
 
 def _source_matches(probe: Mapping[str, Any], backend: Mapping[str, Any]) -> bool:
+    """The running package was built from the mounted build inputs.
+
+    The backend keeps a verified package when only files outside its build
+    inputs change (documentation, frontend sources); its full-tree
+    `source_digest` then differs from a fresh probe while the build-input
+    snapshot and native identity still match. OpenAPI depends only on the
+    backend binary, so the build-input identity is the binding check.
+    """
     native = probe.get("native_source_identity")
     return isinstance(native, Mapping) and (
         probe.get("resolved_commit") == backend["commit"]
-        and probe.get("source_digest") == backend["source_digest"]
         and probe.get("source_snapshot_sha256") == backend["snapshot"]
         and dict(native) == backend["native"]
     )
