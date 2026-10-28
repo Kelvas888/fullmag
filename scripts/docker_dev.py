@@ -69,6 +69,7 @@ BASE_CONTEXT_FILES = (
     ("linux_native_probe.py", "docker/all-in-one/linux_native_probe.py"),
     ("runtime_service.py", "docker/all-in-one/runtime_service.py"),
     ("runtime_service_unclaimed_cancellation.py", "docker/all-in-one/runtime_service_unclaimed_cancellation.py"),
+    ("runtime_service_snapshot.py", "docker/all-in-one/runtime_service_snapshot.py"),
     ("frontend_dev.py", "docker/all-in-one/frontend_dev.py"),
     ("healthcheck.py", "docker/all-in-one/healthcheck.py"),
     ("docker_startup_script.py", "scripts/docker_startup_script.py"),
@@ -2521,12 +2522,35 @@ def _parser() -> argparse.ArgumentParser:
     empty_quarantine.add_argument("--activation", required=True)
     empty_quarantine.add_argument("--recovery-id", required=True)
     empty_quarantine.add_argument("--apply", action="store_true", help="commit after exact stopped-namespace and empty-store proofs; default is dry-run")
+    offline_reconcile = subparsers.add_parser(
+        "reconcile-offline-volume",
+        help="repair one stopped terminal-owner control lease while preserving sessions and unknown activation evidence",
+    )
+    offline_reconcile.add_argument("--source-root", type=Path, required=True)
+    offline_reconcile.add_argument("--attempt", required=True)
+    offline_reconcile.add_argument("--config-sha256", required=True)
+    offline_reconcile.add_argument("--operation-attempt", required=True)
+    offline_reconcile.add_argument("--port", type=int, required=True)
+    offline_reconcile.add_argument("--apply", action="store_true")
+    offline_reconcile.add_argument("--expected-plan-sha256")
+    reattest = subparsers.add_parser("reattest-host-device-volume", help="explicitly reattest a stopped WSL group's renumbered host device")
+    reattest.add_argument("--source-root", type=Path, required=True)
+    reattest.add_argument("--attempt", required=True)
+    reattest.add_argument("--config-sha256", required=True)
+    reattest.add_argument("--certificate-sha256", required=True)
+    reattest.add_argument("--expected-host-device", type=int, required=True)
+    reattest.add_argument("--apply", action="store_true")
+    reattest.add_argument("--interrupted-iteration", help="exact absent helper iteration to reconcile after an abrupt host stop")
     resume_parser = subparsers.add_parser("resume-volume", help="Observe one exact retained volume DEV start without restarting backend")
     resume_parser.add_argument("--attempt", required=True)
     resume_parser.add_argument("--config-sha256", required=True)
     resume_parser.add_argument("--source-root", type=Path, required=True)
     resume_parser.add_argument("--port", type=int, required=True)
     resume_parser.add_argument("--restart-backend", action="store_true", help="Start the retained stopped backend; never stop an active service")
+    resume_parser.add_argument("--build-for-recovery", help="Pinned control-volume request; build behind the closed storage gate without serving")
+    resume_parser.add_argument("--build-for-recovery-sha256", help="SHA-256 of the exact recovery build request")
+    resume_parser.add_argument("--prestart-reconciliation", help="Exact confirmed prestart iteration UUID")
+    resume_parser.add_argument("--prestart-reconciliation-sha256", help="SHA-256 of its terminal receipt")
     activate_parser = subparsers.add_parser(
         "activate-script",
         help="activate one Python script in the already-running retained backend",
@@ -2556,6 +2580,13 @@ def _parser() -> argparse.ArgumentParser:
         help="optional frontend port override; conflicting defaults fail closed",
     )
     script_parser.add_argument("--request-id", help="optional stable request fence")
+    frontend_refresh = subparsers.add_parser("refresh-frontend-volume", help="Replace only the pinned frontend metadata generation")
+    frontend_refresh.add_argument("--attempt", required=True)
+    frontend_refresh.add_argument("--config-sha256", required=True)
+    frontend_refresh.add_argument("--source-root", type=Path, required=True)
+    frontend_refresh.add_argument("--port", type=int, required=True)
+    frontend_refresh.add_argument("--frontend-frozen-resume")
+    frontend_refresh.add_argument("--frontend-frozen-resume-sha256")
     run_script_parser = subparsers.add_parser(
         "run-script",
         help="run one script in the managed DEV group and observe its result; keep API/frontend running",
@@ -2579,6 +2610,9 @@ def _parser() -> argparse.ArgumentParser:
     idle_restart.add_argument("--config-sha256", required=True)
     idle_restart.add_argument("--source-root", type=Path, required=True)
     idle_restart.add_argument("--port", type=int, required=True)
+    idle_restart.add_argument("--saved-authoring-checkpoint")
+    idle_restart.add_argument("--saved-authoring-checkpoint-sha256")
+    idle_restart.add_argument("--stop-only", action="store_true", help="Drain and stop the pinned backend without restarting it")
     idle_restart.add_argument(
         "--allow-prepared-session", action="store_true",
         help="allow graceful drain with never-started manual Studies, including held queue entries after a terminal task; retain accepted inputs and never release Solve",
@@ -2636,6 +2670,7 @@ def _parser() -> argparse.ArgumentParser:
     stop_diagnostic.add_argument("--config-sha256", required=True)
     stop_diagnostic.add_argument("--source-root", type=Path, required=True)
     stop_diagnostic.add_argument("--port", type=int, required=True)
+    stop_diagnostic.add_argument("--preview", action="store_true")
     stop_diagnostic.add_argument(
         "--resume-attempt",
         help="exact successful retained resume attempt that pins the current backend start time",
@@ -2723,6 +2758,16 @@ def _parser() -> argparse.ArgumentParser:
             "reference is passed unchanged to the volume-only recovery wrapper "
             "and is never resolved as a host path"
         ),
+    )
+    recreate_volume.add_argument("--completed-recreation-attempt", help="Continue this exact succeeded removal without repeating rm")
+    recreate_volume.add_argument("--completed-recreation-sha256", help="SHA-256 of the completed removal terminal receipt")
+    recreate_volume.add_argument("--drained-successor-proof", help="Exact control-volume proof of a later successful managed drain")
+    recreate_volume.add_argument("--drained-successor-proof-sha256", help="SHA-256 of the exact drained-successor proof")
+    recreate_volume.add_argument("--terminal-observation-proof", help="Exact private control-volume proof of one terminal observation")
+    recreate_volume.add_argument("--terminal-observation-proof-sha256", help="SHA-256 of the exact terminal observation proof")
+    recreate_volume.add_argument(
+        "--offline-reconciliation", metavar="OPERATION_TOKEN",
+        help="consume the exact completed offline control repair without replaying its old operation",
     )
     recreate_volume.add_argument("--fresh-state", action="store_true", help="Preserve the previous session and archive its runtime state before starting an empty session")
     recreate_volume.set_defaults(profile="dev", image=None, toolchain_image=None, source_manifest=None,
@@ -2931,6 +2976,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.port = selected.port
         if args.action == "build":
             build(args)
+        elif args.action == "refresh-frontend-volume":
+            from docker_volume_dev import refresh_frontend
+            refresh_frontend(args)
         elif args.action == "maintain-cache":
             from docker_volume_cache_maintenance import maintain
             maintain(args)
@@ -2963,6 +3011,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise _fail("Apply acknowledgement and plan digest require --apply")
                 result = plan(inspect_retirement(args))
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        elif args.action == "reconcile-offline-volume":
+            from docker_volume_offline_reconcile import apply, collect
+            if not args.apply and args.expected_plan_sha256 is not None:
+                raise _fail("A plan digest requires --apply")
+            result = apply(args) if args.apply else collect(args)
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recover-cancelled-activation":
             from docker_volume_cancelled_activation import run as recover_cancelled_activation
             result = recover_cancelled_activation(args)
@@ -2972,6 +3026,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = stop_bootstrap(args)
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         elif args.action == "recreate-volume":
+            if bool(args.terminal_observation_proof) != bool(args.terminal_observation_proof_sha256):
+                raise _fail("Terminal observation requires paired proof and SHA-256")
+            if args.terminal_observation_proof and any((args.fresh_state, args.recovery_authorization, args.resume_recreation, args.completed_recreation_attempt, args.drained_successor_proof)):
+                raise _fail("Terminal observation requires plain retained recreation without another restore or recovery request")
+            if bool(args.completed_recreation_attempt) != bool(args.completed_recreation_sha256):
+                raise _fail("completed recreation requires both attempt and terminal SHA-256")
+            if args.completed_recreation_attempt and (args.fresh_state or args.recovery_authorization or args.resume_recreation):
+                raise _fail("completed recreation cannot combine fresh state, recovery authorization, or resume recreation")
             import docker_helper_source as helper_source
             try:
                 helper_pair = helper_source.validate_option_pair(
@@ -3003,6 +3065,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "quarantine-empty-stopped":
             from docker_volume_empty_quarantine import quarantine
             quarantine(args)
+        elif args.action == "reattest-host-device-volume":
+            from docker_volume_host_device import run as reattest_host_device
+            print(json.dumps(reattest_host_device(args), sort_keys=True))
         elif args.action == "resume-volume":
             from docker_volume_dev import resume
             resume(args)
