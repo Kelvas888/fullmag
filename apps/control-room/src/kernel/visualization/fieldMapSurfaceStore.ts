@@ -85,3 +85,17 @@ export function useFieldMapSurfaceState(): FieldMapState {
     serverSnapshot,
   );
 }
+
+const serverEvidenceStatus = () => null;
+
+/**
+ * Evidence status only. Consumers outside the 2D surface (the Inspector)
+ * must not re-render for every presented-profile update during pan/zoom.
+ */
+export function useFieldMapSurfaceEvidenceStatus(): FieldMapSurfaceEvidenceStatus | null {
+  return useSyncExternalStore(
+    fieldMapSurfaceStore.subscribe,
+    () => fieldMapSurfaceStore.get().evidenceStatus,
+    serverEvidenceStatus,
+  );
+}

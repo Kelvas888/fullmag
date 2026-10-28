@@ -171,8 +171,9 @@ Plan: `docs/plans/active/viewport-2d-mumax-parity-2026-10-27/`.
 - Cartesian presets use `coolwarm` with a symmetric range, `|v|` uses
   `viridis` with an automatic range; a manual range is never overwritten.
 - Vectors are laid out on a screen-space 2D grid anchored to the (u, v)
-  frame (`layoutScreenGlyphs`), spacing derived from `vector_budget` with a
-  24 px minimum, length = mumax3 in-plane projection with a 7 px minimum,
+  frame (`layoutScreenGlyphs`), spacing derived from `vector_budget` (a
+  presentation-only density, outside the sample identity) with a 24 px
+  minimum, length = mumax3 in-plane projection with a 7 px minimum,
   filled arrowheads, and `⊙/⊗` markers when |v∥|/|v| < 0.25. Over a
   direction raster, `orientation`-coloured arrows are drawn dark with a light
   halo.

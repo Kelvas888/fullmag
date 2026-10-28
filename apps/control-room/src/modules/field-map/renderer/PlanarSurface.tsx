@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import { formatValueWithUnit } from "@/shared/domain/physics/displayUnits";
 
@@ -105,6 +105,19 @@ export function PlanarSurface({
   // The plot area is a size container so the canvas keeps the physical
   // u:v aspect ratio whichever dimension (width or height) is limiting.
   const aspect = Math.abs((model.bounds[1] - model.bounds[0]) / (model.bounds[3] - model.bounds[2])) || 1;
+  const summaryId = useId();
+  const length = (metres: number) =>
+    formatValueWithUnit(metres * axes.displayLengthUnit.scale, axes.displayLengthUnit.symbol);
+  const summary = [
+    `2D field map, ${axes.horizontal.label} from ${length(axes.horizontal.rangeMetres[0])} to ${length(axes.horizontal.rangeMetres[1])}`,
+    `${axes.vertical.label} from ${length(axes.vertical.rangeMetres[0])} to ${length(axes.vertical.rangeMetres[1])}`,
+    model.directionVectors
+      ? "coloured by vector direction"
+      : model.range
+        ? `colour range ${formatValueWithUnit(model.range.min * model.display.probeScale, model.display.legendUnit)} to ${formatValueWithUnit(model.range.max * model.display.probeScale, model.display.legendUnit)}`
+        : "colour range unavailable",
+    "Arrow keys pan, plus and minus zoom, 0 fits, Enter pins a probe.",
+  ].join("; ");
   return (
     <div className="fm-field-map__plot-area">
       <div
@@ -119,11 +132,13 @@ export function PlanarSurface({
         />
         <canvas
           ref={canvasRef}
+          aria-describedby={summaryId}
           aria-label="Planar scalar field"
           className="fm-field-map__canvas"
           role="img"
           data-probes-enabled={String(model.layers.probes)}
-          tabIndex={model.layers.probes ? 0 : -1}
+          // Keyboard pan, zoom and fit must stay reachable without probes.
+          tabIndex={0}
           onClick={(event) => {
             if (gestureMovedRef.current) {
               gestureMovedRef.current = false;
@@ -299,6 +314,7 @@ export function PlanarSurface({
           aria-hidden="true"
           className="fm-field-map__canvas fm-field-map__canvas--overlay"
         />
+        <p className="fm-visually-hidden" id={summaryId}>{summary}</p>
         {probeOverlay}
         <output className="fm-field-map__probe" aria-live="polite">
           {!model.layers.probes || hoverProbe?.value === null || !hoverCoordinates

@@ -29,7 +29,7 @@ import {
   resolvePlanarTargetWireframeStyle,
 } from "@/kernel/visualization/planarTargetPresentation";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
-import { useFieldMapSurfaceState } from "@/kernel/visualization/fieldMapSurfaceStore";
+import { useFieldMapSurfaceEvidenceStatus } from "@/kernel/visualization/fieldMapSurfaceStore";
 import { DIRECTION_COLORMAP } from "@/shared/visualization/directionColor";
 import { projectPlanarPresentationState } from "@/kernel/visualization/planarPresentationProjection";
 import {
@@ -125,7 +125,7 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
   const coverage = planarVisualizationCoverage(selection);
   const viewScope = planarViewScopeForSelection(selection);
   const [validationError, setValidationError] = useState<string | null>(null);
-  const surface = useFieldMapSurfaceState();
+  const surfaceEvidence = useFieldMapSurfaceEvidenceStatus();
   const monitors = usePlanarMonitorsResource({ enabled: coverage.supported });
   const domain = useDomainMetaResource({ enabled: coverage.supported });
   const fieldCatalog = useFieldCatalogResource({ enabled: coverage.supported });
@@ -196,11 +196,11 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
     : SCALAR_COLOR_PALETTE_ITEMS;
   // P1-08: "Live" requires the mounted 2D surface to prove meta + scalar +
   // raster identity; metadata alone is not a rendered frame.
-  const dataState = surface.evidenceStatus === "ready"
+  const dataState = surfaceEvidence === "ready"
     ? "Live"
-    : surface.evidenceStatus === "error"
+    : surfaceEvidence === "error"
       ? "Error"
-      : surface.evidenceStatus === "loading"
+      : surfaceEvidence === "loading"
         ? "Loading frame"
         : meta.status === "ready"
           ? "Metadata only (2D view closed)"

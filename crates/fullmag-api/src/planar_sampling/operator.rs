@@ -101,7 +101,8 @@ impl PlanarOperatorCache {
         }
     }
 
-    /// Number of operators built so far (diagnostics and tests).
+    /// Number of operators built so far.
+    #[cfg(test)]
     pub(crate) fn build_count(&self) -> u64 {
         self.inner.lock().map(|entries| entries.builds).unwrap_or(0)
     }

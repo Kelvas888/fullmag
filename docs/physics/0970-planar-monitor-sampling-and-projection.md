@@ -997,6 +997,10 @@ Structural validation does not prove scientific correctness.
   work across field revisions, but the first build is $O(E)$ per plane.
 - The probe is a point evaluation with `occupied`, `outside` and `empty`
   statuses; FEM point location for the probe is a linear element scan.
+- `vector_budget` is a presentation parameter: it sets the screen-space glyph
+  density of the 2D view and is not part of the sample identity. The vector
+  resource always carries the full raster, so changing the budget never
+  resamples.
 - The failed current browser smoke blocks visible-canvas, lifecycle,
   accessibility, performance, and 3D/2D preservation qualification.
 - The session-resolved `Default` source is contract-only until its typed state,

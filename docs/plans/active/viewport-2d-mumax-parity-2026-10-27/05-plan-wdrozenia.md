@@ -111,9 +111,9 @@ F1 i F2 mogą iść równolegle w osobnych worktree po F0: F1 dotyka głównie `
 | Etap | Stan | Uwagi |
 |---|---|---|
 | F0 | zrobione | smoke contract 11/11, preflight FDM zielony, martwe komendy zastąpione, plany oznaczone `superseded`, spec 15/UI/ledger zsynchronizowane, nota 0970 rozszerzona |
-| F1 | zrobione, smoke przeglądarkowy FDM CPU | pasek kontrolek, koło barw `hsl_direction` (2D/3D/PNG), strzałki z grotami, retencja, skróty, `meta.section`, Inspector `Live`; FEM tylko kompilacja |
-| F2 | zrobione (kompilacja, runtime FDM) | cache operatora FEM, single-flight, `spawn_blocking`, fence epoki, sonda punktowa, ekstrema zajętości, tolerancje względne; BVH odłożony do B6 (rasteryzacja per element zostaje) |
+| F1 | zrobione z odstępstwem, smoke przeglądarkowy FDM CPU | pasek kontrolek, koło barw `hsl_direction` (2D/3D/PNG), strzałki z grotami, retencja, skróty, `meta.section`, Inspector `Live` (selektor tylko statusu), dostępność canvasa (`tabIndex=0`, streszczenie `aria-describedby`); **odstępstwo**: budżety z 03 §10 nie zostały zmierzone (tylko czasy z smoke: otwarcie 0,3 s, krok warstwy ~20 ms) |
+| F2 | zrobione z odstępstwami (kompilacja, runtime FDM) | cache operatora FEM, single-flight, `spawn_blocking`, fence epoki, sonda punktowa, ekstrema zajętości, tolerancje względne FEM, dokładny błąd loadera membership (P1-11); `vector_budget` zdefiniowany jako parametr wyłącznie prezentacyjny (gęstość glifów), poza tożsamością próbki (P1-13); **odstępstwa**: BVH (F2.2) odłożony do B6 — zostaje rasteryzacja per element; tolerancja de-duplikacji w `geometry.rs` nadal absolutna |
 | F3 | zrobione (kompilacja) | Hex8, Pyramid5 (zgodny z MFEM), kwadratura slab/depth dla elementów nieafinicznych |
-| F4 | zrobione (kompilacja + frontend) | przystanki płaszczyzn węzłów z certyfikatu swept; `navigation_step_m` dla siatek niestrukturalnych to 1 % rozciągłości (mediana h⊥ odłożona) |
+| F4 | częściowo | zrobione: przystanki płaszczyzn węzłów z certyfikatu swept (F4.1); **odłożone, odstępstwo od planu**: warstwy nazwane z obiektów i `scope_kind=region` (F4.2), mediana h⊥ jako krok nawigacji (F4.3; jest 1 % rozciągłości), jedno źródło capability airboxu (F4.4) |
 | F5 | częściowo | FDM CPU: smoke sesyjny PASS; FEM CPU/GPU: **BLOCKED** (patrz ledger); FDM GPU: brak zarządzanego toru; zarządzana kwalifikacja wydania: nie wykonana |
 | F6 | projekt | [06-projekt-poziomu-b.md](06-projekt-poziomu-b.md) |

@@ -203,6 +203,8 @@ impl PlanarSampleIdentity {
     }
 }
 
+/// Uncached sampling; production requests use [`sample_resolved_target_cached`].
+#[cfg(test)]
 pub(crate) fn sample_resolved_target(
     target: &ResolvedSpatialTarget,
     request: &ResolvedPlanarSampleRequest,
@@ -243,6 +245,7 @@ pub(crate) fn resolve_spatial_target(
             cell_size_m,
             grid_fingerprint,
             membership,
+            membership_error,
             ..
         } => {
             if matches!(operator, PlanarOperatorIR::SurfaceProjection { .. }) {
@@ -261,7 +264,12 @@ pub(crate) fn resolve_spatial_target(
             let spacing = cell_size_m.ok_or_else(|| {
                 ApiError::conflict("missing_fdm_geometry: exact cell size is unavailable")
             })?;
-            let selected = select_fdm_target(*cells, membership.as_ref(), target)?;
+            let selected = select_fdm_target(
+                *cells,
+                membership.as_ref(),
+                membership_error.as_deref(),
+                target,
+            )?;
             let carrier_identity = grid_fingerprint
                 .clone()
                 .unwrap_or_else(|| format!("fdm:{cells:?}:{origin:?}:{spacing:?}"));
@@ -339,7 +347,7 @@ pub(crate) fn resolve_spatial_target(
                     ));
                 }
             }
-            let selected = select_fdm_target(*cells, Some(membership), target)?;
+            let selected = select_fdm_target(*cells, Some(membership), None, target)?;
             build_fdm_target(
                 field,
                 *cells,
@@ -442,13 +450,14 @@ fn select_fdm_target(
     membership: Option<
         &crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
     >,
+    membership_error: Option<&str>,
     target: &MonitorTargetIR,
 ) -> Result<Vec<bool>, ApiError> {
     let count = cell_count(cells)?;
     match target {
         MonitorTargetIR::Domain => Ok(vec![true; count]),
         MonitorTargetIR::MagneticDomain => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             Ok(membership
                 .cell_membership
                 .iter()
@@ -456,7 +465,7 @@ fn select_fdm_target(
                 .collect())
         }
         MonitorTargetIR::Object { object_id } => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             let indices = resolve_fdm_object_indices(membership, object_id)?;
             Ok(mask_from_indices(count, indices))
         }
@@ -464,7 +473,7 @@ fn select_fdm_target(
             object_id,
             region_id,
         } => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             let numeric_ids = membership
                 .region_legend
                 .iter()
@@ -485,15 +494,22 @@ fn select_fdm_target(
     }
 }
 
-fn require_fdm_membership(
+fn require_fdm_membership<'a>(
     membership: Option<
-        &crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
+        &'a crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
     >,
+    membership_error: Option<&str>,
     count: usize,
-) -> Result<&crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership, ApiError>
+) -> Result<&'a crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership, ApiError>
 {
     let membership = membership.ok_or_else(|| {
-        ApiError::conflict("missing_fdm_membership: target cannot be resolved exactly")
+        // Keep the loader's exact reason (P1-11); the target still fails closed.
+        ApiError::conflict(match membership_error {
+            Some(reason) => format!(
+                "missing_fdm_membership: target cannot be resolved exactly ({reason})"
+            ),
+            None => "missing_fdm_membership: target cannot be resolved exactly".to_string(),
+        })
     })?;
     if membership.cell_membership.len() != count {
         return Err(ApiError::conflict(

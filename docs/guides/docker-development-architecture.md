@@ -567,7 +567,23 @@ wejść używa tego samego klucza receiptu. Do checkoutu wracają wyłącznie cz
 wersjonowane pliki API. Przed publikacją ponownie sprawdzane są źródła,
 kontenery, obrazy i backing wolumenów.
 
-Zmiana źródeł wymaga najpierw zwykłego restartu backendu tej grupy. Timeout
+Zmiana źródeł wymaga najpierw zwykłego restartu backendu tej grupy.
+
+Codegen wiąże się z wejściami buildu backendu: wymaga zgodności commita,
+`source_snapshot_sha256` i natywnej tożsamości źródeł z receiptem pakietu, a
+nie pełnego `source_digest` drzewa. Snapshot wyklucza ścieżki nieużywane przez
+runtime (`LIVE_RUNTIME_STATUS_EXCLUSIONS` i `LIVE_NON_RUNTIME_*` w
+`docker/all-in-one/backend_source.py`: m.in. `docs/**`, `apps/control-room/**`,
+`scripts/test_*`, `*.md`, `*.source-map.json`), a backend po samej zmianie
+takich plików weryfikuje istniejący pakiet zamiast go przebudowywać. Pełny
+skrót drzewa różniłby się wtedy trwale, choć binarka i OpenAPI są aktualne.
+Na hoście WSL z Docker Desktop źródło bind mountu ma postać
+`/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/<dystrybucja>/<sha256>`,
+gdzie skrót to SHA-256 dokładnej ścieżki checkoutu; codegen porównuje go z tą
+ścieżką. Zapieczętowane (bez bitów zapisu) binarki pakietu współdzielonego
+między grupami mogą mieć wiele hardlinków; ich zawartość jest sprawdzana
+skrótem z receiptu. Opublikowane pliki zachowują poprzedni tryb (domyślnie
+`0644`), aby usługa `frontend` mogła je czytać. Timeout
 klienta Docker nie dowodzi zakończenia zdalnego procesu generatora; receipt
 awarii zachowuje identyfikator stagingu i potrzebę uzgodnienia stanu zamiast
 usuwać potencjalnie używane dane. `generate-api-openapi-legacy` zachowuje
