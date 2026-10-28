@@ -166,7 +166,7 @@ pub async fn get_saved_field_geometry_topology(
             verify_expected_identity(&resolved, &query)?;
             let topology_hash = resolved.geometry.mesh.topology_fingerprint_v6();
             let etag_scope = saved_geometry_binary_etag_scope(&resolved);
-            let payload = fem_mesh_payload(resolved.geometry, topology_hash.clone())?;
+            let payload = saved_mesh_payload(resolved.geometry, topology_hash.clone())?;
             let max_response_bytes = parse_response_budget(&query.max_response_bytes)?;
             let estimated = estimated_fmmt_v2_len(&payload)?;
             if estimated > MAX_BINARY_RESPONSE_BYTES || estimated > max_response_bytes {
@@ -390,7 +390,7 @@ fn saved_geometry_resource(
         ));
     }
     let topology_fingerprint = resolved.geometry.mesh.topology_fingerprint_v6();
-    let topology_binary = topology_binary_identity(&resolved.geometry)?;
+    let topology_binary = mesh_topology_binary_identity(&resolved.geometry.mesh)?;
     let support_binary_byte_length =
         support_body_len(resolved.geometry.support.active_node_mask.len())?;
     let support_binary_hash =
@@ -595,7 +595,14 @@ fn parse_response_budget(value: &str) -> Result<usize, ApiError> {
     usize::try_from(parsed).map_err(|_| ApiError::bad_request("max_response_bytes is too large"))
 }
 
-fn fem_mesh_payload(
+pub(crate) fn fem_mesh_payload(
+    geometry: SavedFemP1FieldGeometry,
+    topology_fingerprint: String,
+) -> Result<fullmag_runner::FemMeshPayload, ApiError> {
+    saved_mesh_payload(geometry.into(), topology_fingerprint)
+}
+
+fn saved_mesh_payload(
     geometry: SavedFieldGeometry,
     topology_fingerprint: String,
 ) -> Result<fullmag_runner::FemMeshPayload, ApiError> {
@@ -621,10 +628,9 @@ fn fem_mesh_payload(
 }
 
 fn fem_mesh_payload_borrowed(
-    geometry: &SavedFieldGeometry,
+    mesh: &fullmag_ir::MeshIR,
     topology_fingerprint: String,
 ) -> fullmag_runner::FemMeshPayload {
-    let mesh = &geometry.mesh;
     fullmag_runner::FemMeshPayload {
         mesh_name: mesh.mesh_name.clone(),
         mesh_id: topology_fingerprint,
@@ -645,15 +651,21 @@ fn fem_mesh_payload_borrowed(
     }
 }
 
-fn topology_binary_identity(
-    geometry: &SavedFieldGeometry,
+pub(crate) fn topology_binary_identity(
+    geometry: &SavedFemP1FieldGeometry,
 ) -> Result<Option<(usize, String)>, ApiError> {
-    let topology_fingerprint = geometry.mesh.topology_fingerprint_v6();
-    let estimated = estimated_fmmt_v2_len_for_geometry(geometry)?;
+    mesh_topology_binary_identity(&geometry.mesh)
+}
+
+fn mesh_topology_binary_identity(
+    mesh: &fullmag_ir::MeshIR,
+) -> Result<Option<(usize, String)>, ApiError> {
+    let topology_fingerprint = mesh.topology_fingerprint_v6();
+    let estimated = estimated_fmmt_v2_len_for_geometry(mesh)?;
     if estimated > MAX_BINARY_RESPONSE_BYTES {
         return Ok(None);
     }
-    let payload = fem_mesh_payload_borrowed(geometry, topology_fingerprint);
+    let payload = fem_mesh_payload_borrowed(mesh, topology_fingerprint);
     let body = crate::field_store::serialize_fem_mesh_topology_binary_v2(&payload)
         .map_err(|error| ApiError::internal(format!("saved topology identity failed: {error}")))?;
     if body.len() != estimated {
@@ -685,9 +697,8 @@ fn estimated_fmmt_v2_len(mesh: &fullmag_runner::FemMeshPayload) -> Result<usize,
 }
 
 fn estimated_fmmt_v2_len_for_geometry(
-    geometry: &SavedFieldGeometry,
+    mesh: &fullmag_ir::MeshIR,
 ) -> Result<usize, ApiError> {
-    let mesh = &geometry.mesh;
     let sections = [
         (mesh.nodes.len(), 24_usize),
         (mesh.cells.types.len(), 4),
@@ -752,7 +763,7 @@ fn support_body_len(node_count: usize) -> Result<usize, ApiError> {
     })
 }
 
-fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
     if mask.is_empty() {
         return Err(ApiError::unprocessable(
             "SAVED_GEOMETRY_SUPPORT_INVALID: active-node support is empty",
@@ -786,7 +797,7 @@ fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
     Ok(body)
 }
 
-fn support_binary_identity(mask: &[bool]) -> Result<(Vec<u8>, String), ApiError> {
+pub(crate) fn support_binary_identity(mask: &[bool]) -> Result<(Vec<u8>, String), ApiError> {
     let body = encode_saved_support(mask)?;
     let hash = sha256_hex(&body);
     Ok((body, hash))

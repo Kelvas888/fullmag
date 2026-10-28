@@ -27947,6 +27947,17 @@
           "scope_kind": {
             "type": "string"
           },
+          "section": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanarSectionResource",
+                "description": "Section of the session `Default` slice; null for authored monitors."
+              }
+            ]
+          },
           "source": {
             "$ref": "#/components/schemas/PlanarSampleSourceResource"
           }
@@ -28656,6 +28667,106 @@
           }
         ]
       },
+      "PlanarSectionResource": {
+        "description": "Requested vs. resolved position of the session `Default` slice along its\nnormal. A snap to an FDM cell centre is published, never hidden.",
+        "properties": {
+          "cut_element_count": {
+            "description": "Target elements cut by the sampled FEM plane, when known.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "layer_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "layer_index": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "layer_spacing_m": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "layer_stops_m": {
+            "description": "Discrete stops along the normal (FEM node planes); empty otherwise.",
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "navigation_step_kind": {
+            "description": "`fdm_cell`, `fem_node_plane_spacing`, `median_element_height` (median\nnormal extent of the cut FEM elements; a navigation aid, not a data\nlayer) or `extent_fraction`.",
+            "type": "string"
+          },
+          "navigation_step_m": {
+            "description": "Distance moved by one layer or navigation step along the normal.",
+            "format": "double",
+            "type": "number"
+          },
+          "normal_axis": {
+            "description": "World axis of the slice normal: `x`, `y` or `z`.",
+            "type": "string"
+          },
+          "normal_max_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "normal_min_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "plane": {
+            "description": "`xy`, `xz` or `yz`.",
+            "type": "string"
+          },
+          "requested_coordinate_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "requested_fraction": {
+            "format": "double",
+            "type": "number"
+          },
+          "resolved_coordinate_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "stops_kind": {
+            "description": "`fdm_cell_layers` (snapped to a cell centre), `fem_node_planes` (on a\nswept-mesh node plane), `fem_node_planes_between` (between planes) or\n`continuous`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plane",
+          "normal_axis",
+          "requested_fraction",
+          "requested_coordinate_m",
+          "resolved_coordinate_m",
+          "stops_kind",
+          "normal_min_m",
+          "normal_max_m",
+          "navigation_step_m",
+          "navigation_step_kind",
+          "layer_stops_m"
+        ],
+        "type": "object"
+      },
       "PlanarSourceSelectionState": {
         "description": "The source selected by the session-scoped planar viewport state.\n\n`Default` is a presentation source resolved from the current domain. It is\nintentionally not a monitor identity and is never written into the scene\ndocument or the canonical Python model.",
         "oneOf": [
@@ -28854,6 +28965,25 @@
               }
             },
             "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Native layer of an FDM multilayer carrier, keyed by its canonical layer id.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "layer"
+                ],
+                "type": "string"
+              },
+              "scope_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "scope_id",
               "kind"
             ],
             "type": "object"
@@ -34239,6 +34369,59 @@
         ],
         "type": "object"
       },
+      "SavedPlaybackFemMesh": {
+        "description": "Bounded, JSON-only metadata for a saved FEM P1 playback mesh.",
+        "properties": {
+          "cell_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "facet_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "geometry_sha256": {
+            "type": "string"
+          },
+          "node_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "support_byte_length": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "support_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "topology_byte_length": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "topology_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_count",
+          "cell_count",
+          "facet_count",
+          "geometry_sha256"
+        ],
+        "type": "object"
+      },
       "SavedPlaybackResource": {
         "description": "The small JSON read model for a completed saved-result playback.",
         "properties": {
@@ -34247,14 +34430,31 @@
               "format": "double",
               "type": "number"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fem_mesh": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SavedPlaybackFemMesh",
+                "description": "Canonical FEM P1 mesh metadata. The heavy mesh and active-node mask\nremain behind the revision-pinned binary geometry endpoint."
+              }
+            ]
           },
           "grid_cells_xyz": {
             "items": {
               "minimum": 0,
               "type": "integer"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -34264,7 +34464,10 @@
               "format": "double",
               "type": "number"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "revision": {
             "description": "SHA-256 identity of the sidecar and all playback array metadata.",
@@ -34291,9 +34494,6 @@
           "schema",
           "revision",
           "name",
-          "grid_cells_xyz",
-          "cell_size_m",
-          "origin_m",
           "stages"
         ],
         "type": "object"
@@ -47283,6 +47483,24 @@
         },
         "required": [
           "pinned"
+        ],
+        "type": "object"
+      },
+      "WorkspacePlaybackGeometryQuery": {
+        "description": "Revision-pinned binary topology/support selection for saved FEM playback.",
+        "properties": {
+          "part": {
+            "description": "`topology` returns FMMT v2; `support` returns FMSP v1.",
+            "type": "string"
+          },
+          "revision": {
+            "description": "Exact revision returned by `GET /v2/workspace/items/{id}/playback`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "part"
         ],
         "type": "object"
       },
@@ -69591,6 +69809,63 @@
           },
           "422": {
             "description": "Playback metadata or frame values are invalid"
+          }
+        },
+        "tags": [
+          "workspace_items"
+        ]
+      }
+    },
+    "/v2/workspace/items/{id}/playback/geometry": {
+      "get": {
+        "operationId": "workspace_items_get_workspace_items_id_playback_geometry",
+        "parameters": [
+          {
+            "description": "Registered result item id (decimal string)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact revision returned by `GET /v2/workspace/items/{id}/playback`.",
+            "in": "query",
+            "name": "revision",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`topology` returns FMMT v2; `support` returns FMSP v1.",
+            "in": "query",
+            "name": "part",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "Revision-pinned saved FEM topology (FMMT v2) or active-node support (FMSP v1)"
+          },
+          "400": {
+            "description": "Invalid item id or geometry part"
+          },
+          "404": {
+            "description": "The item or geometry file is missing"
+          },
+          "409": {
+            "description": "The supplied playback revision is stale or the source changed during the read"
+          },
+          "422": {
+            "description": "The result has no FEM geometry or its metadata is invalid"
           }
         },
         "tags": [

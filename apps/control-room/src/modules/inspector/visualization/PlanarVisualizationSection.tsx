@@ -7,6 +7,7 @@ import type {
   PlanarFieldSource,
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
+import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   planarFieldQueryFromMeta,
@@ -18,6 +19,10 @@ import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResou
 import { isFlowMajorTensorDescriptor, tensorProjectionOutputKind } from "@/kernel/api/tensorFieldProjection";
 import { quantityCatalogEntrySpatialProjections, quantityCatalogEntrySupportsAnySpatialVisualization } from "@/kernel/api/quantityIds";
 import { useFieldCatalogResource, useQuantityCatalogResource } from "@/kernel/resources/studyRuntimeResources";
+import {
+  planarGridResolutionPresets,
+  resolvePlanarSectionGeometry,
+} from "@/kernel/visualization/planarSectionModel";
 import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { resolveVisualizationTargetFromSelection } from "@/kernel/visualization/ObjectVisualizationController";
@@ -27,6 +32,8 @@ import {
   resolvePlanarTargetWireframeStyle,
 } from "@/kernel/visualization/planarTargetPresentation";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
+import { useFieldMapSurfaceEvidenceStatus } from "@/kernel/visualization/fieldMapSurfaceStore";
+import { DIRECTION_COLORMAP } from "@/shared/visualization/directionColor";
 import { projectPlanarPresentationState } from "@/kernel/visualization/planarPresentationProjection";
 import {
   resolvePlanarInspectorCapabilities,
@@ -82,7 +89,9 @@ function capabilityReason(capability: FieldMapCapability): string | undefined {
   if (capability.enabled) return undefined;
   switch (capability.reasonCode) {
     case "fdm_scope_not_supported":
-      return "Structured FDM sampling does not support mesh-part or airbox scope.";
+      return "Structured FDM sampling does not support mesh-part scope.";
+    case "fem_layer_scope_not_supported":
+      return "Native layer scope requires an FDM multilayer carrier.";
     case "mesh_overlay_unavailable":
       return "Mesh overlay is unavailable for this sample.";
     case "occupancy_mask_unavailable":
@@ -99,8 +108,12 @@ function capabilityReason(capability: FieldMapCapability): string | undefined {
       return "The selected scalar quantity has no vector components.";
     case "quantity_not_spatial":
       return "The selected quantity is not spatially sampleable.";
+    case "airbox_carrier_unresolved":
+      return "Waiting for the backend to resolve the Airbox carrier.";
     default:
-      return "This control is unavailable for the selected planar sample.";
+      return capability.reasonCode
+        ? `Unavailable for the selected planar sample: ${capability.reasonCode}`
+        : "This control is unavailable for the selected planar sample.";
   }
 }
 
@@ -119,6 +132,7 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
   const coverage = planarVisualizationCoverage(selection);
   const viewScope = planarViewScopeForSelection(selection);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const surfaceEvidence = useFieldMapSurfaceEvidenceStatus();
   const monitors = usePlanarMonitorsResource({ enabled: coverage.supported });
   const domain = useDomainMetaResource({ enabled: coverage.supported });
   const fieldCatalog = useFieldCatalogResource({ enabled: coverage.supported });
@@ -138,12 +152,13 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
    * canonical query key, while the React compiler cannot prove the derived
    * presentation object is immutable. */
   /* eslint-disable react-hooks/preserve-manual-memoization */
+  const defaultSliceKey = planar ? JSON.stringify(planar.default_slice) : undefined;
   const source = useMemo<PlanarFieldSource>(() => {
     if (planarSourceKey !== "default" && planarSourceKey.length > 0) {
       return { kind: "monitor", monitorId: planarSourceKey };
     }
-    return { kind: "default" };
-  }, [planarSourceKey]);
+    return { kind: "default", sliceKey: defaultSliceKey };
+  }, [defaultSliceKey, planarSourceKey]);
   /* eslint-enable react-hooks/preserve-manual-memoization */
   const sourceValue = source.kind === "default" ? "default" : source.monitorId;
   const quantityId = planar?.quantity_id ?? "";
@@ -190,6 +205,21 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
       Boolean(quantityCatalog.data.quantities.find((entry) => entry.id === quantity.quantity_id &&
         quantityCatalogEntrySupportsAnySpatialVisualization(entry)))),
   );
+  const vectorQuantity = (selectedDescriptor?.components ?? 3) > 1;
+  const paletteItems = vectorQuantity
+    ? [{ label: "Direction (HSL, mumax3)", value: DIRECTION_COLORMAP }, ...SCALAR_COLOR_PALETTE_ITEMS]
+    : SCALAR_COLOR_PALETTE_ITEMS;
+  // P1-08: "Live" requires the mounted 2D surface to prove meta + scalar +
+  // raster identity; metadata alone is not a rendered frame.
+  const dataState = surfaceEvidence === "ready"
+    ? "Live"
+    : surfaceEvidence === "error"
+      ? "Error"
+      : surfaceEvidence === "loading"
+        ? "Loading frame"
+        : meta.status === "ready"
+          ? "Metadata only (2D view closed)"
+          : meta.status;
 
   if (!coverage.supported) {
     return <InspectorGroup title="2D visualization"><FieldRow label="Availability" value="Not a spatial target" /><FieldRow label="Reason" value="quantity_or_target_not_spatial" /></InspectorGroup>;
@@ -234,6 +264,11 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
   const vectorStyle = planar.vector_style;
   const interaction = planar.interaction;
   const quality = planar.quality;
+  const resolutionPresets = source.kind === "default"
+    ? planarGridResolutionPresets(
+        resolvePlanarSectionGeometry(domain.data, planar.default_slice.plane),
+      )
+    : [];
   const capabilities = resolvePlanarInspectorCapabilities({
     descriptor: meta.data
       ? {
@@ -245,6 +280,7 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
       : null,
     discretization,
     metaAvailable: meta.status === "ready" && meta.data !== null,
+    metaErrorCode: meta.error instanceof ControlRoomApiError ? meta.error.code : null,
     occupancyAvailable: mask.status === "ready" && mask.data !== null,
     component: planar.component,
     quantity: selectedDescriptor,
@@ -289,7 +325,7 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
           <option value="default">Default</option>
           <optgroup label="Monitors">{(monitors.data?.monitors ?? []).map((monitor) => <option key={monitor.id} value={monitor.id}>{monitor.name}</option>)}</optgroup>
         </FormField>
-        {source.kind === "default" ? <DefaultPlanarSourceSection defaultSlice={planar.default_slice} domain={domain.data} patch={patch} /> : null}
+        {source.kind === "default" ? <DefaultPlanarSourceSection defaultSlice={planar.default_slice} domain={domain.data} patch={patch} section={meta.data?.section ?? null} /> : null}
       </div>
     </InspectorGroup>
   );
@@ -298,11 +334,11 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
       collapsible
       defaultOpen={false}
       icon={<Palette size={16} strokeWidth={1.75} />}
-      summary={`${SCALAR_COLOR_PALETTE_ITEMS.find((item) => item.value === planar.colormap)?.label ?? planar.colormap} • ${range.mode === "auto" ? "Auto range" : range.mode === "manual" ? "Manual range" : "Symmetric range"}`}
+      summary={`${paletteItems.find((item) => item.value === planar.colormap)?.label ?? planar.colormap} • ${range.mode === "auto" ? "Auto range" : range.mode === "manual" ? "Manual range" : "Symmetric range"}`}
       title="Surface Coloring"
       variant="nav"
     >
-      <FormField disabled={!capabilities.raster.enabled} hint={scalarReason} label="Color map" type="select" value={planar.colormap} onChange={(event) => patch({ colormap: event.currentTarget.value })}>{SCALAR_COLOR_PALETTE_ITEMS.map((palette) => <option key={palette.value} value={palette.value}>{palette.label}</option>)}</FormField>
+      <FormField disabled={!capabilities.raster.enabled} hint={scalarReason} label="Color map" type="select" value={planar.colormap} onChange={(event) => patch({ colormap: event.currentTarget.value })}>{paletteItems.map((palette) => <option key={palette.value} value={palette.value}>{palette.label}</option>)}</FormField>
       {displayUnitItems.length > 1 ? <FormField disabled={!capabilities.raster.enabled} hint={scalarReason} label="Display unit" type="select" value={planar.display_unit ?? displayUnitItems[0]?.value ?? ""} onChange={(event) => patch({ display_unit: event.currentTarget.value || null })}>{displayUnitItems.map((unit) => <option key={unit.value} value={unit.value}>{unit.label}</option>)}</FormField> : <FieldRow label="Unit" value={canonicalUnit || "dimensionless"} />}
       <FormField disabled={!capabilities.raster.enabled} hint={scalarReason} label="Range mode" type="select" value={range.mode} onChange={(event) => patch({ range: planarRangeForMode(event.currentTarget.value as PlanarRange["mode"], range) })}>{PLANAR_RANGE_MODE_ITEMS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</FormField>
       {range.mode === "manual" ? <><FormField disabled={!capabilities.raster.enabled} error={validationError ?? undefined} hint={scalarReason} label="Range minimum" type="number" value={range.min ?? ""} onChange={(event) => updateManualRange("min", event.currentTarget.value)} /><FormField disabled={!capabilities.raster.enabled} error={validationError ?? undefined} hint={scalarReason} label="Range maximum" type="number" value={range.max ?? ""} onChange={(event) => updateManualRange("max", event.currentTarget.value)} /></> : null}
@@ -314,11 +350,11 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group">
       <VisualizationInspectorOverview
-        advanced={<PlanarQualitySection capability={capabilities.raster} interaction={interaction} patch={patch} quality={quality} resolution={planar.resolution} />}
+        advanced={<PlanarQualitySection capability={capabilities.raster} interaction={interaction} patch={patch} quality={quality} resolution={planar.resolution} resolutionPresets={resolutionPresets} />}
         camera={<p className="m-0 text-fm-help leading-snug text-fm-muted">Pan and zoom follow the planar viewport.</p>}
         clipping={<p className="m-0 text-fm-help leading-snug text-fm-muted">The active plane and slice position are controlled in Source &amp; Slice.</p>}
         context={sourceAndSlice}
-        dataState={meta.status === "ready" ? "Live" : meta.status}
+        dataState={dataState}
         display={<><PlanarDisplayPassesSection capabilities={capabilities} layers={planar.layers} patch={patch} visible={planar.visible} /><VisualizationRenderModeControl disabled={!planar.visible} options={renderModeOptions} value={resolvePlanarDisplayMode(planar.layers)} onValueChange={(mode) => patch(planarDisplayModePatch(mode, planar.layers))} /><FormField label="Quantity" type="select" value={quantityId} onChange={(event) => { const next = event.currentTarget.value; const entry = quantityCatalog.data?.quantities.find((entry) => entry.id === next); const options = quantityCatalogEntrySpatialProjections(entry); if (isFlowMajorTensorDescriptor(entry?.tensor) && options.length === 0) return; patch({ component: options.find((option) => option.value === "frobenius")?.value ?? options[0]?.value ?? "magnitude", quantity_id: next, ...(isFlowMajorTensorDescriptor(entry?.tensor) ? { layers: { ...planar.layers, vectors: false } } : {}) }); }}>{availableQuantities.map((quantity) => <option key={quantity.quantity_id} value={quantity.quantity_id}>{quantity.label} ({quantity.unit || "1"})</option>)}</FormField><FormField label="Component" type="select" value={planar.component} onChange={(event) => { const component = event.currentTarget.value as PlanarState["component"]; if (tensor != null && !tensorOptions.some((option) => option.value === component)) return; patch({ component, ...(isFlowMajorTensorDescriptor(tensor) && tensorProjectionOutputKind(component) !== "vector" ? { layers: { ...planar.layers, vectors: false } } : {}) }); }}>{componentItems.map((component) => <option key={component.value} value={component.value}>{component.label}</option>)}</FormField></>}
         enabledPassCount={enabledPassCount}
         meshState={capabilities.mesh.enabled ? "Ready" : "Degraded"}

@@ -30,6 +30,7 @@ mod script_source_capture;
 mod accepted_script_run;
 mod run_manifest;
 mod runtime_service_client;
+mod retained_snapshot_validation;
 mod container_recovery_capabilities;
 mod runtime_supervisor;
 mod saved_fem_snapshot_gate;
@@ -231,6 +232,24 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&runtime_service_client::recover_unknown_empty(
                     &config,
+                    &request,
+                    &request_sha256,
+                )?)?
+            );
+        }
+        Command::Runtime(RuntimeCommand::ValidateRetainedSnapshot {
+            store,
+            config,
+            config_sha256,
+            request,
+            request_sha256,
+        }) => {
+            println!(
+                "{}",
+                serde_json::to_string(&retained_snapshot_validation::validate(
+                    &store,
+                    &config,
+                    &config_sha256,
                     &request,
                     &request_sha256,
                 )?)?
@@ -1972,6 +1991,40 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Runtime(RuntimeCommand::Doctor)
+        ));
+    }
+
+    #[test]
+    fn cli_parses_read_only_retained_snapshot_validation() {
+        let cli = Cli::try_parse_from([
+            "fullmag",
+            "runtime",
+            "validate-retained-snapshot",
+            "--store",
+            "/snapshot/state/runs/docker-all/session-store",
+            "--config",
+            "/snapshot/config/runtime.json",
+            "--config-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--request",
+            "/snapshot/request.json",
+            "--request-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .expect("cli parse");
+        assert!(matches!(
+            cli.command,
+            Command::Runtime(RuntimeCommand::ValidateRetainedSnapshot {
+                store,
+                config,
+                config_sha256,
+                request,
+                request_sha256,
+            }) if store == std::path::Path::new("/snapshot/state/runs/docker-all/session-store")
+                && config == std::path::Path::new("/snapshot/config/runtime.json")
+                && config_sha256 == "a".repeat(64)
+                && request == std::path::Path::new("/snapshot/request.json")
+                && request_sha256 == "b".repeat(64)
         ));
     }
 

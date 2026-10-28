@@ -1689,7 +1689,16 @@ def _parse_saved_playback_result(
     if (payload.get("script_sha256") != expected_script_sha256
             or not SHA256_RE.fullmatch(expected_script_sha256)):
         raise BuildControlError("Saved Playback helper source hash differs from the admitted script")
-    if payload.get("frame_indices") != [0, 400, 800]:
+    geometry_kind = payload.get("geometry_kind", "fdm")
+    if geometry_kind not in {"fdm", "fem"}:
+        raise BuildControlError("Saved Playback geometry kind is unsupported")
+    expected_indices = [0, 400, 800]
+    if geometry_kind == "fem":
+        frame_count = payload.get("frame_count")
+        if type(frame_count) is not int or not 3 <= frame_count <= 100_000:
+            raise BuildControlError("Saved FEM Playback frame count is invalid")
+        expected_indices = [0, (frame_count - 1) // 2, frame_count - 1]
+    if payload.get("frame_indices") != expected_indices:
         raise BuildControlError("Saved Playback helper did not inspect first, midpoint, and last frames")
     frame_hashes = payload.get("frame_sha256")
     if (not isinstance(frame_hashes, list)

@@ -159,6 +159,7 @@ set(FEM_SOURCES
     cpu/mfem/runtime/backend_lifecycle.cpp
     cpu/mfem/runtime/backend_step.cpp
     cpu/mfem/runtime/cpu_threads.cpp
+    cpu/mfem/runtime/hypre_host_policy.cpp
     cpu/mfem/runtime/eigen_dense.cpp
     cpu/mfem/runtime/field_refresh.cpp
     gpu/cuda/runtime/gpu_state_runtime.cpp

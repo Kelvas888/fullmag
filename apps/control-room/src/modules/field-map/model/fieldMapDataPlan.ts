@@ -7,7 +7,7 @@ import type {
 
 import { planarScopeCapability } from "./fieldMapCapabilities";
 
-export type FieldMapViewScopeKind = "monitor_target" | "mesh_part" | "airbox";
+export type FieldMapViewScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer";
 
 /** The planar profile is the source of truth for scope identity. */
 export interface FieldMapViewScope {
@@ -31,6 +31,8 @@ export interface FieldMapDataPlanInput {
   projectionAllowed?: boolean;
   resolution: readonly [number, number];
   showVectors: boolean;
+  /** The raster is coloured by vector direction, which needs the vector payload. */
+  colorByDirection?: boolean;
   snapshotId?: string | null;
   stageId?: string | null;
   vectorBudget: number;
@@ -60,10 +62,13 @@ export function buildFieldMapDataPlan(
   });
   const projectionAllowed = input.projectionAllowed !== false;
   const unavailableReason = !scope.enabled
-    ? "structured FDM grid planar sampling does not support mesh-part or airbox scopes."
+    ? scope.reasonCode === "fem_layer_scope_not_supported"
+      ? "native layer scope requires an FDM multilayer carrier."
+      : "structured FDM grid planar sampling does not support mesh-part scope."
     : !projectionAllowed ? "The selected tensor projection is not available in the canonical catalog." : null;
-  const enabled =
-    input.active && scope.enabled && projectionAllowed;
+  const enabled = input.active && scope.enabled && projectionAllowed;
+  const needsVectors = tensorProjectionOutputKind(input.component) !== "scalar" &&
+    (input.showVectors || input.colorByDirection === true);
   const availability: FieldMapDataPlanAvailability = !scope.enabled || !projectionAllowed
     ? "not-applicable"
     : enabled
@@ -80,19 +85,21 @@ export function buildFieldMapDataPlan(
       quality: input.quality,
       resolution_x: input.resolution[0],
       resolution_y: input.resolution[1],
-      // The v2 contract only accepts an id for mesh_part. In particular,
-      // monitor_target and airbox must not receive a guessed id.
+      // The v2 contract only accepts an id for mesh_part and layer. In
+      // particular, monitor_target and airbox must not receive a guessed id.
       scope_id:
-        viewScope.kind === "mesh_part" ? viewScope.scope_id ?? undefined : undefined,
+        viewScope.kind === "mesh_part" || viewScope.kind === "layer"
+          ? viewScope.scope_id ?? undefined
+          : undefined,
       scope_kind: viewScope.kind,
       snapshot_id: input.snapshotId ?? undefined,
       stage_id: input.stageId ?? undefined,
-      vector_budget: input.showVectors ? input.vectorBudget : 0,
+      vector_budget: needsVectors ? input.vectorBudget : 0,
     },
     requestMask: enabled,
     requestMesh: enabled && input.includeMesh,
     requestScalar: enabled,
-    requestVectors: enabled && tensorProjectionOutputKind(input.component) !== "scalar" && input.showVectors,
+    requestVectors: enabled && needsVectors,
     unavailableReason,
   };
 }

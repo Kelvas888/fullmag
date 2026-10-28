@@ -407,6 +407,20 @@ pub(crate) enum RuntimeCommand {
         #[arg(long)]
         request_sha256: String,
     },
+    /// Validate a retained runtime snapshot without changing the runtime or store.
+    #[command(name = "validate-retained-snapshot")]
+    ValidateRetainedSnapshot {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        request_sha256: String,
+    },
     /// Report recovery request support without opening a store or config.
     #[command(name = "service-container-recovery-capabilities", hide = true)]
     ServiceContainerRecoveryCapabilities,

@@ -35,6 +35,8 @@ pub mod retained_terminal_runs;
 pub mod retained_attempt_histories;
 pub mod retained_held_manual_runs;
 pub mod container_recovery_proof;
+mod retained_snapshot;
+pub use retained_snapshot::validate_retained_snapshot;
 
 pub const RUNTIME_SERVICE_OWNER_SCHEMA: &str = "runtime_service_owner.v1";
 pub const RUNTIME_SERVICE_CONFIG_SCHEMA_V1: &str = "runtime_service_config.v1";
@@ -551,9 +553,10 @@ fn retained_manual_held_run_ids(
     Ok(ids)
 }
 
-/// Invoked under the existing native startup/launch/owner/store/ledger guards.
-/// Preserve each run, start release and checkpoint exactly as found; only the
-/// caller's established owner-to-Failed recovery transition may write state.
+/// Recovery callers invoke this under the native startup/launch/owner/store/
+/// ledger guards. Read-only inspection may also use it against an isolated,
+/// stable snapshot. It preserves every run, start release and checkpoint;
+/// only a recovery caller's later owner transition may write state.
 fn validate_manual_held_union(
     store: &SessionStore,
     terminal: &[retained_terminal_runs::RetainedTerminalRunPin],
@@ -2784,20 +2787,11 @@ fn require_retained_cancelled_runtime_store(
     config: &RuntimeServiceConfig,
     pins: &[retained_cancelled_runs::RetainedCancelledRunPin],
 ) -> Result<()> {
-    for relative in [
-        "manifests",
-        "live_command_journals",
-        "recovery",
-        "temp",
-    ] {
-        require_empty_store_namespace(store, relative)?;
-    }
-    require_empty_batch_namespace(store)?;
     let retained_run_ids = pins
         .iter()
         .map(|pin| pin.run_id.clone())
         .collect::<BTreeSet<_>>();
-    require_runtime_recovery_scheduler_state(store, config, Some(&retained_run_ids))
+    require_retained_runtime_store_for_run_ids(store, config, &retained_run_ids)
 }
 
 fn require_retained_terminal_runtime_store(
@@ -2805,15 +2799,23 @@ fn require_retained_terminal_runtime_store(
     config: &RuntimeServiceConfig,
     pins: &[retained_terminal_runs::RetainedTerminalRunPin],
 ) -> Result<()> {
-    for relative in ["manifests", "live_command_journals", "recovery", "temp"] {
-        require_empty_store_namespace(store, relative)?;
-    }
-    require_empty_batch_namespace(store)?;
     let retained_run_ids = pins
         .iter()
         .map(|pin| pin.run_id.clone())
         .collect::<BTreeSet<_>>();
-    require_runtime_recovery_scheduler_state(store, config, Some(&retained_run_ids))
+    require_retained_runtime_store_for_run_ids(store, config, &retained_run_ids)
+}
+
+fn require_retained_runtime_store_for_run_ids(
+    store: &SessionStore,
+    config: &RuntimeServiceConfig,
+    retained_run_ids: &BTreeSet<String>,
+) -> Result<()> {
+    for relative in ["manifests", "live_command_journals", "recovery", "temp"] {
+        require_empty_store_namespace(store, relative)?;
+    }
+    require_empty_batch_namespace(store)?;
+    require_runtime_recovery_scheduler_state(store, config, Some(retained_run_ids))
 }
 
 fn require_runtime_recovery_scheduler_state(
@@ -5849,7 +5851,8 @@ mod container_recovery_contract_tests {
     };
     use crate::{
         FmsPreparationResourcePool, FmsResourceBudget, FmsResourceKind,
-        FmsSchedulerResourcePool, FMS_PREPARATION_RESOURCE_POOL_SCHEMA,
+        FmsSchedulerPoolCheckpoint, FmsSchedulerResourcePool, FmsSchedulerRunSource,
+        FMS_PREPARATION_RESOURCE_POOL_SCHEMA, FMS_SCHEDULER_POOL_CHECKPOINT_SCHEMA,
         FMS_SCHEDULER_RESOURCE_POOL_SCHEMA,
     };
     use tempfile::TempDir;
@@ -6404,6 +6407,74 @@ mod container_recovery_contract_tests {
         .is_err());
         assert!(!store.accepted_run_start_permitted("held-first").unwrap());
         assert!(!store.accepted_run_start_permitted("held-second").unwrap());
+    }
+
+    #[test]
+    fn retained_snapshot_validation_is_read_only_and_returns_sorted_run_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let config = executable_config(&store);
+        let second = write_held_run(&store, "held-z");
+        let first = write_held_run(&store, "held-a");
+        store
+            .commit_scheduler_resource_pool(
+                0,
+                &FmsSchedulerResourcePool {
+                    schema_version: FMS_SCHEDULER_RESOURCE_POOL_SCHEMA.into(),
+                    pool_id: config.compute_pool_id.clone(),
+                    generation: 1,
+                    resources: config.compute_resources.clone(),
+                },
+            )
+            .unwrap();
+        store
+            .commit_preparation_resource_pool(
+                0,
+                &FmsPreparationResourcePool {
+                    schema_version: FMS_PREPARATION_RESOURCE_POOL_SCHEMA.into(),
+                    pool_id: config.preparation_pool_id.clone(),
+                    generation: 1,
+                    resources: config.preparation_resources.clone(),
+                },
+            )
+            .unwrap();
+        let held_runs = [second, first];
+        let mut preparation_checkpoint = FmsSchedulerPoolCheckpoint {
+            schema_version: FMS_SCHEDULER_POOL_CHECKPOINT_SCHEMA.into(),
+            pool_id: config.preparation_pool_id.clone(),
+            sequence: 1,
+            run_source: FmsSchedulerRunSource::Store,
+            run_ids: vec!["held-z".into()],
+            next_run_id: Some("held-z".into()),
+        };
+        store
+            .commit_preparation_scheduler_pool_checkpoint(0, &preparation_checkpoint)
+            .unwrap();
+
+        let run_ids = validate_retained_snapshot(&store, &config, &[], &held_runs).unwrap();
+
+        assert_eq!(run_ids, vec!["held-a", "held-z"]);
+        preparation_checkpoint.sequence = 2;
+        preparation_checkpoint.run_ids = vec!["unknown-run".into()];
+        preparation_checkpoint.next_run_id = Some("unknown-run".into());
+        store
+            .commit_preparation_scheduler_pool_checkpoint(1, &preparation_checkpoint)
+            .unwrap();
+        assert!(validate_retained_snapshot(&store, &config, &[], &held_runs).is_err());
+        assert!(!store
+            .root()
+            .join(RUNTIME_SERVICE_OWNER_DESCRIPTOR_PATH)
+            .exists());
+        assert!(!store.root().join(RUNTIME_SERVICE_OWNER_LOCK_PATH).exists());
+        assert!(!store.root().join("shared-host-ledger").exists());
+        assert!(!store
+            .root()
+            .join("runs/held-a/start_release.json")
+            .exists());
+        assert!(!store
+            .root()
+            .join("runs/held-z/start_release.json")
+            .exists());
     }
 
     #[test]

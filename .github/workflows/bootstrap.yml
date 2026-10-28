@@ -176,13 +176,19 @@ jobs:
       - name: Run disconnected mixed-P1 v2 API summary contracts
         run: cargo test -p fullmag-api --bin fullmag-api mixed_v2_summary_tests --no-fail-fast
 
+      - name: Run read-only retained snapshot validation contracts
+        run: |
+          cargo test -p fullmag-session --lib retained_snapshot --no-fail-fast
+          cargo test -p fullmag-cli --bin fullmag retained_snapshot --no-fail-fast
+          cargo test -p fullmag-api --bin fullmag-api isolated_snapshot --no-fail-fast
+
       - name: Run native container recovery capability CLI contracts
         run: cargo test -p fullmag-cli --bin fullmag container_recovery_capabilities
 
-      - name: Verify read-only saved FDM playback and binary frame routes
+      - name: Verify read-only saved FDM/FEM playback and binary frame routes
         run: |
           cargo test --locked -p fullmag-workspace-inspect --lib
-          cargo test --locked -p fullmag-api --bin fullmag-api saved_playback_routes_return_metadata_and_revision_checked_binary_frames
+          cargo test --locked -p fullmag-api --bin fullmag-api saved_playback_
 
       - name: Run instance discovery contracts (ADR 0069)
         run: cargo test -p fullmag-api --bin fullmag-api instance_discovery::tests --no-fail-fast
@@ -833,6 +839,7 @@ jobs:
       - name: Verify Docker storage probes and runtime lifecycle contracts
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_fem_cpu_hypre_host_policy.py -v
           python -B scripts/test_docker_backend_dev.py -v
           python -B scripts/test_docker_shared_build_storage.py -v
           python -B scripts/test_backend_shared_store.py -v
@@ -853,6 +860,13 @@ jobs:
           python -B scripts/test_docker_volume_container_recovery.py -v
           python -B scripts/test_linux_native_device_preparation.py -v
           python -B scripts/test_docker_linux_host_readmission.py -v
+          python -B scripts/test_docker_isolated_sqlite_snapshot.py -v
+          python -B scripts/test_docker_isolated_snapshot_copy.py -v
+          python -B scripts/test_docker_isolated_snapshot_namespace.py -v
+          python -B scripts/test_docker_isolated_session_recovery.py -v
+          python -B scripts/test_docker_isolated_sqlite_fence.py -v
+          python -B scripts/test_docker_isolated_control_snapshot.py -v
+          python -B scripts/test_runtime_service_snapshot.py -v
           python -B scripts/test_docker_volume_abrupt_stop_recovery.py -v
           python -B scripts/test_docker_windows_bind_isolation.py -v
           python -B scripts/test_docker_prepare_container_recovery.py -v
