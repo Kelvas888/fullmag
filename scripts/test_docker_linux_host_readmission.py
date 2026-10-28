@@ -382,6 +382,35 @@ class DockerLinuxHostReadmissionTests(unittest.TestCase):
         )
 
 
+    def test_known_state_alias_and_its_relatives_never_bypass_raw_overlap(self):
+        alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/" + "a" * 64
+        for source in (alias, alias + "/runs", alias.rsplit("/", 1)[0]):
+            calls = []
+            def canonicalize(_item):
+                calls.append("canonical")
+                return {source: "/independent/store"}
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "retained Linux state"):
+                readmission._assert_no_live_consumers(
+                    [{"Id": "9" * 64, "Mounts": [{"Type": "bind", "Source": source,
+                        "Destination": "/data", "RW": True}]}],
+                    state_paths=["/storage/fullmag"], state_alias_sources=[alias],
+                    control_volume="control-vol", ledger_mounts={("volume", "ledger-vol")},
+                    allowed_ids=set(), canonicalize_foreign=canonicalize,
+                )
+            self.assertEqual(calls, [], "raw protected overlap must precede any resolver")
+
+    def test_desktop_drive_paths_are_not_local_posix_disjoint_proof(self):
+        for source in ("/run/desktop/mnt/host/c/work", "/run/desktop/mnt/host/e/storage",
+                       "/host_mnt/c/work", "/mnt/host/e/storage", "/run/desktop/mnt/host",
+                       "//host_mnt/c/work", "//run/desktop/mnt/host/c/work"):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "Windows.*unresolved|unsafe"):
+                readmission._assert_no_live_consumers(
+                    [{"Id": "9" * 64, "Mounts": [{"Type": "bind", "Source": source,
+                        "Destination": "/data", "RW": True}]}],
+                    state_paths=["/storage/fullmag"], control_volume="control-vol",
+                    ledger_mounts={("volume", "ledger-vol")}, allowed_ids=set(),
+                )
+
     def test_foreign_wsl_alias_requires_readonly_canonical_mapping(self):
         alias = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Other/hash/state"
         container = {"Id": "9" * 64, "Mounts": [

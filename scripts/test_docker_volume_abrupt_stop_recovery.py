@@ -212,6 +212,20 @@ class AbruptStopTests(unittest.TestCase):
                 with self.assertRaisesRegex(r.ContainerRecoveryError,'foreign Docker container references|unresolved storage identity'):
                     r._assert_no_foreign_storage_consumers(SimpleNamespace(),b,f,compose)
 
+    def test_desktop_drive_paths_do_not_bypass_abrupt_consumer_fence(self):
+        proof, _, compose = self.fixture()
+        backend, frontend = proof['containers'].values()
+        for source in ('/run/desktop/mnt/host/c/work', '/run/desktop/mnt/host/e/storage',
+                       '/host_mnt/c/work', '/mnt/host/e/storage', '/run/desktop/mnt/host',
+                       '//host_mnt/c/work', '//run/desktop/mnt/host/c/work'):
+            foreign = {'Id': 'a' * 64, 'Mounts': [{'Type': 'bind', 'Source': source,
+                       'Destination': '/data', 'RW': True}]}
+            with self.subTest(source=source), patch.object(r, 'docker_capture', side_effect=[
+                    SimpleNamespace(stdout=('a' * 64).encode()),
+                    SimpleNamespace(stdout=json.dumps([foreign]).encode())]):
+                with self.assertRaisesRegex(r.ContainerRecoveryError, 'Windows.*unresolved|unsafe'):
+                    r._assert_no_foreign_storage_consumers(SimpleNamespace(), backend, frontend, compose)
+
     def test_unknown_foreign_alias_uses_only_exact_disjoint_proof_and_keeps_other_guards(self):
         proof, _, compose = self.fixture()
         backend, frontend = proof['containers'].values()
