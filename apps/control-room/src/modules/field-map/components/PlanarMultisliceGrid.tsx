@@ -70,8 +70,8 @@ export function PlanarMultisliceGrid(props: PlanarMultisliceGridProps) {
       >
         {props.positionFractions.map((fraction, index) => (
           <PlanarMultislicePanel
-            // Panels are positional; a changed fraction refetches in place.
-            key={index}
+            // A panel is its slot plus position: a new fraction is a new sample.
+            key={`${index}:${fraction}`}
             fraction={fraction}
             index={index}
             onExtent={onExtent}
