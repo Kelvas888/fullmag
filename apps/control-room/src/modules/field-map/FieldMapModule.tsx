@@ -36,6 +36,12 @@ import {
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { projectPlanarPresentationState } from "@/kernel/visualization/planarPresentationProjection";
 import {
+  PLANAR_VECTOR_CARRIER_COMPONENT,
+  derivePlanarComponentScalar,
+  isClientDerivablePlanarComponent,
+  resolvePlanarComponentDerivation,
+} from "./model/planarComponentDerivation";
+import {
   objectSectionLayers,
   planarSectionAxes,
   resolvePlanarSectionGeometry,
@@ -67,6 +73,8 @@ import {
 } from "./model/planarAxisModel";
 import {
   createPlanarEvidence,
+  planarRenderIdentity,
+  planarRenderScalarIdentity,
   resolvePlanarEvidenceStatus,
   type PlanarEvidenceStatus,
   type PlanarRenderEvidence,
@@ -91,7 +99,7 @@ function useFieldMapModuleController() {
   const active = layout.get().activeViewportMainModuleId === "field-map";
   const visualization = useVisualizationStateResource({ enabled: active });
   const canonicalPlanar = visualization.data?.planar;
-  const presentationPlanar = useMemo(
+  const presentationBase = useMemo(
     () => projectPlanarPresentationState(
       visualization.data,
       visualization.optimisticData,
@@ -99,7 +107,7 @@ function useFieldMapModuleController() {
     [visualization.data, visualization.optimisticData],
   );
   const activePinned = canonicalPlanar?.visible !== false && canonicalPlanar?.layers.probes ? pinned : null;
-  const activeRenderEvidence = presentationPlanar?.visible !== false && presentationPlanar?.layers.raster ? renderEvidence : null;
+  const activeRenderEvidence = presentationBase?.visible !== false && presentationBase?.layers.raster ? renderEvidence : null;
   const canonicalSourceKind = canonicalPlanar?.source.kind;
   const canonicalSourceMonitorId = canonicalSourceKind === "monitor"
     ? canonicalPlanar?.source.monitor_id
@@ -146,7 +154,7 @@ function useFieldMapModuleController() {
       left.target?.kind === right.target?.kind,
   });
   const effectiveWireframeStyle = useMemo(() => {
-    if (!presentationPlanar) return undefined;
+    if (!presentationBase) return undefined;
     const target = selectedFieldContext.target;
     if (
       !target ||
@@ -155,15 +163,15 @@ function useFieldMapModuleController() {
         visualization.data?.targets,
       ) !== undefined
     ) {
-      return presentationPlanar.wireframe_style;
+      return presentationBase.wireframe_style;
     }
     return resolvePlanarTargetWireframeStyle(
-      presentationPlanar.wireframe_style,
-      presentationPlanar.target_overrides,
+      presentationBase.wireframe_style,
+      presentationBase.target_overrides,
       target,
     );
   }, [
-    presentationPlanar,
+    presentationBase,
     selectedFieldContext.target,
     visualization.data?.targets,
   ]);
@@ -191,6 +199,30 @@ function useFieldMapModuleController() {
   const selectedQuantity = quantityCatalog.data?.quantities.find(
     (entry) => entry.id === canonicalPlanar?.quantity_id,
   );
+  // D2D-12: x/y/z/|v| of a vector plane sample are derived from its vectors,
+  // so a component switch is presentation (no new sample, 0 requests).
+  const componentDerivation = resolvePlanarComponentDerivation({
+    component: canonicalPlanar?.component,
+    operatorKind: canonicalSourceKind === "default" ? canonicalPlanar?.default_slice.operator.kind : null,
+    quantity: selectedQuantity,
+  });
+  const clientComponents = componentDerivation === "client";
+  const presentationPlanar = useMemo(
+    () => projectPlanarPresentationState(
+      visualization.data,
+      visualization.optimisticData,
+      {
+        clientComponent: (authoritative, optimistic) => clientComponents &&
+          isClientDerivablePlanarComponent(authoritative) &&
+          isClientDerivablePlanarComponent(optimistic),
+      },
+    ),
+    [clientComponents, visualization.data, visualization.optimisticData],
+  );
+  const displayComponent = presentationPlanar?.component ?? "";
+  // One carrier sample feeds every client-side component raster, so the
+  // rendered frame identity must name the component it shows.
+  const componentPresentationKey = clientComponents ? `component=${displayComponent}` : null;
   const requiresTensorProjection = selectedQuantity?.tensor != null ||
     selectedQuantity?.shape === "tensor_field" ||
     normalizeTensorProjection(canonicalPlanar?.component) !== null;
@@ -200,7 +232,7 @@ function useFieldMapModuleController() {
   const plan = useMemo(
     () => buildFieldMapDataPlan({
       active: active && canonicalPlanar !== undefined && canonicalPlanar.visible !== false,
-      component: canonicalPlanar?.component ?? "",
+      component: clientComponents ? PLANAR_VECTOR_CARRIER_COMPONENT : canonicalPlanar?.component ?? "",
       discretization:
         domain.data?.discretization ?? runtime ?? null,
       includeMesh: (canonicalPlanar?.layers.mesh ?? false) || (canonicalPlanar?.layers.boundaries ?? false),
@@ -213,7 +245,7 @@ function useFieldMapModuleController() {
         canonicalPlanar?.resolution.height ?? 0,
       ],
       showVectors: canonicalPlanar?.layers.vectors ?? false,
-      colorByDirection: isDirectionColormap(canonicalPlanar?.colormap),
+      colorByDirection: isDirectionColormap(canonicalPlanar?.colormap) || clientComponents,
       snapshotId: selectedFieldContext.snapshotId,
       stageId: selectedFieldContext.stageId,
       viewScope: canonicalPlanar?.view_scope,
@@ -221,6 +253,7 @@ function useFieldMapModuleController() {
     }),
     [
       active,
+      clientComponents,
       domain.data?.discretization,
       canonicalPlanar,
       projectionAllowed,
@@ -296,7 +329,7 @@ function useFieldMapModuleController() {
         : null,
     [meta.data],
   );
-  const component = canonicalPlanar?.component ?? "";
+  const component = clientComponents ? displayComponent : canonicalPlanar?.component ?? "";
   const quantityId = canonicalPlanar?.quantity_id ?? "";
   const onRenderEvidence = useCallback(
     (next: PlanarRenderEvidence) => setRenderEvidence(next),
@@ -353,13 +386,15 @@ function useFieldMapModuleController() {
   // Decode binary payloads once per resource revision. Presentation-only
   // updates (pan, zoom, styles) must reuse the same typed arrays so the worker
   // does not recolour the raster on every pointer event.
-  const scalarValues = useMemo(
-    () => (scalar.data ? decodeFieldVector(scalar.data.data).values : null),
-    [scalar.data],
-  );
   const worldVectorValues = useMemo(
     () => (vectors.data ? decodeFieldVector(vectors.data).values : null),
     [vectors.data],
+  );
+  const scalarValues = useMemo(
+    () => clientComponents && worldVectorValues && isClientDerivablePlanarComponent(displayComponent)
+      ? derivePlanarComponentScalar(worldVectorValues, displayComponent)
+      : scalar.data ? decodeFieldVector(scalar.data.data).values : null,
+    [clientComponents, displayComponent, scalar.data, worldVectorValues],
   );
   const frameVectorValues = useMemo(
     () => (worldVectorValues && frame ? projectPlanarVectors(worldVectorValues, frame) : null),
@@ -407,7 +442,7 @@ function useFieldMapModuleController() {
       wireframeStyle: effectiveWireframeStyle,
       pointStyle: presentationPlanar.point_style,
       resolution: meta.data.resolution as [number, number],
-      sampleIdentity: scalar.data.etag ?? "",
+      sampleIdentity: planarRenderIdentity(scalar.data.etag, componentPresentationKey),
       scalar: scalarValues,
       vectorBudget: canonicalPlanar?.resolution.vector_budget ?? 0,
       vectorScale: presentationPlanar.vector_style.scale,
@@ -421,7 +456,7 @@ function useFieldMapModuleController() {
       vectors: frameVectorValues,
       worldVectors: worldVectorValues,
     });
-  }, [canonicalPlanar?.resolution.vector_budget, effectiveWireframeStyle, frame, frameVectorValues, maskValues, meshOverlay.data, meta.data, presentationPlanar, scalar.data, scalarValues, worldVectorValues]);
+  }, [canonicalPlanar?.resolution.vector_budget, componentPresentationKey, effectiveWireframeStyle, frame, frameVectorValues, maskValues, meshOverlay.data, meta.data, presentationPlanar, scalar.data, scalarValues, worldVectorValues]);
   // LR-10: rewizja próbki jest częścią klucza zasobu, więc każda nowa rewizja
   // tworzy świeży wpis store bez danych. Bez retencji rodzic renderował wtedy
   // FieldMapStatus zamiast PlanarSurface, a cleanup zwalniał renderer i worker
@@ -541,6 +576,7 @@ function useFieldMapModuleController() {
   const evidenceStatus: PlanarEvidenceStatus = resolvePlanarEvidenceStatus({
     metaIdentity: meta.data?.etag,
     metaStatus: meta.status,
+    presentationKey: componentPresentationKey,
     renderEvidence: activeRenderEvidence,
     scalarIdentity: scalar.data?.etag,
     scalarStatus: scalar.status,
@@ -624,7 +660,7 @@ function useFieldMapModuleController() {
     },
     quantityId,
     raster: activeRenderEvidence?.raster ?? null,
-    scalarIdentity: activeRenderEvidence?.sampleIdentity ?? null,
+    scalarIdentity: planarRenderScalarIdentity(activeRenderEvidence?.sampleIdentity),
     status: evidenceStatus,
   });
 

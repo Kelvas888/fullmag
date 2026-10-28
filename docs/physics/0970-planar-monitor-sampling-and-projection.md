@@ -234,6 +234,16 @@ $\operatorname{atan2}(q_v,q_u)/(2\pi)\bmod 1$. Vectors whose norm does not
 exceed $10^{-12}$ times the maximum raster vector norm receive
 `undefined_orientation` and a non-finite scalar.
 
+Because every component is a function of the reduced vector $\bar{\mathbf q}$
+alone, `x`, `y`, `z` and `magnitude` computed from the published vector raster
+of a sample equal the backend scalar raster of that component exactly
+(component-of-average; for the linear components this also equals the average
+of the component, for `magnitude` it does not, $|\bar{\mathbf q}|\le\overline{|\mathbf q|}$).
+The Control Room therefore switches among these four components of a
+three-component, non-tensor `plane_sample` without requesting a new sample; it
+uses the backend path for every other case, including slab, depth and surface
+operators, although the identity above would also hold there.
+
 (planar-monitor-symbols-and-si-units)=
 ## Symbols and SI units
 
