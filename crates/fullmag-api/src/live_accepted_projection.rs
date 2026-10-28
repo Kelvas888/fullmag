@@ -3798,7 +3798,6 @@ mod tests {
                 "status":"accepted"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
         apply_projection(&state, &context, projection).await.unwrap();
         let current = state.current_live_state.read().await;
         let snapshot = current.as_ref().unwrap();
@@ -3857,7 +3856,6 @@ mod tests {
                 "status":"running"
             })).unwrap());
         }
-        let _transition = state.current_live_session_transition.lock().await;
         let projection = load_durable_projection(store.root(), &context, None, &mut None).unwrap().unwrap();
         assert_eq!(projection.status, "failed");
         assert!(projection.terminal_without_outputs);
