@@ -806,12 +806,15 @@ async fn build_planar_field_from_source(
         "\"fm-planar-sha256:{:x}\"",
         Sha256::digest(sample_token.as_bytes())
     );
+    let section = resolved_source
+        .section
+        .map(|section| section.with_fem_section_extent(result.section_extent));
     Ok(BuiltPlanarField {
         result,
         target,
         request,
         source: resolved_source.identity,
-        section: resolved_source.section,
+        section,
         frame,
         operator,
         scene_revision,
@@ -1357,7 +1360,7 @@ fn meta_resource(built: &BuiltPlanarField) -> PlanarFieldMetaResource {
             )
         });
     PlanarFieldMetaResource {
-        schema_version: "planar_sample_meta.v5".to_string(),
+        schema_version: "planar_sample_meta.v6".to_string(),
         sample_token: built.sample_token.clone(),
         scene_revision: built.scene_revision,
         source: source_resource(&built.source),
@@ -1536,6 +1539,8 @@ fn section_resource(section: &ResolvedPlanarSection) -> PlanarSectionResource {
         normal_min_m: section.normal_min_m,
         normal_max_m: section.normal_max_m,
         navigation_step_m: section.navigation_step_m,
+        navigation_step_kind: section.navigation_step_kind.to_string(),
+        cut_element_count: section.cut_element_count,
         layer_stops_m: section.layer_stops_m.clone(),
     }
 }

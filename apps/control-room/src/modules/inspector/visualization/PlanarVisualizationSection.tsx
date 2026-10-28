@@ -7,6 +7,7 @@ import type {
   PlanarFieldSource,
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
+import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   planarFieldQueryFromMeta,
@@ -265,6 +266,7 @@ export function PlanarVisualizationSection({ selection }: { selection: Selection
       : null,
     discretization,
     metaAvailable: meta.status === "ready" && meta.data !== null,
+    metaErrorCode: meta.error instanceof ControlRoomApiError ? meta.error.code : null,
     occupancyAvailable: mask.status === "ready" && mask.data !== null,
     quantity: selectedDescriptor,
     scopeKind: planar.view_scope.kind,

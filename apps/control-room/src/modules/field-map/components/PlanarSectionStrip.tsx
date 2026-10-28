@@ -68,11 +68,16 @@ export function PlanarSectionStrip({
   const drafting = draft?.key === draftKey;
   const step = drafting ? draft.value : committedStep;
   // A committed FEM request may sit between node planes; the backend samples
-  // it there, so the readout uses the request rather than the nearest plane.
+  // it there, so the readout names that instead of the nearest plane.
   const betweenStops = !drafting && geometry?.stops
     ? !sectionStopPosition(geometry, defaultSlice.position_fraction).onStop
     : false;
-  const fraction = betweenStops
+  // Outside a drag the readout follows the committed request exactly; the
+  // model applies the FDM and node-plane snaps the backend uses.
+  const cutElements = layerCount === null && section?.plane === plane
+    ? section.cut_element_count ?? null
+    : null;
+  const fraction = !drafting
     ? defaultSlice.position_fraction
     : layerCount !== null && geometry
       ? sectionLayerFraction(geometry, step)
@@ -188,13 +193,21 @@ export function PlanarSectionStrip({
           >
             ›
           </Button>
-          <span aria-live="polite" className="fm-field-map__section-caption">
+          <span
+            aria-live="polite"
+            className="fm-field-map__section-caption"
+            title={cutElements !== null && geometry?.navigationStepM
+              ? `‹ › step ${formatSectionLength(geometry.navigationStepM)}: median height of the cut elements (navigation aid, not a data layer)`
+              : undefined}
+          >
             {pendingCoordinate
               ? `showing ${axis} = ${formatSectionLength(shownCoordinate)} · loading `
               : `${axis}: `}
             {formatSectionLength(coordinate ?? Number.NaN)}
             {layerCount === null
-              ? ""
+              ? cutElements !== null && !pendingCoordinate
+                ? ` · ${cutElements.toLocaleString("en-US")} elements cut`
+                : ""
               : betweenStops
                 ? ` · between ${layerNoun}s`
                 : ` · ${layerNoun} ${step} / ${layerCount - 1}`}
