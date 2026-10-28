@@ -110,6 +110,10 @@ docker-dev-reconcile-development request request_sha256 source_root apply="false
 docker-dev-reconcile-resume request request_sha256 source_root apply="false":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_development_interrupted.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
 
+# Prepare device evidence after WSL reboot; no runtime admission, start or Solve.
+docker-dev-readmit-linux-storage request request_sha256 source_root image_id apply="false":
+    @{{storage_python}} "{{repo_root}}/scripts/docker_linux_native_readmission.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}} --image-id {{quote(image_id)}}{{if apply == "true" { " --apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
+
 # Confirm one canceled BuildKit toolchain only; preserve images, caches and verified receipt.
 docker-dev-reconcile-toolchain request request_sha256 source_root preview="true":
     @{{storage_python}} "{{repo_root}}/scripts/docker_volume_toolchain_reconcile.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}} --source-root {{quote(source_root)}}{{if preview == "true" { " --preview" } else if preview == "false" { "" } else { error("preview must be true or false") } }}

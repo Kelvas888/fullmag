@@ -116,3 +116,42 @@ wszystkich historycznych runów. Obecny binarny pakiet nie obsługuje v4.
    Inspector, poprawny brak danych i screenshoty; bez nowego Solve przy zmianie widoku.
 6. Pozostałe wymagania E0–E12 oraz testy/CI i integracja PR. Ten checkpoint nie
    zastępuje odbioru end-to-end ani odtworzenia wyników publikacji.
+
+
+## Przygotowanie storage po restarcie WSL — kontroler i regresje
+
+Nowy kontrakt `fullmag.linux-native-device-readmission-preparation.v1` przypina
+pięć surowych plików admission, engine, root/inode, dawny i obecny device oraz
+istniejące image/source/binary binding. Kandydat zmienia wyłącznie `host_device`
+i `restart_verified=False`. Nie daje namespace admission; dotychczasowe bramki
+`reuse_certificate`, retained storage i rzeczywisty guest probe pozostają zachowane.
+
+Kontroler `scripts/docker_linux_native_readmission.py` udostępnia jawny request
+`fullmag.docker-linux-device-readmission.v1` przez receptę
+`just docker-dev-readmit-linux-storage <request> <SHA256> <source_root> <image_id> [apply]`.
+Domyślne preview nie zmienia certyfikatu ani ownera. Zarządzany helper własnej grupy
+trzyma operation/STARTUP/LAUNCH/OWNER oraz host-before-store writer locks na
+rzeczywistych inode. Dwa kontenery muszą pozostać w dokładnie przypiętym stopped
+state; aktywny konsument lub rezerwacja oznaczają odmowę. Nie zatrzymuje usług.
+
+Archiwum w prywatnym control volume zachowuje bezstratne surowe bajty i kandydata
+przed pierwszą zmianą hosta. Publikacja zachowuje inode certyfikatu bind-mountu.
+Replay korzysta z archiwum i obsługuje wyłącznie pary old/old, marker-new/cert-old
+oraz new/new; nieznane lub torn bytes wymagają osobnego recovery. Helper nie
+wykonuje żadnej mutacji Dockera ani admission, a EOF zwalnia blokady. Dlatego
+kontroler stosuje istniejący wzorzec transakcji recovery, bez nowej operacji buildu
+ani trwałego active; archiwum i zwykłe bramki blokują niejawne dopuszczenie po awarii.
+
+Weryfikacja w interpretowanym Pythonie we własnym zarządzanym helperze:
+13 regresji core i 8 regresji wrappera: PASS, bez failures/errors/skips.
+Wrapper uruchamia rzeczywisty protokół na prywatnych fixture i sprawdza wszystkie
+blokady, przerwanie po EOF, odmowę przy aktywnej operacji/rezerwacji, zmianę danych,
+nieczytelny katalog oraz historię większą niż 64 pliki. Dowody:
+`verification/linux-native-readmission-20261028/core-tests.log` i
+`verification/linux-native-readmission-20261028/wrapper-tests.log`.
+Niezależny przegląd core: brak Required; dwa Required wrappera (serializacja raw
+archiwum i jawna odmowa błędu enumeracji) zostały poprawione przed użyciem.
+
+Rzeczywiste preview/apply, nowy probe w docelowym backendzie, managed build,
+native mixed-history recovery i odbiór H w WebGL pozostają niewykonane.
+Wynik symulacji zachowuje Failed/unassessed. Nie powtarzano Solve.

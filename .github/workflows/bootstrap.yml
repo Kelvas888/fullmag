@@ -866,6 +866,8 @@ jobs:
           python -B scripts/test_docker_volume_reconcile.py -v
           python -B scripts/test_docker_volume_development_interrupted.py -v
           python -B scripts/test_docker_volume_resume_interrupted.py -v
+          python -B scripts/test_linux_native_readmission.py -v
+          python -B scripts/test_docker_linux_native_readmission.py -v
           python -B scripts/test_docker_dev_browser_qa.py -v
           python -B scripts/test_docker_volume_receipts.py -v
           python -B scripts/test_docker_saved_authoring_history.py -v
