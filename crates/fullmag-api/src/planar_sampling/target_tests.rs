@@ -239,6 +239,7 @@ fn scalar_fdm_field(
             cell_size_m: Some([1.0, 1.0, 1.0]),
             grid_fingerprint: Some("grid-fingerprint-1".to_string()),
             membership: Some(membership),
+            membership_error: None,
             multilayer_scope: None,
         },
     }

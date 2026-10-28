@@ -20,17 +20,23 @@ export interface PlanarInspectorCapabilities {
   vectors: FieldMapCapability;
 }
 
-const FDM_UNSUPPORTED_PLANAR_SCOPES = new Set(["mesh_part", "airbox"]);
+export type PlanarScopeKind = "monitor_target" | "mesh_part" | "airbox" | "layer";
 
+/**
+ * Structured FDM grids have no mesh parts; native layers exist only for FDM
+ * multilayer carriers. The Airbox scope is resolved by the backend carrier
+ * (FDM Airbox cells or FEM airbox elements) and fails there with its exact reason.
+ */
 export function planarScopeCapability(input: {
   discretization: string | null | undefined;
-  scopeKind: "monitor_target" | "mesh_part" | "airbox";
+  scopeKind: PlanarScopeKind;
 }): FieldMapCapability {
-  if (
-    input.discretization?.trim().toLowerCase() === "fdm" &&
-    FDM_UNSUPPORTED_PLANAR_SCOPES.has(input.scopeKind)
-  ) {
+  const discretization = input.discretization?.trim().toLowerCase();
+  if (discretization === "fdm" && input.scopeKind === "mesh_part") {
     return { enabled: false, reasonCode: "fdm_scope_not_supported" };
+  }
+  if (discretization === "fem" && input.scopeKind === "layer") {
+    return { enabled: false, reasonCode: "fem_layer_scope_not_supported" };
   }
   return { enabled: true, reasonCode: null };
 }
@@ -71,7 +77,7 @@ export function resolvePlanarInspectorCapabilities(input: {
     components: number;
     location?: string | null;
   } | null | undefined;
-  scopeKind: "monitor_target" | "mesh_part" | "airbox";
+  scopeKind: PlanarScopeKind;
 }): PlanarInspectorCapabilities {
   const quantityAvailable = input.quantity?.available === true;
   const spatial =

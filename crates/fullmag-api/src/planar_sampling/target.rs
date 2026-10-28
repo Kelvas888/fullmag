@@ -44,6 +44,18 @@ pub(crate) struct ResolvedSpatialTarget {
 }
 
 impl ResolvedSpatialTarget {
+    /// Raw carrier value at a world point with the raster's own locator and
+    /// basis: containing FDM cell or FEM shape functions. `None` when the point
+    /// lies outside the selected target.
+    pub(crate) fn evaluate_point(&self, point: [f64; 3]) -> Option<(u32, Vec<f64>)> {
+        match &self.field {
+            TargetField::Fdm(field) => {
+                super::fdm::cell_value_at(field, point).map(|(cell, value)| (cell, value.to_vec()))
+            }
+            TargetField::Fem(field) => super::fem::interpolate_at(field, point),
+        }
+    }
+
     pub(crate) fn selected_entity_ids(&self) -> &[u32] {
         &self.selected_entity_ids
     }
@@ -191,6 +203,8 @@ impl PlanarSampleIdentity {
     }
 }
 
+/// Uncached sampling; production requests use [`sample_resolved_target_cached`].
+#[cfg(test)]
 pub(crate) fn sample_resolved_target(
     target: &ResolvedSpatialTarget,
     request: &ResolvedPlanarSampleRequest,
@@ -198,6 +212,22 @@ pub(crate) fn sample_resolved_target(
     match &target.field {
         TargetField::Fdm(field) => PlanarSamplingEngine::sample_fdm(field, request),
         TargetField::Fem(field) => PlanarSamplingEngine::sample_fem(field, request),
+    }
+}
+
+/// Like [`sample_resolved_target`], but FEM plane sampling reuses a cached
+/// geometry operator keyed by `geometry_key`.
+pub(crate) fn sample_resolved_target_cached(
+    target: &ResolvedSpatialTarget,
+    request: &ResolvedPlanarSampleRequest,
+    cache: &super::PlanarOperatorCache,
+    geometry_key: &str,
+) -> Result<PlanarSampleResult, ApiError> {
+    match &target.field {
+        TargetField::Fdm(field) => PlanarSamplingEngine::sample_fdm(field, request),
+        TargetField::Fem(field) => {
+            PlanarSamplingEngine::sample_fem_cached(field, request, cache, geometry_key)
+        }
     }
 }
 
@@ -215,6 +245,7 @@ pub(crate) fn resolve_spatial_target(
             cell_size_m,
             grid_fingerprint,
             membership,
+            membership_error,
             ..
         } => {
             if matches!(operator, PlanarOperatorIR::SurfaceProjection { .. }) {
@@ -233,7 +264,12 @@ pub(crate) fn resolve_spatial_target(
             let spacing = cell_size_m.ok_or_else(|| {
                 ApiError::conflict("missing_fdm_geometry: exact cell size is unavailable")
             })?;
-            let selected = select_fdm_target(*cells, membership.as_ref(), target)?;
+            let selected = select_fdm_target(
+                *cells,
+                membership.as_ref(),
+                membership_error.as_deref(),
+                target,
+            )?;
             let carrier_identity = grid_fingerprint
                 .clone()
                 .unwrap_or_else(|| format!("fdm:{cells:?}:{origin:?}:{spacing:?}"));
@@ -311,7 +347,7 @@ pub(crate) fn resolve_spatial_target(
                     ));
                 }
             }
-            let selected = select_fdm_target(*cells, Some(membership), target)?;
+            let selected = select_fdm_target(*cells, Some(membership), None, target)?;
             build_fdm_target(
                 field,
                 *cells,
@@ -414,13 +450,14 @@ fn select_fdm_target(
     membership: Option<
         &crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
     >,
+    membership_error: Option<&str>,
     target: &MonitorTargetIR,
 ) -> Result<Vec<bool>, ApiError> {
     let count = cell_count(cells)?;
     match target {
         MonitorTargetIR::Domain => Ok(vec![true; count]),
         MonitorTargetIR::MagneticDomain => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             Ok(membership
                 .cell_membership
                 .iter()
@@ -428,7 +465,7 @@ fn select_fdm_target(
                 .collect())
         }
         MonitorTargetIR::Object { object_id } => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             let indices = resolve_fdm_object_indices(membership, object_id)?;
             Ok(mask_from_indices(count, indices))
         }
@@ -436,7 +473,7 @@ fn select_fdm_target(
             object_id,
             region_id,
         } => {
-            let membership = require_fdm_membership(membership, count)?;
+            let membership = require_fdm_membership(membership, membership_error, count)?;
             let numeric_ids = membership
                 .region_legend
                 .iter()
@@ -457,15 +494,22 @@ fn select_fdm_target(
     }
 }
 
-fn require_fdm_membership(
+fn require_fdm_membership<'a>(
     membership: Option<
-        &crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
+        &'a crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership,
     >,
+    membership_error: Option<&str>,
     count: usize,
-) -> Result<&crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership, ApiError>
+) -> Result<&'a crate::router_v2::handlers::data::resolved_spatial_field::FdmCellMembership, ApiError>
 {
     let membership = membership.ok_or_else(|| {
-        ApiError::conflict("missing_fdm_membership: target cannot be resolved exactly")
+        // Keep the loader's exact reason (P1-11); the target still fails closed.
+        ApiError::conflict(match membership_error {
+            Some(reason) => format!(
+                "missing_fdm_membership: target cannot be resolved exactly ({reason})"
+            ),
+            None => "missing_fdm_membership: target cannot be resolved exactly".to_string(),
+        })
     })?;
     if membership.cell_membership.len() != count {
         return Err(ApiError::conflict(
@@ -766,11 +810,14 @@ fn fem_planar_elements(
                     .try_into()
                     .map(FemPlanarElement::Prism6)
                     .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Prism6 arity is not 6")),
-                fullmag_ir::FemCellTypeIR::Pyramid5 | fullmag_ir::FemCellTypeIR::Hex8 => {
-                    Err(ApiError::unprocessable(format!(
-                        "unsupported_element_order: planar P1 sampling does not support {cell_type:?}"
-                    )))
-                }
+                fullmag_ir::FemCellTypeIR::Pyramid5 => nodes
+                    .try_into()
+                    .map(FemPlanarElement::Pyramid5)
+                    .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Pyramid5 arity is not 5")),
+                fullmag_ir::FemCellTypeIR::Hex8 => nodes
+                    .try_into()
+                    .map(FemPlanarElement::Hex8)
+                    .map_err(|_| ApiError::conflict("invalid_fem_connectivity: Hex8 arity is not 8")),
             }
         })
         .collect()

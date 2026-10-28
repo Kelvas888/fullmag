@@ -50,6 +50,13 @@ export function planarViewScopeForSelection(
     };
   }
   if (
+    selection.ref?.type === "fdm-domain" &&
+    selection.ref.scope === "layer" &&
+    selection.ref.layerId
+  ) {
+    return { kind: "layer", scope_id: selection.ref.layerId };
+  }
+  if (
     selection.ref?.type === "airbox" ||
     selection.kind?.includes("airbox")
   ) {

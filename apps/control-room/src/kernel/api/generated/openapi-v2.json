@@ -27754,6 +27754,17 @@
           "scope_kind": {
             "type": "string"
           },
+          "section": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanarSectionResource",
+                "description": "Section of the session `Default` slice; null for authored monitors."
+              }
+            ]
+          },
           "source": {
             "$ref": "#/components/schemas/PlanarSampleSourceResource"
           }
@@ -28463,6 +28474,92 @@
           }
         ]
       },
+      "PlanarSectionResource": {
+        "description": "Requested vs. resolved position of the session `Default` slice along its\nnormal. A snap to an FDM cell centre is published, never hidden.",
+        "properties": {
+          "layer_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "layer_index": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "layer_spacing_m": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "layer_stops_m": {
+            "description": "Discrete stops along the normal (FEM node planes); empty otherwise.",
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "navigation_step_m": {
+            "description": "Distance moved by one layer or navigation step along the normal.",
+            "format": "double",
+            "type": "number"
+          },
+          "normal_axis": {
+            "description": "World axis of the slice normal: `x`, `y` or `z`.",
+            "type": "string"
+          },
+          "normal_max_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "normal_min_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "plane": {
+            "description": "`xy`, `xz` or `yz`.",
+            "type": "string"
+          },
+          "requested_coordinate_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "requested_fraction": {
+            "format": "double",
+            "type": "number"
+          },
+          "resolved_coordinate_m": {
+            "format": "double",
+            "type": "number"
+          },
+          "stops_kind": {
+            "description": "`fdm_cell_layers` (snapped to a cell centre), `fem_node_planes` (on a\nswept-mesh node plane), `fem_node_planes_between` (between planes) or\n`continuous`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plane",
+          "normal_axis",
+          "requested_fraction",
+          "requested_coordinate_m",
+          "resolved_coordinate_m",
+          "stops_kind",
+          "normal_min_m",
+          "normal_max_m",
+          "navigation_step_m",
+          "layer_stops_m"
+        ],
+        "type": "object"
+      },
       "PlanarSourceSelectionState": {
         "description": "The source selected by the session-scoped planar viewport state.\n\n`Default` is a presentation source resolved from the current domain. It is\nintentionally not a monitor identity and is never written into the scene\ndocument or the canonical Python model.",
         "oneOf": [
@@ -28661,6 +28758,25 @@
               }
             },
             "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Native layer of an FDM multilayer carrier, keyed by its canonical layer id.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "layer"
+                ],
+                "type": "string"
+              },
+              "scope_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "scope_id",
               "kind"
             ],
             "type": "object"

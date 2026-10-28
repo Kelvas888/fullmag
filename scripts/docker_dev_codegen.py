@@ -883,10 +883,17 @@ def _probe_source(container: str, token: str) -> tuple[dict[str, Any], str]:
 
 
 def _source_matches(probe: Mapping[str, Any], backend: Mapping[str, Any]) -> bool:
+    """The running package was built from the mounted build inputs.
+
+    The backend keeps a verified package when only files outside its build
+    inputs change (documentation, frontend sources); its full-tree
+    `source_digest` then differs from a fresh probe while the build-input
+    snapshot and native identity still match. OpenAPI depends only on the
+    backend binary, so the build-input identity is the binding check.
+    """
     native = probe.get("native_source_identity")
     return isinstance(native, Mapping) and (
         probe.get("resolved_commit") == backend["commit"]
-        and probe.get("source_digest") == backend["source_digest"]
         and probe.get("source_snapshot_sha256") == backend["snapshot"]
         and dict(native) == backend["native"]
     )

@@ -666,6 +666,7 @@ use utoipa::OpenApi;
         crate::schemas::planar_fields::PlanarFieldOccupancyResource,
         crate::schemas::planar_fields::PlanarFieldLinksResource,
         crate::schemas::planar_fields::PlanarFieldMetaResource,
+        crate::schemas::planar_fields::PlanarSectionResource,
         crate::schemas::planar_fields::PlanarFieldProbeResource,
         crate::schemas::planar_fields::PlanarSampleSourceResource,
         crate::schemas::logs::EngineLogResource,

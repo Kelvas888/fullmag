@@ -830,16 +830,16 @@ describe("PlanarVisualizationSection", () => {
         mocks.planar.view_scope = { kind: "mesh_part", scope_id: "part-1" };
       },
       "Mesh overlay",
-      "Structured FDM sampling does not support mesh-part or airbox scope.",
+      "Structured FDM sampling does not support mesh-part scope.",
     ],
     [
-      "an FDM airbox scope",
+      "a FEM native-layer scope",
       () => {
-        mocks.discretization = "fdm";
-        mocks.planar.view_scope = { kind: "airbox" };
+        mocks.discretization = "fem";
+        mocks.planar.view_scope = { kind: "layer", scope_id: "bottom" };
       },
       "Mesh overlay",
-      "Structured FDM sampling does not support mesh-part or airbox scope.",
+      "Native layer scope requires an FDM multilayer carrier.",
     ],
     [
       "a scalar quantity vector control",

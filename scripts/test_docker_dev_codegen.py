@@ -148,6 +148,18 @@ class DockerDevCodegenTests(unittest.TestCase):
         with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", side_effect=OSError("missing")):
             self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
 
+    def test_source_match_binds_build_inputs_not_documentation_edits(self) -> None:
+        backend = {"commit": "c" * 40, "snapshot": "s" * 64, "source_digest": "d" * 64, "native": {"n": 1}}
+        probe = {
+            "resolved_commit": "c" * 40,
+            "source_snapshot_sha256": "s" * 64,
+            "source_digest": "e" * 64,
+            "native_source_identity": {"n": 1},
+        }
+        self.assertTrue(codegen._source_matches(probe, backend))
+        self.assertFalse(codegen._source_matches({**probe, "source_snapshot_sha256": "t" * 64}, backend))
+        self.assertFalse(codegen._source_matches({**probe, "native_source_identity": {"n": 2}}, backend))
+
     def test_source_probe_uses_backend_module_root(self) -> None:
         self.assertIn('sys.path.insert(0, "/opt/fullmag")', codegen.SOURCE_PROBE_SCRIPT)
 
