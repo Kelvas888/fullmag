@@ -1237,7 +1237,7 @@ function resolveHysteresisLoopCommandInput(
   };
 }
 
-function hysteresisPointSelectionPayload(input: HysteresisPointCommandInput) {
+export function hysteresisPointSelectionPayload(input: HysteresisPointCommandInput) {
   return {
     kind: "analysis.chart-point" as const,
     label: `Point ${input.point.point_id} (${input.point.field_value_mT} mT)`,

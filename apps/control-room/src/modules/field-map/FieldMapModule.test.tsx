@@ -175,6 +175,7 @@ vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
 
 vi.mock("@/kernel/resources/studyRuntimeResources", () => ({
   useFieldCatalogResource: () => ({ data: null, error: null, status: "idle" }),
+  useHysteresisPointsResource: () => ({ data: null, error: null, status: "idle" }),
   useQuantityCatalogResource: () => ({ data: null, error: null, status: "idle" }),
 }));
 

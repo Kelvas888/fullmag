@@ -560,3 +560,18 @@
 .fm-field-map__multislice-error {
   color: var(--fm-warning);
 }
+
+/* Snapshot navigator (F6 B4): one row under the 2D controls. */
+.fm-field-map__snapshot-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--fm-space-2);
+  min-width: 0;
+}
+
+.fm-field-map__snapshot-readout {
+  min-width: 12rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--fm-text-secondary);
+}
