@@ -810,6 +810,7 @@ jobs:
       - name: Verify Docker storage probes and runtime lifecycle contracts
         run: |
           python -B scripts/test_fullmag_docker_runtime.py -v
+          python -B scripts/test_fem_cpu_hypre_host_policy.py -v
           python -B scripts/test_docker_backend_dev.py -v
           python -B scripts/test_docker_shared_build_storage.py -v
           python -B scripts/test_backend_shared_store.py -v
