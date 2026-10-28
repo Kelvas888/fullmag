@@ -843,6 +843,17 @@ the geometry pass of the cached `plane_sample` operator and published with the
 number of cut elements; when no operator was built (slab and depth operators,
 or no cut element) the step stays one hundredth of the normal extent.
 
+A slab-average Default slice is centred at $p_n^{\mathrm{req}}$ itself:
+neither {eq}`eq-planar-default-layer` nor the node-plane snap applies, because
+moving the centre of a slab of thickness $t$ to a cell centre would shift
+$[p_n-t/2,\,p_n+t/2]$ by up to $h_n/2$ into the neighbouring material. A named
+object layer is such a slab with $p_n$ and $t$ taken from the realized
+geometry bounds $[a,b]$ of the object along the normal, $p_n=(a+b)/2$ and
+$t=b-a$; its value is the occupied-measure mean of the slab, which also
+contains any other material inside $[a,b]$ in the sampled target. Restricting
+it to one object or region is a scope (`scope_kind=region`, or an object
+monitor target), not a different reduction.
+
 `stops_kind` is `fdm_cell_layers` when {eq}`eq-planar-default-layer` applies,
 `fem_node_planes` or `fem_node_planes_between` on a certified swept mesh, and
 `continuous` otherwise; `navigation_step_m` is $h_n$, the mean node-plane
@@ -951,6 +962,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N21 | probe on the raster edge, outside the frame and outside the target | `occupied`, `outside` and `empty` respectively; no clamped value |
 | PM-N22 | default section on even/odd FDM grids at $\phi\in\{0,0.5,1\}$ | published $k$ and $p_n^{\mathrm{res}}$ follow {eq}`eq-planar-default-layer`; requested coordinate preserved |
 | PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
+| PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |
 | PM-D02 | default position validation | `position_fraction` is finite and in $[0,1]$; resolved `position_m` is finite and inside the selected normal bounds |
 | PM-D03 | default/authored sampler parity | after source resolution, both source identities use the same interpolation and measure-weighted reduction; source provenance remains distinct |

@@ -325,3 +325,67 @@ export function stepSectionFraction(
     : CONTINUOUS_SECTION_STEP;
   return clampFraction(clampFraction(fraction) + delta * step);
 }
+
+/** Extent of one realized object along the section normal (a named layer). */
+export interface ObjectSectionLayer {
+  objectId: string;
+  name: string;
+  min: number;
+  max: number;
+}
+
+interface RealizedBodyBounds {
+  bounds_max: number[];
+  bounds_min: number[];
+  object_id: string;
+  object_name: string;
+}
+
+/**
+ * Named layers along `axis` from the realized geometry bodies, merged per
+ * object and ordered along the normal (note 0970, object layers).
+ */
+export function objectSectionLayers(
+  bodies: readonly RealizedBodyBounds[] | null | undefined,
+  axis: PlanarSectionAxis,
+): ObjectSectionLayer[] {
+  const index = AXIS_INDEX[axis];
+  const layers = new Map<string, ObjectSectionLayer>();
+  for (const body of bodies ?? []) {
+    const min = body.bounds_min[index];
+    const max = body.bounds_max[index];
+    if (typeof min !== "number" || typeof max !== "number" ||
+      !Number.isFinite(min) || !Number.isFinite(max) || max <= min) continue;
+    const previous = layers.get(body.object_id);
+    layers.set(body.object_id, previous
+      ? { ...previous, max: Math.max(previous.max, max), min: Math.min(previous.min, min) }
+      : { max, min, name: body.object_name || body.object_id, objectId: body.object_id });
+  }
+  return [...layers.values()].sort((left, right) => left.min - right.min || left.max - right.max);
+}
+
+/** Default slice of a named layer: a slab of the object's thickness centred on it. */
+export function objectLayerSlice(
+  geometry: PlanarSectionGeometry,
+  layer: ObjectSectionLayer,
+): { operator: Extract<DefaultOperator, { kind: "slab_average" }>; position_fraction: number } {
+  return {
+    operator: { kind: "slab_average", thickness_m: layer.max - layer.min },
+    position_fraction: clampFraction(((layer.min + layer.max) / 2 - geometry.normalMin) / geometry.normalExtent),
+  };
+}
+
+/** The named layer the current default slice selects, if any. */
+export function matchObjectLayer(
+  slice: { operator: DefaultOperator; position_fraction: number },
+  geometry: PlanarSectionGeometry | null,
+  layers: readonly ObjectSectionLayer[],
+): ObjectSectionLayer | null {
+  if (!geometry || slice.operator.kind !== "slab_average") return null;
+  const tolerance = STOP_SNAP_RELATIVE_WINDOW * geometry.normalExtent;
+  const thickness = slice.operator.thickness_m;
+  const centre = geometry.normalMin + clampFraction(slice.position_fraction) * geometry.normalExtent;
+  return layers.find((layer) =>
+    Math.abs(layer.max - layer.min - thickness) <= tolerance &&
+    Math.abs((layer.min + layer.max) / 2 - centre) <= tolerance) ?? null;
+}

@@ -377,8 +377,18 @@ pub(crate) fn resolve_default_planar_source_with_stops(
         PlanarAxisPlane::Yz => ("yz", 0),
     };
     let mut coordinate = default_slice_coordinate(domain, normal_axis, q)?;
+    // A slab is centred where it was requested: snapping its centre to a cell
+    // or node plane would shift an object-thickness slab into its neighbours.
+    let slab = matches!(
+        default_slice.operator,
+        DefaultPlanarOperatorState::SlabAverage { .. }
+    );
+    if slab {
+        coordinate.resolved = coordinate.requested;
+        coordinate.layer = None;
+    }
     let node_planes = match fem_stops {
-        Some(stops) if stops.axis == normal_axis && coordinate.layer.is_none() => {
+        Some(stops) if !slab && stops.axis == normal_axis && coordinate.layer.is_none() => {
             let (snapped, layer) = snap_to_node_plane(coordinate, stops);
             coordinate = snapped;
             Some((stops, layer))
@@ -831,6 +841,31 @@ mod tests {
                 v_max_m: 6.0,
             }
         );
+    }
+
+    #[test]
+    fn default_fdm_slab_is_centred_at_the_requested_coordinate() {
+        let mut d = domain([0.0; 3], [1.0, 1.0, 8.0], "generation-a");
+        d.grid = Some(StructuredGridDescriptor {
+            shape: [1, 1, 8],
+            origin: [0.0; 3],
+            spacing: [1.0; 3],
+        });
+        // z = 2.0 is a cell boundary; a plane sample snaps to the cell centre
+        // 1.5, a two-cell object slab must stay centred on 2.0.
+        let resolved = resolve_default_planar_source(
+            &d,
+            &slice(
+                PlanarAxisPlane::Xy,
+                0.25,
+                DefaultPlanarOperatorState::SlabAverage { thickness_m: 2.0 },
+            ),
+        )
+        .unwrap();
+        assert_eq!(resolved.frame.origin_m[2], 2.0);
+        let section = resolved.section.expect("section");
+        assert_eq!(section.layer_index, None);
+        assert_eq!(section.resolved_coordinate_m, 2.0);
     }
 
     #[test]

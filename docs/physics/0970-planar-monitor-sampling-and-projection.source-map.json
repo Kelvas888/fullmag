@@ -138,6 +138,11 @@
       "id": "PM-N23",
       "status": "unqualified",
       "requirement": "Continuous FEM section through a graded Tet4 film publishes h_perp of eq-planar-navigation-step over the cut elements, changing with the plane, while the raster is unchanged by the step."
+    },
+    {
+      "id": "PM-N24",
+      "status": "unqualified",
+      "requirement": "An object-layer slab on an even FDM cell count stays centred on the object, and region scope on two regions of opposite m yields two different maps, each empty outside its region."
     }
   ],
   "equations": [

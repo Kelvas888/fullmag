@@ -19,6 +19,7 @@ import {
 } from "@/kernel/resources/planarFieldResources";
 import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useFieldCatalogResource } from "@/kernel/resources/studyRuntimeResources";
+import { useGeometryRealizationResource } from "@/kernel/resources/useGeometryRealizationResource";
 import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
@@ -31,6 +32,8 @@ import {
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
 import { projectPlanarPresentationState } from "@/kernel/visualization/planarPresentationProjection";
 import {
+  objectSectionLayers,
+  planarSectionAxes,
   resolvePlanarSectionGeometry,
   withSectionStops,
 } from "@/kernel/visualization/planarSectionModel";
@@ -302,6 +305,15 @@ function useFieldMapModuleController() {
     canonicalPlanar?.source.kind === "default"
       ? visualization.optimisticData?.planar?.default_slice ?? canonicalPlanar.default_slice
       : null;
+  // Named layers: realized objects along the section normal (note 0970).
+  const realization = useGeometryRealizationResource(active && sectionDefaultSlice !== null);
+  const sectionPlane = sectionDefaultSlice?.plane ?? null;
+  const objectLayers = useMemo(
+    () => sectionPlane
+      ? objectSectionLayers(realization.data?.bodies, planarSectionAxes(sectionPlane).normal)
+      : [],
+    [realization.data?.bodies, sectionPlane],
+  );
   // Decode binary payloads once per resource revision. Presentation-only
   // updates (pan, zoom, styles) must reuse the same typed arrays so the worker
   // does not recolour the raster on every pointer event.
@@ -563,6 +575,7 @@ function useFieldMapModuleController() {
     renderModel,
     scalar,
     metaSection,
+    objectLayers,
     sectionDefaultSlice,
     setPinned,
     shownCoordinateM,
@@ -593,6 +606,7 @@ export default function FieldMapModule() {
     renderModel,
     scalar,
     metaSection,
+    objectLayers,
     sectionDefaultSlice,
     setPinned,
     shownCoordinateM,
@@ -604,6 +618,7 @@ export default function FieldMapModule() {
     <PlanarSectionStrip
       defaultSlice={sectionDefaultSlice}
       domain={domainMeta}
+      objectLayers={objectLayers}
       section={metaSection}
       shownCoordinate={shownCoordinateM}
       onChange={onSectionChange}
