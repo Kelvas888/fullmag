@@ -2050,6 +2050,7 @@ async fn apply_projection(
     let previous_status = next.session.status.clone();
     let terminal = matches!(projection.status, "completed" | "failed" | "cancelled");
     let mut changed = false;
+    let mut scalar_sample_advanced = false;
     if let Some(run) = next.run.as_mut() {
         if run.status != projection.status {
             run.status = projection.status.to_string();
@@ -2252,7 +2253,10 @@ async fn apply_projection(
                         latest_scalar_row: Some(row),
                     },
                 )?;
-                changed |= next.scalar_revision != scalar_revision;
+                if next.scalar_revision != scalar_revision {
+                    changed = true;
+                    scalar_sample_advanced = true;
+                }
             }
         }
     }
@@ -2462,6 +2466,18 @@ async fn apply_projection(
     }
     next.state_version = next.state_version.saturating_add(1);
     let published_fence = ProjectionPublicationFence::capture(&next)?;
+    // Accepted runs publish scalars through this projection, so emit the same
+    // scalar.sample event the interactive sync path does for live clients.
+    let scalar_sample = scalar_sample_advanced
+        .then(|| next.scalar_rows.last().cloned())
+        .flatten()
+        .map(|row| crate::PendingRealtimeScalarSample {
+            session_id: next.session.session_id.clone(),
+            run_id: next.run.as_ref().map(|run| run.run_id.clone()),
+            revision: next.scalar_revision,
+            row,
+            terminal,
+        });
     let mut realtime_state =
         crate::current_live_realtime_state_from_snapshot(state, &next, display_revision).await;
 
@@ -2505,6 +2521,9 @@ async fn apply_projection(
         let mut current = state.current_live_state.write().await;
         std::mem::replace(&mut *current, Some(next))
     };
+    if let Some(sample) = scalar_sample {
+        crate::queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
+    }
     drop(transition);
     if let Some(previous) = previous {
         let _ = tokio::task::spawn_blocking(move || drop(previous));
