@@ -3648,7 +3648,7 @@ mod tests {
         let bytes = serde_json::to_vec(&json!({
             "schema": "fullmag.project_definition.v1",
             "name": "accepted-test",
-            "project_id": loaded.project_id.to_string(),
+            "project_id": loaded.project_id.as_str(),
             "revision": loaded.specification.snapshot.definition_revision,
             "scene": stored_scene,
         }))
