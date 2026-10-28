@@ -49,7 +49,9 @@ import {
 } from "@/kernel/visualization/planarSectionModel";
 import { isDirectionColormap } from "@/shared/visualization/directionColor";
 import { FieldMapToolbar, type FieldMapToolbarQuantity } from "./components/FieldMapToolbar";
+import { FieldMapAuxiliaryDiagnostics } from "./components/FieldMapAuxiliaryDiagnostics";
 import { PlanarColorLegend } from "./components/PlanarColorLegend";
+import { PlanarMultisliceGrid } from "./components/PlanarMultisliceGrid";
 import { PlanarPinnedProbe } from "./components/PlanarPinnedProbe";
 import { PlanarProfileChart } from "./components/PlanarProfileChart";
 import { quantityDisplayName } from "@/kernel/api/quantityIds";
@@ -64,7 +66,6 @@ import {
   buildFieldMapRenderModel,
   normalizePlanarColorRange,
   projectPlanarVectors,
-  resolveFieldMapAuxiliaryDiagnostics,
   surfaceProjectionStatus,
 } from "./model/fieldMapRenderModel";
 import {
@@ -559,6 +560,10 @@ function useFieldMapModuleController() {
       : null,
     { enabled: plan.enabled },
   );
+  // Multislice panels (F6 B2) replace the single surface for the Default source.
+  const multislice = plan.source.kind === "default" && presentationPlanar?.multislice?.enabled
+    ? presentationPlanar.multislice
+    : null;
   const profileLengthUnit = useMemo(() => activeProfileSegment && renderModel?.frame
     ? resolvePlanarAxes(
         {
@@ -861,6 +866,23 @@ export default function FieldMapModule() {
         ) : null}
       </header>
       <div className="fm-field-map__stage">
+        {multislice ? (
+          <PlanarMultisliceGrid
+            baseQuery={plan.query}
+            clientComponent={clientComponents ? displayComponent : null}
+            colorByDirection={renderModel.directionVectors !== null}
+            colormap={renderModel.colormap ?? presentationPlanar.colormap}
+            positionFractions={multislice.position_fractions}
+            quantityId={plan.quantityId}
+            range={normalizePlanarColorRange(presentationPlanar.range)}
+            rasterOpacity={presentationPlanar.raster_opacity ?? 1}
+            renderLegend={(range) => presentationPlanar.viewport_colorbar_visible !== false ? (
+              <PlanarColorLegend colormap={renderModel.colormap ?? presentationPlanar.colormap} component={presentationPlanar.component} legendUnit={renderModel.display.legendUnit} probeScale={renderModel.display.probeScale} quantityId={plan.quantityId} range={range} rangeState={range ? "current" : "pending"} />
+            ) : null}
+            requestVectors={plan.requestVectors}
+            source={plan.source}
+          />
+        ) : (
         <PlanarSurface
           model={renderModel}
           onInteraction={onInteraction}
@@ -877,7 +899,8 @@ export default function FieldMapModule() {
             />
           ) : null}
         />
-        {presentationPlanar.viewport_colorbar_visible !== false ? (
+        )}
+        {presentationPlanar.viewport_colorbar_visible !== false && !multislice ? (
           <PlanarColorLegend
             colormap={renderModel.colormap ?? presentationPlanar.colormap}
             component={presentationPlanar.component}
@@ -924,32 +947,6 @@ export default function FieldMapModule() {
         ]}
       />
     </section>
-  );
-}
-
-function FieldMapAuxiliaryDiagnostics({
-  layers,
-}: {
-  layers: readonly {
-    label: string;
-    requested: boolean;
-    resource: { data: ArrayBuffer | null; error: Error | null; status: "error" | "idle" | "loading" | "ready" | "stale" };
-  }[];
-}) {
-  const diagnostics = resolveFieldMapAuxiliaryDiagnostics(
-    layers.map(({ label, requested, resource }) => ({
-      errorMessage: resource.error?.message ?? null,
-      hasData: resource.data !== null,
-      label,
-      requested,
-      status: resource.status,
-    })),
-  );
-  if (diagnostics.length === 0) return null;
-  return (
-    <div className="fm-field-map__diagnostics" role="status" aria-label="Planar layer diagnostics">
-      {diagnostics.map((message) => <p key={message}>{message}</p>)}
-    </div>
   );
 }
 

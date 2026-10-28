@@ -188,6 +188,8 @@ export interface PlanarFieldQuery {
   expected_source_revision?: string;
   expected_scene_revision?: string;
   include_mesh?: boolean;
+  /** Default source only: multislice panel position along the plane normal (note 0970). */
+  position_fraction?: number;
   quality?: string;
   resolution_x?: number;
   resolution_y?: number;

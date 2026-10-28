@@ -26,6 +26,11 @@ pub struct PlanarFieldQuery {
     pub quality: Option<String>,
     pub vector_budget: Option<u32>,
     pub include_mesh: Option<bool>,
+    /// Default source only: position fraction along the plane normal for this
+    /// request instead of the session's `default_slice.position_fraction`
+    /// (multislice panels, note 0970). The source hash, and with it the sample
+    /// identity, follows the overridden slice.
+    pub position_fraction: Option<f64>,
     #[serde(default, with = "crate::schemas::decimal_u64::optional")]
     #[param(value_type = String)]
     pub expected_scene_revision: Option<u64>,
