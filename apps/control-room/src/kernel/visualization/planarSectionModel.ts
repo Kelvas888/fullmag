@@ -31,6 +31,9 @@ export const PLANAR_MAX_RESOLUTION = 2048;
  */
 const FULL_THICKNESS_SLAB_FACTOR = 2;
 
+/** Matches the caption tolerance for "shown" vs. "requested" coordinates. */
+const STOP_SNAP_RELATIVE_WINDOW = 1e-6;
+
 export interface PlanarSectionGeometry {
   plane: PlanarSectionPlane;
   normal: PlanarSectionAxis;
@@ -78,6 +81,23 @@ export function sectionLayerIndex(geometry: PlanarSectionGeometry, fraction: num
     return best;
   }
   return geometry.layerCount !== null ? layerIndexFromFraction(fraction, geometry.layerCount) : null;
+}
+
+/**
+ * Requested coordinate relative to the FEM node planes. The backend snaps a
+ * request to a plane only within a relative window and otherwise samples the
+ * requested coordinate between planes (`fem_node_planes_between`).
+ */
+export function sectionStopPosition(
+  geometry: PlanarSectionGeometry,
+  fraction: number,
+): { coordinate: number; index: number; onStop: boolean } {
+  const coordinate = geometry.normalMin + clampFraction(fraction) * geometry.normalExtent;
+  const index = sectionLayerIndex(geometry, fraction) ?? 0;
+  const stop = geometry.stops?.[index];
+  const onStop = stop !== undefined &&
+    Math.abs(stop - coordinate) <= STOP_SNAP_RELATIVE_WINDOW * geometry.normalExtent;
+  return { coordinate, index, onStop };
 }
 
 /** Position fraction that resolves to exactly layer `index`. */
@@ -161,7 +181,8 @@ export function resolvedSectionCoordinate(
   fraction: number,
 ): number {
   if (geometry.stops?.length) {
-    return geometry.stops[sectionLayerIndex(geometry, fraction) ?? 0]!;
+    const position = sectionStopPosition(geometry, fraction);
+    return position.onStop ? geometry.stops[position.index]! : position.coordinate;
   }
   if (geometry.layerCount !== null && geometry.layerSpacing !== null) {
     const index = layerIndexFromFraction(fraction, geometry.layerCount);
@@ -263,10 +284,25 @@ export function stepSectionFraction(
   geometry: PlanarSectionGeometry | null,
   delta: number,
 ): number {
+  const steps = Math.round(delta);
+  if (geometry?.stops?.length) {
+    const position = sectionStopPosition(geometry, fraction);
+    if (position.onStop || steps === 0) {
+      return sectionLayerFraction(geometry, position.index + steps);
+    }
+    // Between node planes: the first step lands on the adjacent plane in the
+    // direction of travel, so no plane is skipped.
+    const stops = geometry.stops;
+    const adjacent = steps > 0
+      ? stops.findIndex((stop) => stop > position.coordinate)
+      : stops.findLastIndex((stop) => stop < position.coordinate);
+    if (adjacent < 0) return clampFraction(fraction);
+    return sectionLayerFraction(geometry, adjacent + steps - Math.sign(steps));
+  }
   const count = sectionLayerCount(geometry);
   if (geometry && count !== null) {
     const index = sectionLayerIndex(geometry, fraction) ?? 0;
-    return sectionLayerFraction(geometry, index + Math.round(delta));
+    return sectionLayerFraction(geometry, index + steps);
   }
   return clampFraction(clampFraction(fraction) + delta * CONTINUOUS_SECTION_STEP);
 }

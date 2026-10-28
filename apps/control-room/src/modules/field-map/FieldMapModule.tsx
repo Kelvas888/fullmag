@@ -389,7 +389,7 @@ function useFieldMapModuleController() {
       JSON.stringify({
         sessionFrameKey,
         domainGenerationId: domain.data?.generation_id ?? null,
-        defaultSliceShape: canonicalPlanar
+        defaultSliceShape: canonicalPlanar?.source.kind === "default"
           ? {
               operator: canonicalPlanar.default_slice.operator,
               plane: canonicalPlanar.default_slice.plane,

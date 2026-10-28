@@ -138,4 +138,39 @@ describe("FEM node-plane stops", () => {
     // Stops of another plane are ignored.
     expect(withSectionStops(continuous, { layer_stops_m: [0, 1], plane: "xz" })?.stops).toBeUndefined();
   });
+
+  it("keeps a request between node planes and steps to the adjacent plane", async () => {
+    const {
+      resolvedSectionCoordinate,
+      sectionStopPosition,
+      stepSectionFraction,
+      withSectionStops,
+    } = await import("./planarSectionModel");
+    // Three exact layers in a 9 nm film inside an 80 nm domain.
+    const geometry = withSectionStops({
+      layerCount: null,
+      layerSpacing: null,
+      nativeResolution: null,
+      normal: "z" as const,
+      normalExtent: 80e-9,
+      normalMax: 40e-9,
+      normalMin: -40e-9,
+      plane: "xy" as const,
+      u: "x" as const,
+      v: "y" as const,
+    }, {
+      layer_stops_m: [-4.5e-9, -1.5e-9, 1.5e-9, 4.5e-9],
+      plane: "xy",
+    })!;
+    const fractionOf = (z: number) => (z + 40e-9) / 80e-9;
+    expect(sectionStopPosition(geometry, 0.5).onStop).toBe(false);
+    expect(resolvedSectionCoordinate(geometry, 0.5)).toBeCloseTo(0, 18);
+    expect(sectionStopPosition(geometry, fractionOf(1.5e-9)).onStop).toBe(true);
+    expect(resolvedSectionCoordinate(geometry, fractionOf(1.5e-9))).toBeCloseTo(1.5e-9, 18);
+    expect(stepSectionFraction(0.5, geometry, 1)).toBeCloseTo(fractionOf(1.5e-9), 12);
+    expect(stepSectionFraction(0.5, geometry, -1)).toBeCloseTo(fractionOf(-1.5e-9), 12);
+    expect(stepSectionFraction(0.5, geometry, 2)).toBeCloseTo(fractionOf(4.5e-9), 12);
+    // Above the top plane there is no further stop in that direction.
+    expect(stepSectionFraction(fractionOf(20e-9), geometry, 1)).toBeCloseTo(fractionOf(20e-9), 12);
+  });
 });

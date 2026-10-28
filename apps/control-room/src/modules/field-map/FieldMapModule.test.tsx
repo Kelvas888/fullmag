@@ -405,13 +405,15 @@ describe("FieldMapModule planar state ownership", () => {
   });
 
   it.each([
-    ["plane", { default_slice: { plane: "xz", position_fraction: 0.5, operator: { kind: "plane_sample" } } }, null],
-    ["position", { default_slice: { plane: "xy", position_fraction: 0.75, operator: { kind: "plane_sample" } } }, null],
-    ["operator", { default_slice: { plane: "xy", position_fraction: 0.5, operator: { kind: "slab_average", thickness_m: 1e-9 } } }, null],
-    ["vector budget", { resolution: { width: 256, height: 128, vector_budget: 1024 } }, null],
-    ["default source definition", {}, "changed-default-hash"],
-    ["monitor source definition", {}, "changed-monitor-hash"],
-  ])("discards a retained frame when %s changes during scalar refresh", async (_label, patch, sourceHash) => {
+    ["plane", { default_slice: { plane: "xz", position_fraction: 0.5, operator: { kind: "plane_sample" } } }, null, false],
+    ["operator", { default_slice: { plane: "xy", position_fraction: 0.5, operator: { kind: "slab_average", thickness_m: 1e-9 } } }, null, false],
+    ["vector budget", { resolution: { width: 256, height: 128, vector_budget: 1024 } }, null, false],
+    ["monitor source definition", {}, "changed-monitor-hash", false],
+    // A layer step keeps the previous frame mounted (mumax3 parity); the
+    // section readout names the shown and the loading layer.
+    ["position", { default_slice: { plane: "xy", position_fraction: 0.75, operator: { kind: "plane_sample" } } }, null, true],
+    ["default source definition", {}, "changed-default-hash", true],
+  ])("retention when %s changes during scalar refresh", async (_label, patch, sourceHash, retained) => {
     const planar = {
       component: "magnitude",
       quantity_id: "m",
@@ -451,14 +453,15 @@ describe("FieldMapModule planar state ownership", () => {
       mocks.visualization.data = { planar: { ...planar, ...patch } };
       mocks.sourceDefinitionHash = sourceHash as string | null;
       await render();
-      expect(mocks.surface).not.toHaveBeenCalled();
+      if (retained) expect(mocks.surface).toHaveBeenCalled();
+      else expect(mocks.surface).not.toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
       dom.restore();
     }
   });
 
-  it("does not duplicate Inspector-owned planar selection controls", () => {
+  it("keeps source selection in the Inspector and exposes the D2D-01 toolbar over the same state", () => {
     mocks.visualization.data = {
       planar: {
         colormap: "viridis",
@@ -486,9 +489,11 @@ describe("FieldMapModule planar state ownership", () => {
     const html = renderToStaticMarkup(<FieldMapModule />);
 
     expect(html).not.toContain('aria-label="Planar field selection controls"');
-    for (const label of ["Source", "Quantity", "Component", "Plane"]) {
-      expect(html).not.toContain(`aria-label="${label}"`);
-    }
+    expect(html).not.toContain('aria-label="Source"');
+    // D2D-01: quantity, component, plane and layer controls sit above the map
+    // and write the same visualization/state.planar as the Inspector.
+    expect(html).toContain('aria-label="2D view controls"');
+    expect(html).toContain('aria-label="Component"');
   });
 
   it("renders a horizontal scalar instrument with min, ramp, and max in display units", () => {
@@ -556,7 +561,7 @@ describe("FieldMapModule planar state ownership", () => {
       '<div class="fm-field-map__canvas-stack"><output data-planar-render-layers=',
     );
     expect(html).toMatch(
-      /<div class="fm-field-map__canvas-stack">[\s\S]*<table class="fm-field-map__pinned-probe">[\s\S]*<\/table><\/div>/,
+      /<div class="fm-field-map__canvas-stack">[\s\S]*<table [^>]*class="fm-field-map__pinned-probe">[\s\S]*<\/table><\/div>/,
     );
   });
 

@@ -16,6 +16,7 @@ import {
   sectionLayerFraction,
   sectionLayerIndex,
   sectionReduction,
+  sectionStopPosition,
   stepSectionFraction,
   withSectionStops,
   type PlanarSectionPlane,
@@ -64,10 +65,18 @@ export function PlanarSectionStrip({
   const committedStep = layerCount !== null && geometry
     ? sectionLayerIndex(geometry, defaultSlice.position_fraction) ?? 0
     : Math.round(defaultSlice.position_fraction * FRACTION_STEPS);
-  const step = draft?.key === draftKey ? draft.value : committedStep;
-  const fraction = layerCount !== null && geometry
-    ? sectionLayerFraction(geometry, step)
-    : step / FRACTION_STEPS;
+  const drafting = draft?.key === draftKey;
+  const step = drafting ? draft.value : committedStep;
+  // A committed FEM request may sit between node planes; the backend samples
+  // it there, so the readout uses the request rather than the nearest plane.
+  const betweenStops = !drafting && geometry?.stops
+    ? !sectionStopPosition(geometry, defaultSlice.position_fraction).onStop
+    : false;
+  const fraction = betweenStops
+    ? defaultSlice.position_fraction
+    : layerCount !== null && geometry
+      ? sectionLayerFraction(geometry, step)
+      : step / FRACTION_STEPS;
   const coordinate = geometry ? resolvedSectionCoordinate(geometry, fraction) : null;
   const axis = geometry?.normal ?? (plane === "xy" ? "z" : plane === "xz" ? "y" : "x");
 
@@ -184,7 +193,11 @@ export function PlanarSectionStrip({
               ? `showing ${axis} = ${formatSectionLength(shownCoordinate)} · loading `
               : `${axis}: `}
             {formatSectionLength(coordinate ?? Number.NaN)}
-            {layerCount !== null ? ` · ${layerNoun} ${step} / ${layerCount - 1}` : ""}
+            {layerCount === null
+              ? ""
+              : betweenStops
+                ? ` · between ${layerNoun}s`
+                : ` · ${layerNoun} ${step} / ${layerCount - 1}`}
           </span>
         </>
       )}
