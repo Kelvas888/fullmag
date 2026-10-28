@@ -152,10 +152,10 @@ jobs:
       - name: Run native container recovery capability CLI contracts
         run: cargo test -p fullmag-cli --bin fullmag container_recovery_capabilities
 
-      - name: Verify read-only saved FDM playback and binary frame routes
+      - name: Verify read-only saved FDM/FEM playback and binary frame routes
         run: |
           cargo test --locked -p fullmag-workspace-inspect --lib
-          cargo test --locked -p fullmag-api --bin fullmag-api saved_playback_routes_return_metadata_and_revision_checked_binary_frames
+          cargo test --locked -p fullmag-api --bin fullmag-api saved_playback_
 
       - name: Run instance discovery contracts (ADR 0069)
         run: cargo test -p fullmag-api --bin fullmag-api instance_discovery::tests --no-fail-fast
