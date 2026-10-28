@@ -47,6 +47,10 @@ const DEFAULT_RESOLUTION: u32 = 128;
 const MIN_RESOLUTION: u32 = 16;
 const MAX_RESOLUTION: u32 = 2048;
 
+#[path = "planar_profile.rs"]
+pub mod planar_profile;
+pub use planar_profile::*;
+
 #[derive(Debug, Clone)]
 enum PlanarDataSource {
     Default,
