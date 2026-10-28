@@ -178,7 +178,7 @@ docker-dev-stop-saved-authoring attempt config_sha256 source_root checkpoint che
 
 # Read-only preview by default; apply creates a verified copy for one stopped master.
 docker-dev-recover-isolated source_root operator_pins recovery_id terminal_runs held_runs restore_run_id apply="false":
-    @{{storage_python}} "{{repo_root}}/scripts/docker_isolated_session_recovery.py" --repo-root "{{repo_root}}" --source-root {{quote(source_root)}} --operator-pins {{quote(operator_pins)}} --recovery-id {{quote(recovery_id)}} --retained-terminal-runs {{quote(terminal_runs)}} --retained-held-manual-runs {{quote(held_runs)}} --restore-run-id {{quote(restore_run_id)}} {{if apply == "true" { "--apply" } else if apply == "false" { "" } else { error("apply must be true or false") }}}
+    @{{storage_python}} "{{repo_root}}/scripts/docker_isolated_session_recovery.py" --repo-root "{{repo_root}}" --source-root {{quote(source_root)}} --operator-pins {{quote(operator_pins)}} --recovery-id {{quote(recovery_id)}} --retained-terminal-runs {{quote(terminal_runs)}} --retained-held-manual-runs {{quote(held_runs)}} --restore-run-id {{quote(restore_run_id)}} {{if apply == "true" { "--apply" } else if apply == "false" { "" } else { error("apply must be true or false") } }}
 
 # Explicit managed recovery of one stopped Docker namespace. The old attempt,
 # Compose config digest, source checkout, frontend port, and control-volume
