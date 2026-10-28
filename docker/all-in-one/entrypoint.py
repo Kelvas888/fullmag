@@ -577,6 +577,10 @@ def serve():
         signal.signal(number, lambda *_: stopping.set())
     paths = service.prepare_storage()
     try:
+        if (os.environ.get("FULLMAG_ISOLATED_SNAPSHOT_START") is not None
+                or os.environ.get("FULLMAG_ISOLATED_SNAPSHOT_START_SHA256") is not None):
+            import runtime_service_snapshot
+            runtime_service_snapshot.admit(paths, service)
         bootstrap = service.initialize_accepted_store(paths)
     except Exception as error:
         return _serve_startup_diagnostics(service, paths, stopping, error)

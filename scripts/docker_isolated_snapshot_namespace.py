@@ -210,6 +210,13 @@ def validate_snapshot_namespace_receipt(
     pins = receipt["control_pins"]
     if type(pins) is not dict or not 1 <= len(pins) <= MAX_PINS:
         _fail("control_pins must be a bounded nonempty object")
+    startup_prefix = namespace + "/isolated-snapshot/"
+    startup_paths = {
+        startup_prefix + name for name in (
+            "start.json", "copied-content.json", "source-manifest.json",
+            "request.json", "original-config.json",
+        )
+    }
     pin_digests = {}
     for path, pin in pins.items():
         safe_path = _control_relative(path, "control pin path")
@@ -217,16 +224,25 @@ def validate_snapshot_namespace_receipt(
         if (
             safe_path == REGISTRY_PATH
             or safe_path == own_receipt_path
-            or safe_path.startswith(namespace + "/")
+            or (safe_path.startswith(namespace + "/") and safe_path not in startup_paths)
         ):
-            _fail("control_pins cannot pin the current registry or snapshot receipt")
+            _fail("control_pins cannot pin the current registry, snapshot receipt, or other new namespace paths")
         pin_digests[safe_path] = digest
 
     required_paths = _required_pin_paths(previous_namespace, previous_registry_path, old_attempt)
+    required_paths.update(startup_paths)
     if not required_paths.issubset(pin_digests):
-        _fail("control_pins omit required prior-session control records")
+        _fail("control_pins omit required prior-session or immutable startup records")
     if pin_digests[previous_registry_path] != previous_registry_sha256:
         _fail("previous registry digest conflicts with its control pin")
+
+    for name, digest_field in (
+        ("source-manifest.json", "source_manifest_sha256"),
+        ("request.json", "request_sha256"),
+        ("original-config.json", "original_config_sha256"),
+    ):
+        if pin_digests[startup_prefix + name] != receipt[digest_field]:
+            _fail("Immutable startup " + name + " digest differs from its archived source pin")
 
     # A path may be referenced through more than one receipt field only when
     # every reference authenticates the same bytes.

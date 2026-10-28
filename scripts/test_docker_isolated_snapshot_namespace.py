@@ -92,6 +92,26 @@ def make_receipt(previous_namespace="namespaces/" + PREVIOUS_ID):
         for path in sorted(required_paths)
     }
     raw_files[previous_registry_path] = previous_registry_raw
+    startup_prefix = receipt["namespace"] + "/isolated-snapshot/"
+    for name, archive in (
+        ("source-manifest.json", receipt["source_manifest_path"]),
+        ("request.json", receipt["request_path"]),
+        ("original-config.json", receipt["original_config_path"]),
+    ):
+        raw_files[startup_prefix + name] = raw_files[archive]
+    raw_files[startup_prefix + "copied-content.json"] = encode({"state": {}, "user_data": {}})
+    raw_files[startup_prefix + "start.json"] = encode({
+        "schema": "fullmag.isolated-snapshot-start.v1", "allow_script_replay": False,
+        "request_sha256": receipt["request_sha256"],
+        "config_sha256": receipt["original_config_sha256"],
+        "source_manifest_sha256": receipt["source_manifest_sha256"],
+        "copied_content_sha256": digest(raw_files[startup_prefix + "copied-content.json"]),
+        "restore_run_id": "run-held",
+    })
+    receipt["control_pins"].update({
+        startup_prefix + name: digest(raw_files[startup_prefix + name])
+        for name in ("start.json", "copied-content.json", "source-manifest.json", "request.json", "original-config.json")
+    })
     return receipt, raw_files
 
 
@@ -238,6 +258,32 @@ class SnapshotReceiptValidationTests(unittest.TestCase):
             ):
                 self.validate(candidate)
 
+    def test_requires_all_five_exact_immutable_startup_pins(self):
+        receipt, _ = make_receipt()
+        prefix = receipt["namespace"] + "/isolated-snapshot/"
+        for name in ("start.json", "copied-content.json", "source-manifest.json", "request.json", "original-config.json"):
+            candidate = copy.deepcopy(receipt)
+            del candidate["control_pins"][prefix + name]
+            with self.subTest(missing=name), self.assertRaises(docker_build_control.BuildControlError):
+                self.validate(candidate)
+        for suffix in ("isolated-snapshot/native-validation.json", "isolated-snapshot/other.json", "runtime-control/OWNER.json", "isolated-snapshot/start.json/extra"):
+            candidate = copy.deepcopy(receipt)
+            candidate["control_pins"][receipt["namespace"] + "/" + suffix] = "1" * 64
+            with self.subTest(forbidden=suffix), self.assertRaises(docker_build_control.BuildControlError):
+                self.validate(candidate)
+        candidate = copy.deepcopy(receipt)
+        candidate["control_pins"]["namespace-recovery/" + RECOVERY_ID + "/terminal.json"] = "2" * 64
+        with self.assertRaises(docker_build_control.BuildControlError):
+            self.validate(candidate)
+
+    def test_startup_source_pins_must_match_existing_archived_receipt_fields(self):
+        receipt, _ = make_receipt()
+        for name in ("source-manifest.json", "request.json", "original-config.json"):
+            candidate = copy.deepcopy(receipt)
+            candidate["control_pins"][receipt["namespace"] + "/isolated-snapshot/" + name] = "1" * 64
+            with self.subTest(name=name), self.assertRaises(docker_build_control.BuildControlError):
+                self.validate(candidate)
+
     def test_source_references_cannot_self_pin_registry_or_snapshot_receipt(self):
         receipt, _ = make_receipt()
         forbidden = (
@@ -375,6 +421,31 @@ class SnapshotNamespaceResolutionTests(unittest.TestCase):
                 self.control, malformed_registry, malformed_registry_raw
             )
         self.assertEqual(self.original_state(), original_state)
+
+    def test_rejects_coherent_staged_startup_drift_before_resolution_mutation(self):
+        prefix = self.receipt["namespace"] + "/isolated-snapshot/"
+        archived = {field: self.files[self.receipt[field]] for field in (
+            "source_manifest_path", "request_path", "original_config_path"
+        )}
+        initial_files = copy.deepcopy(self.files)
+        original_state = self.original_state()
+        for name, meta_field in (
+            ("source-manifest.json", "source_manifest_sha256"),
+            ("request.json", "request_sha256"),
+            ("original-config.json", "config_sha256"),
+            ("copied-content.json", "copied_content_sha256"),
+        ):
+            self.files = copy.deepcopy(initial_files)
+            self.files[prefix + name] += b" changed coherently with staged metadata"
+            meta = json.loads(self.files[prefix + "start.json"])
+            meta[meta_field] = digest(self.files[prefix + name])
+            self.files[prefix + "start.json"] = encode(meta)
+            patcher, _ = self.patch_reader()
+            with self.subTest(name=name), patcher, self.assertRaises(docker_build_control.BuildControlError):
+                snapshot.resolve_snapshot_namespace(self.control, self.registry, self.registry_raw)
+            self.assertEqual(self.original_state(), original_state)
+            for field, raw in archived.items():
+                self.assertEqual(self.files[self.receipt[field]], raw)
 
     def test_rejects_pinned_file_drift_without_mutating_control(self):
         original_state = self.original_state()

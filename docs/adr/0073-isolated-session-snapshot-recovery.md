@@ -27,7 +27,13 @@ Nie kopiujemy certyfikatu przyjęcia ani natywnego OWNER do nowej authority.
 Workspace SQLite kopiujemy wraz z WAL w spójnym, sprawdzonym inventory,
 pod wyłączną blokadą OFD zakresu lock-byte strony DB (otwarcie O_RDWR tylko
 do kernellowej blokady, bez zmiany danych) i read fence locków WAL.
-WAL nieposiadający jeszcze shm także wymaga wyłącznej blokady DB;
+WAL nieposiadający jeszcze shm także wymaga wyłącznej blokady DB.
+Przy mapowaniu UID wykluczającym właścicielskie otwarcie na hoście używamy
+krótkiego przypiętego helpera BuildControl z rzeczywistym UID/GID właściciela
+odczytanym przez Docker, bez capabilities. Root/control/registry są readonly,
+a jedynym RW bindem jest sam plik workspace.db. Operator przez readonly FD
+potwierdza konflikt własnego OFD read lock z helperem na tym samym inode.
+Brak konfliktu oznacza odmowę. Nie ma chmod/chown ani słabszej blokady źródła;
 sprawdzenie bazy może modyfikować wyłącznie nową kopię.
 
 Natywny walidator wyłącznie do odczytu ponownie sprawdza pełny union runów,
@@ -54,3 +60,16 @@ Runtime: niezmieniony oryginał, te same runy/wyniki/model, held nadal Accepted,
 brak Solve/Fields oraz właściwe Quantity Source Airboxa w przeglądarce.
 Rollback zachowuje nową kopię i wskazuje stary zachowany namespace; nie
 uruchamia starej inkarnacji automatycznie.
+
+## Odtworzenie bieżącego modelu
+
+Snapshot obejmuje także runtime-control/local-live (model bieżący i historyczny
+command journal) kopiowany wewnątrz control volume bez native OWNER/config.
+Manifest obejmuje pełne hashe tych plików. Dla źródła, którego bieżący model
+był tylko w pamięci, operator jawnie przypina restore_run_id należący do held
+pins. Nowa prywatna ścieżka API odtwarza model z immutable Study/SceneDocument
+i istniejącego przygotowania przed listen, zachowując logiczne session/run IDs,
+requested intent i manual gate. Nie produkuje starego Failed-owner proof ani
+nie rozluźnia istniejącego reattach. Metadane nowej authority mają osobny typ.
+Jest to prywatny startup protocol; publiczne OpenAPI i transport UI nie zmieniają
+schematu. Oryginał pozostaje niezmieniony także przy błędzie nowego API.
