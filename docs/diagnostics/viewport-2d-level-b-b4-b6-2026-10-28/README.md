@@ -43,3 +43,18 @@ B = `074446535` (kandydaci z BVH cache'owanego po fingerprincie topologii). 12 p
 (XY, XZ, YZ × φ = 0,2 / 0,37 / 0,5 / 0,81, 384×384, `pm_n17_ab.py`): skróty rastra skalarnego i maski
 oraz współrzędne **identyczne** we wszystkich 12 (`pm_n17_A.json`, `pm_n17_B.json`). Czasy meta
 porównywalne (25–98 ms) — siatka fixture jest mała; pomiary 200k/2M elementów pozostają otwarte.
+
+### PM-N17 — skala 164k elementów
+Fixture `examples/viewport_2d_fem_large_mesh_smoke.py` (film 80×60×40 nm, h ≈ 2,2 nm, powietrze 8 nm;
+164 425–164 444 Tet4, 26,5k węzłów). Mesher nie jest deterministyczny między startami grupy, więc
+skróty A/B na tej siatce nie są porównywalne. Zamiast tego, w jednym procesie z buildem z indeksem
+(`pm_n17_probe_check.py`): 4 przekroje (XY ×2, XZ, YZ; 2865–5758 przeciętych elementów),
+300 losowych pikseli 256² porównanych z sondą w środku piksela (sonda = skan bezpośredni):
+168/168 zajętych pikseli z wartością bitowo równą, 0 pikseli pustych w rastrze przy zajętej sondzie
+(indeks nie gubi elementów), 1 piksel zajęty w rastrze przy pustej sondzie — różnica tolerancji
+brzegowej rasteryzacja/sonda istniejąca wcześniej (indeks może tylko usuwać kandydatów).
+Czas meta dla świeżej płaszczyzny 512²: mediana 380 ms (bez indeksu) i 419 ms (z indeksem; pierwsza
+płaszczyzna 523 ms z budową BVH) — przy 164k elementów indeks nie daje mierzalnego przyspieszenia
+end-to-end (dominują inne etapy żądania). Punkt 2M elementów nie został uruchomiony (generowanie
+siatki tej skali w grupie DEV), więc korzyść wydajnościowa PM-N17 pozostaje niewykazana.
+
