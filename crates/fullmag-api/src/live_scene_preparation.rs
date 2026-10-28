@@ -927,7 +927,13 @@ pub(crate) async fn publish_accepted_frontier_preparation(
                 format!("accepted preparation snapshot validation failed: {error:#}"),
             )
         })?;
-        let step_id = if command_kind_for_worker == "accepted_run_reattach" {
+        // Both private restore callers validate their own distinct authority
+        // before reaching this exact existing anchor projection. This branch
+        // grants no restore authority and never releases or executes a task.
+        let step_id = if matches!(
+            command_kind_for_worker.as_str(),
+            "accepted_run_reattach" | "isolated_snapshot_restore"
+        ) {
             let anchor = store
                 .read_preparation_receipt(typed_run_id.as_str())
                 .map_err(|error| {

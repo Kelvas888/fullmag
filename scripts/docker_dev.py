@@ -69,6 +69,7 @@ BASE_CONTEXT_FILES = (
     ("linux_native_probe.py", "docker/all-in-one/linux_native_probe.py"),
     ("runtime_service.py", "docker/all-in-one/runtime_service.py"),
     ("runtime_service_unclaimed_cancellation.py", "docker/all-in-one/runtime_service_unclaimed_cancellation.py"),
+    ("runtime_service_snapshot.py", "docker/all-in-one/runtime_service_snapshot.py"),
     ("frontend_dev.py", "docker/all-in-one/frontend_dev.py"),
     ("healthcheck.py", "docker/all-in-one/healthcheck.py"),
     ("docker_startup_script.py", "scripts/docker_startup_script.py"),
