@@ -250,7 +250,7 @@ export function PlanarSurface({
             pinchRef.current = null;
             if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
             const segmentDrag = segmentDragRef.current;
-            if (segmentDrag?.pointerId === event.pointerId) {
+            if (segmentDrag && segmentDrag.pointerId === event.pointerId) {
               segmentDragRef.current = null;
               const [u, v] = pointerUv(event.currentTarget, event.clientX, event.clientY, model.viewport);
               setDraftSegment(null);
@@ -287,7 +287,7 @@ export function PlanarSurface({
             }
             const [u, v] = pointerUv(event.currentTarget, event.clientX, event.clientY, model.viewport);
             const segmentDrag = segmentDragRef.current;
-            if (segmentDrag?.pointerId === event.pointerId) {
+            if (segmentDrag && segmentDrag.pointerId === event.pointerId) {
               setDraftSegment({ u0: segmentDrag.u0, u1: u, v0: segmentDrag.v0, v1: v });
               return;
             }

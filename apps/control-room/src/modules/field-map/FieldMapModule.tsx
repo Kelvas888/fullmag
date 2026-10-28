@@ -493,7 +493,7 @@ function useFieldMapModuleController() {
       : null,
     { enabled: plan.enabled },
   );
-  const profileLengthUnit = useMemo(() => renderModel
+  const profileLengthUnit = useMemo(() => activeProfileSegment && renderModel?.frame
     ? resolvePlanarAxes(
         {
           normal: renderModel.frame.normal,
@@ -506,7 +506,7 @@ function useFieldMapModuleController() {
         1,
         1,
       ).displayLengthUnit
-    : null, [renderModel]);
+    : null, [activeProfileSegment, renderModel]);
 
 
   const evidenceStatus: PlanarEvidenceStatus = resolvePlanarEvidenceStatus({
