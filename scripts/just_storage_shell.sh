@@ -443,6 +443,7 @@ case "${recipe}" in
     docker_dev_up_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" up[ ]+(--port '([0-9]{4,5})'[ ]+)?--gpu-access '(auto|required|disabled)'( --source-root '([^']+)')?( --script '([^']+)')?[[:space:]]*$"
     docker_dev_codegen_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" codegen-openapi( --source-root '([^']+)')?[[:space:]]*$"
     docker_dev_recreate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" recreate --direct-development --run-receipt '([^']+)' --previous-config-sha256 '([0-9a-f]{64})' --gpu-access '(auto|required|disabled)'[ ]+(--source-root '([^']+)'[ ]+)?--port '([0-9]{4,5})'[[:space:]]*$"
+    docker_dev_recovery_build_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})' --restart-backend --build-for-recovery '(verification/[A-Za-z0-9._/-]+\\.json)' --build-for-recovery-sha256 '([0-9a-f]{64})'[[:space:]]*$"
     docker_dev_resume_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" resume-volume --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --port '([0-9]{4,5})'( --restart-backend)?( --prestart-reconciliation '([0-9a-f]{32})' --prestart-reconciliation-sha256 '([0-9a-f]{64})')?[[:space:]]*$"
     docker_dev_discover_script_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" script --script '([^']+)'( --source-root '([^']+)')?( --port '([0-9]{4,5})')?( --request-id '([^']+)')?[[:space:]]*$"
     docker_dev_activate_pattern="^[^[:space:]]+ \"[^\"]+/scripts/docker_dev.py\" --repo-root \"[^\"]+\" activate-script --attempt '([0-9a-f]{32})' --config-sha256 '([0-9a-f]{64})' --source-root '([^']+)' --script '([^']+)'( --request-id '([^']+)')?[[:space:]]*$"
@@ -484,6 +485,10 @@ case "${recipe}" in
       docker_dev_args+=(activate-script --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
         --source-root "${BASH_REMATCH[3]}" --script "${BASH_REMATCH[4]}")
       if [[ -n "${BASH_REMATCH[6]:-}" ]]; then docker_dev_args+=(--request-id "${BASH_REMATCH[6]}"); fi
+    elif [[ "${recipe}" =~ ${docker_dev_recovery_build_pattern} ]]; then
+      docker_dev_args+=(resume-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
+        --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}" --restart-backend
+        --build-for-recovery "${BASH_REMATCH[5]}" --build-for-recovery-sha256 "${BASH_REMATCH[6]}")
     elif [[ "${recipe}" =~ ${docker_dev_resume_pattern} ]]; then
       docker_dev_args+=(resume-volume --attempt "${BASH_REMATCH[1]}" --config-sha256 "${BASH_REMATCH[2]}"
         --source-root "${BASH_REMATCH[3]}" --port "${BASH_REMATCH[4]}")

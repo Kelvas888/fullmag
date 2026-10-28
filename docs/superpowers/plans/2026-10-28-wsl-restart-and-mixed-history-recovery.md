@@ -318,3 +318,55 @@ powtarzalny adapter tej obserwacji do kanonicznego guard nadal powstaje;
 jednorazowy odczyt metadanych nie zastępuje tej bramki. Równolegle przygotowywana
 jest jawna ścieżka buildu pakietu w zatrzymanym fixed backendzie za zamkniętą
 bramką storage. Obie zmiany wymagają osobnych regresji i przeglądu przed użyciem.
+
+
+## Przyrostowe przygotowanie pakietu za zamkniętą bramką storage
+
+Dodano jawną receptę `docker-dev-build-for-recovery` oraz zamknięty request
+`fullmag.retained-recovery-build.v1`. Recepta wybiera dokładnie zachowany attempt,
+kanoniczny hash Compose, source root, request z control volume i jego SHA256;
+port naszej grupy pozostaje 3203. Nie jest to zwykły resume ani admission.
+
+Przed startem wymagane są niezmienione Ready owner, pełne piny terminal/held,
+certyfikat prepared z restart_verified=false, zgodny prywatny cache bez aktywnych
+konsumentów i dokładne bajty kontrolera oraz helperów starego obrazu. Obraz
+kompiluje i publikuje pakiet przed bramką storage; zgodność funkcji `_serve`
+i `validate_host` jest dodatkowo sprawdzana względem przejrzanych źródeł.
+Tylko istniejący backend może wystartować. Frontend pozostaje zatrzymany.
+
+Po publikacji najpierw porównywane są source/receipt/provenance i surowe hashe,
+a dopiero potem wykonywane read-only CLI capabilities tego samego sealed binary.
+Pakiet musi rzeczywiście reklamować recovery v4 oraz przypiętą tożsamość buildu.
+Oczekiwanym końcem tej operacji jest naturalna odmowa storage po co najmniej
+240 sekundach, exit 2, bez startu API/native. To sukces przygotowania pakietu,
+nie sukces runtime. Brak potwierdzenia zachowuje operację do rozpoznania;
+nie powoduje automatycznego ponowienia ani zmiany flagi admission.
+
+Docker potrafi zwracać `Mounts` w różnej kolejności dla identycznego kontenera.
+Nowe obserwacje sortują wyłącznie tę listę po unikalnym niepustym Destination;
+porównania starych archiwów normalizują kopię, nie zmieniając surowych dowodów.
+Wszystkie pola Source/RW/options, stan, Config i HostConfig nadal są przypięte.
+Przygotowywany osobno adapter Windows wymaga resolvera jawnie wybranej grupy
+z pasującym Compose i labelem, z zachowaniem domyślnego ograniczenia legacy
+do fullmag-master; ta część pozostaje WIP poza commitem recepty.
+
+Dowody źródłowe: 86 interpretowanych regresji abrupt/legacy/preparation,
+retained context, shell i nowego buildu: PASS. Wcześniejsze 74 kontrole obejmowały
+również adapter Windows przed rozszerzeniem kontroli potomnych reparse points.
+Aktualny adapter Windows nadal wymaga końcowych testów i rzeczywistego preflightu.
+Logi: control volume `verification/recovery-mount-order-20261028/`.
+Nie kompilowano lokalnych testów Rust i nie wykonano jeszcze nowej recepty.
+
+Pełny snapshot 15 919 plików / 537 825 914 B pozostaje identyczny:
+store SHA256 `a7def36ae039208a98f6bce55f254afab818bf407528c38af8312765e5fceb41`,
+ledger `ba6628a5d510d66e40dff31888a68730f0d09e40aa3ef2cdf8ef9638d1e85d8a`.
+FMS użytkownika ma nadal SHA256
+`d1ce5e22d273213da0119492a95a24a46428b75a199a24dbd93dd0c216bf24de`.
+Dowód: `full-store-preservation.log` w powyższym katalogu control volume.
+
+Ocena retencji przed buildem: skill `fullmag-build-stage-cleanup` nie istnieje
+w worktree ani sprawdzonych katalogach skilli użytkownika. Zastosowano fallback
+z build-storage governance. Zachowujemy wszystkie bieżące cache, pakiet rollback,
+logi, dokumenty recovery i wyniki, ponieważ są referencjonowane przez aktywne
+odzyskiwanie. Brak wykazanego zbędnego kandydata; niczego nie usuwano. Ponowna
+ocena dopiero po zweryfikowanym nowym pakiecie i zakończonym recovery.

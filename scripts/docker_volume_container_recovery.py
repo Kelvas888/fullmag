@@ -92,6 +92,24 @@ def _canonical(value: object) -> bytes:
         _fail(f"recovery record is not canonical JSON: {error}")
 
 
+def _stable_container_observation(value):
+    """Docker Mounts is an unordered inventory; preserve every mount field."""
+    if not isinstance(value, Mapping) or not isinstance(value.get("Mounts"), list):
+        _fail("Docker observation has no complete mount inventory")
+    mounts = value["Mounts"]
+    destinations = []
+    for mount in mounts:
+        if not isinstance(mount, Mapping):
+            _fail("Docker observation mount is malformed")
+        destination = mount.get("Destination")
+        if not isinstance(destination, str) or not destination:
+            _fail("Docker observation mount destination is missing")
+        destinations.append(destination)
+    if len(set(destinations)) != len(destinations):
+        _fail("Docker observation has duplicate mount destinations")
+    return {**value, "Mounts": sorted(mounts, key=lambda item: item["Destination"])}
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -1854,7 +1872,8 @@ def prepare_abrupt_stop_proof(
     proof = {"schema": ABRUPT_PROOF_HELD_MANUAL_SCHEMA if retained_held_manual_runs is not None else ABRUPT_PROOF_SCHEMA,
              "authorization_pins": pins,
              "docker_engine_id_sha256": engine_sha, "raw_records": raw_records,
-             "containers": {"backend": backend, "frontend": frontend},
+             "containers": {"backend": _stable_container_observation(backend),
+                            "frontend": _stable_container_observation(frontend)},
              "network": _abrupt_network(backend, frontend, control.project),
              "storage_proof": storage_proof,
              "retained_terminal_runs": copy.deepcopy(retained_terminal_runs)}
@@ -1926,22 +1945,25 @@ def validate_abrupt_stop_proof(proof, authorization, *, control=None, compose=No
         pin = _container_pin(item, service, authorization["compose_project"])
         if pin["container_id"] != authorization[service + "_container_id"] or pin["image_id"] != authorization["old_image_id"]:
             _fail("abrupt archived container differs from authorization")
+    containers = {service: _stable_container_observation(item) for service, item in containers.items()}
     _validate_owner_host(owner, containers["backend"])
     if control is not None:
         if _docker_engine_sha() != proof["docker_engine_id_sha256"]:
             _fail("abrupt Docker engine changed")
         if transition is None:
             current = _inspect_pair(authorization, control.project, compose)
-            if {"backend": current[0], "frontend": current[1]} != containers:
+            if {"backend": _stable_container_observation(current[0]),
+                    "frontend": _stable_container_observation(current[1])} != containers:
                 _fail("abrupt Docker observations changed")
             if _abrupt_network(*current, control.project) != proof["network"]:
                 _fail("abrupt private network observations changed")
         else:
-            if {"backend": transition["backend"], "frontend": transition["frontend"]} != containers:
+            if {service: _stable_container_observation(transition[service])
+                    for service in ("backend", "frontend")} != containers:
                 _fail("prepared retry differs from original abrupt observations")
             for service, item in transition["present"].items():
                 _strict_stopped(item)
-                if item != containers[service]:
+                if _stable_container_observation(item) != containers[service]:
                     _fail("prepared retry Docker observations changed")
             # Old containers may now be absent; network can only be absent or
             # the exact owned bridge without consumers other than the old pair.

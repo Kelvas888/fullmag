@@ -321,6 +321,48 @@ class AbruptStopTests(unittest.TestCase):
         with patch.object(r,'_control_bytes',side_effect=lambda c,p: records[p]), patch.object(r,'_docker_engine_sha',return_value='f'*64), patch.object(r,'_inspect_pair',return_value=tuple(drift.values())):
             with self.assertRaisesRegex(r.ContainerRecoveryError,'observations'): r.validate_abrupt_stop_proof(proof,auth,control=SimpleNamespace(project=compose['name']),compose=compose)
 
+    def test_mount_order_is_not_drift_but_every_mount_field_is_pinned(self):
+        proof, auth, compose = self.fixture()
+        records = {item['path']: item['raw_utf8'].encode() for item in proof['raw_records'].values()}
+        for item in proof['containers'].values():
+            item['Mounts'].append({'Type': 'volume', 'Name': 'cache', 'Destination': '/build',
+                                  'RW': True, 'Options': {'subpath': 'private'}})
+        current = copy.deepcopy(proof['containers'])
+        for item in current.values():
+            item['Mounts'].reverse()
+        original = copy.deepcopy(proof)
+        control = SimpleNamespace(project=compose['name'])
+        with patch.object(r, '_control_bytes', side_effect=lambda c, p: records[p]), \
+             patch.object(r, '_docker_engine_sha', return_value='f'*64), \
+             patch.object(r, '_inspect_pair', return_value=tuple(current.values())), \
+             patch.object(r, '_abrupt_network', return_value=proof['network']), \
+             patch.object(r, '_assert_no_foreign_storage_consumers'), \
+             patch.object(r, '_ledger_and_store_snapshot', return_value=proof['storage_proof']):
+            r.validate_abrupt_stop_proof(proof, auth, control=control, compose=compose)
+            transition = {**current, 'present': current}
+            r.validate_abrupt_stop_proof(proof, auth, control=control, compose=compose, transition=transition)
+            self.assertEqual(proof, original)  # Never rewrite archived evidence.
+            for key, changed in [('Name', 'other-cache'), ('RW', False), ('Options', {'subpath': 'foreign'})]:
+                mount = current['backend']['Mounts'][0]
+                old = mount[key]
+                mount[key] = changed
+                with self.subTest(key=key), self.assertRaisesRegex(r.ContainerRecoveryError, 'observations'):
+                    r.validate_abrupt_stop_proof(proof, auth, control=control, compose=compose)
+                mount[key] = old
+            current['backend']['Mounts'][1]['Source'] = '/other/store'
+            with self.assertRaisesRegex(r.ContainerRecoveryError, 'observations'):
+                r.validate_abrupt_stop_proof(proof, auth, control=control, compose=compose)
+
+    def test_mount_inventory_must_have_unique_nonempty_destinations(self):
+        proof, _, _ = self.fixture()
+        original = proof['containers']['backend']
+        for extra in [dict(original['Mounts'][0]), {}, {'Destination': ''}, {'Destination': 3}, None]:
+            value = copy.deepcopy(original)
+            value['Mounts'].append(extra)
+            with self.subTest(extra=extra), self.assertRaises(r.ContainerRecoveryError):
+                r._stable_container_observation(value)
+
+
     def test_owner_host_and_identity_cannot_be_fabricated(self):
         proof,auth,_=self.fixture()
         for key in ('host','owner_token'):

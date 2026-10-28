@@ -2382,7 +2382,7 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
 
 
 
-def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
+def _wait_for_publication(control, operation, backend_id, *, timeout=14400, publication_pins=None):
     """A previous succeeded package is not evidence that this start finished."""
     import fullmag_docker_runtime as runtime
     deadline = time.monotonic() + timeout
@@ -2416,6 +2416,9 @@ def _wait_for_publication(control, operation, backend_id, *, timeout=14400):
             if (receipt.get("state") != "succeeded" or provenance.get("state") != "succeeded"
                     or provenance.get("build_receipt_sha256") != observed["receipt"]["sha256"]):
                 raise BuildControlError("Current handoff has no matching succeeded package/provenance")
+            if publication_pins is not None:
+                publication_pins.update(receipt_sha256=observed["receipt"]["sha256"],
+                                        provenance_sha256=observed["provenance"]["sha256"])
             return receipt, provenance
         if time.monotonic() - last_report > 45:
             mirror_console("Backend startup is in progress (build, package validation or runtime handoff); see backend service logs. Docker data retained.\n")
@@ -6505,6 +6508,294 @@ print(json.dumps(sorted(result,key=lambda p:p['pid'])))
         operation['daemon_pending'] = False
 
 
+
+_RECOVERY_BUILD_SCHEMA = "fullmag.retained-recovery-build.v1"
+_RECOVERY_BUILD_HELPERS = ("backend_dev.py", "linux_native_probe.py")
+
+
+def _recovery_build_request(raw):
+    import docker_volume_container_recovery as recovery
+    value = json.loads(raw)
+    fields = {"schema", "authorization_pins", "retained_terminal_runs", "retained_held_manual_runs",
+              "storage_proof_sha256", "certificate_sha256", "source_commit", "source_digest",
+              "source_snapshot_sha256", "controller_sha256", "baked_helpers"}
+    if not isinstance(value, dict) or set(value) != fields or value["schema"] != _RECOVERY_BUILD_SCHEMA:
+        raise BuildControlError("Recovery build request fields/schema differ")
+    recovery._abrupt_pins(value["authorization_pins"])
+    recovery.expected_recovery_outcome({"schema_version": recovery.HELD_MANUAL_REQUEST_SCHEMA,
+        "retained_terminal_runs": value["retained_terminal_runs"],
+        "retained_held_manual_runs": value["retained_held_manual_runs"]})
+    for key in ("storage_proof_sha256", "certificate_sha256", "source_digest", "source_snapshot_sha256", "controller_sha256"):
+        recovery._require_sha(value[key], key)
+    if not isinstance(value["source_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["source_commit"]):
+        raise BuildControlError("Recovery build requires the full source commit")
+    if not isinstance(value["baked_helpers"], dict) or set(value["baked_helpers"]) != set(_RECOVERY_BUILD_HELPERS):
+        raise BuildControlError("Recovery build requires both baked helper pins")
+    for key, digest in value["baked_helpers"].items():
+        recovery._require_sha(digest, key)
+    return value
+
+
+def _recovery_build_helpers(backend_id, request, selected):
+    """Authenticate the stopped image and its unchanged fail-closed handoff."""
+    import ast
+    import tarfile
+    for name, symbol in (("backend_dev.py", "_serve"), ("linux_native_probe.py", "validate_host")):
+        archive = docker_capture("cp", backend_id + ":/opt/fullmag/" + name, "-").stdout
+        if len(archive) > 16 * 1024 * 1024:
+            raise BuildControlError("Baked helper exceeds its observation budget")
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as stream:
+            members = stream.getmembers()
+            if len(members) != 1 or not members[0].isfile() or members[0].size > 8 * 1024 * 1024:
+                raise BuildControlError("Baked helper is not one bounded regular file")
+            raw = stream.extractfile(members[0]).read()
+        if hashlib.sha256(raw).hexdigest() != request["baked_helpers"][name]:
+            raise BuildControlError("Baked recovery helper SHA differs: " + name)
+        def function(source):
+            nodes = [node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == symbol]
+            if len(nodes) != 1:
+                raise BuildControlError("Baked storage handoff function is ambiguous")
+            return ast.dump(nodes[0], include_attributes=False)
+        if function(raw) != function((selected / "docker/all-in-one" / name).read_bytes()):
+            raise BuildControlError("Baked storage handoff differs from the reviewed launcher source")
+
+
+def _recovery_build_certificate(state, document, request):
+    host = _session_host()
+    certificate = _retained_certificate(state, document)
+    if certificate.get("storage_profile") != "linux-native-v1" or certificate.get("restart_verified") is not False:
+        raise BuildControlError("Recovery build requires prepared, unverified Linux storage")
+    evidence = {name: hashlib.sha256(host.read_owned_regular(state / name)).hexdigest()
+                for name in host.READMISSION_FILES}
+    if evidence[host.CERTIFICATE_NAME] != request["certificate_sha256"]:
+        raise BuildControlError("Prepared recovery certificate SHA differs")
+    return evidence
+
+
+_RECOVERY_BUILD_CAPABILITY = r'''
+import hashlib,json,os,stat,subprocess,sys
+from pathlib import Path
+root=Path('/opt/fullmag/package')
+paths=[root/'bin/fullmag-bin',root/'backend-build-receipt.json',Path('/opt/fullmag/control/backend/runtime-provenance.json')]
+def observe(path, maximum, shared_payload=False):
+    if path.resolve(strict=True)!=path: raise RuntimeError('Capability path contains a link')
+    with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK),'rb') as stream:
+        before=os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or not 0<before.st_size<=maximum
+                or (before.st_nlink!=1 and (not shared_payload or before.st_mode&0o222))):
+            raise RuntimeError('Capability input is not bounded owned or sealed regular data')
+        digest=hashlib.sha256(); count=0; chunks=[]
+        for block in iter(lambda:stream.read(1024*1024),b''):
+            count+=len(block)
+            if count>maximum or count>before.st_size: raise RuntimeError('Capability input exceeded its size bound')
+            digest.update(block)
+            if not shared_payload: chunks.append(block)
+        after=os.fstat(stream.fileno())
+    def identity(v): return (v.st_dev,v.st_ino,v.st_size,v.st_mtime_ns,v.st_ctime_ns,v.st_nlink,v.st_mode)
+    if count!=before.st_size or identity(before)!=identity(after) or identity(after)!=identity(path.stat()):
+        raise RuntimeError('Capability input changed')
+    return digest.hexdigest(),None if shared_payload else b''.join(chunks)
+def snapshot():
+    return [observe(path,2*1024**3 if i==0 else 8*1024**2,shared_payload=i==0) for i,path in enumerate(paths)]
+expected=json.loads(sys.argv[1])
+if (not isinstance(expected,dict) or set(expected)!={'binary_sha256','receipt_sha256','provenance_sha256'}
+        or any(not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value) for value in expected.values())):
+    raise RuntimeError('Capability publication pins are invalid')
+before=snapshot()
+if [item[0] for item in before]!=[expected['binary_sha256'],expected['receipt_sha256'],expected['provenance_sha256']]:
+    raise RuntimeError('Capability input differs from pinned publication; native command not executed')
+result=subprocess.run([str(paths[0]),'runtime','service-container-recovery-capabilities'],capture_output=True,timeout=30)
+if result.returncode or len(result.stdout)>65536: raise RuntimeError('Native v4 capability command failed')
+if snapshot()!=before: raise RuntimeError('Capability publication changed')
+print(json.dumps({'binary_sha256':before[0][0],'receipt_sha256':before[1][0],'provenance_sha256':before[2][0],
+                  'raw_utf8':result.stdout.decode('utf-8'),'capabilities':json.loads(result.stdout),
+                  'receipt':json.loads(before[1][1]),'provenance':json.loads(before[2][1])}))
+'''
+
+
+def _recovery_build_source(receipt, provenance, request, publication_pins=None):
+    """Validate source and publication before executing its native capability CLI."""
+    source = receipt.get("source", {})
+    native = receipt.get("native_source_identity", {})
+    if (receipt.get("state") != "succeeded" or provenance.get("state") != "succeeded"
+            or source.get("resolved_commit") != request["source_commit"]
+            or source.get("source_digest") != request["source_digest"]
+            or source.get("source_snapshot_sha256") != request["source_snapshot_sha256"]
+            or native.get("head_commit_full") != request["source_commit"]
+            or native.get("source_snapshot_sha256") != request["source_snapshot_sha256"]
+            or provenance.get("commit") != request["source_commit"]
+            or provenance.get("source_digest") != request["source_digest"]
+            or provenance.get("source_snapshot_sha256") != request["source_snapshot_sha256"]):
+        raise BuildControlError("Recovery publication is stale or differs from the requested source")
+    binaries = [item.get("sha256") for item in receipt.get("artifacts", []) if item.get("path") == "bin/fullmag-bin"]
+    receipt_sha = provenance.get("build_receipt_sha256")
+    if (len(binaries) != 1 or not isinstance(binaries[0], str) or not _SHA256.fullmatch(binaries[0])
+            or not isinstance(receipt_sha, str) or not _SHA256.fullmatch(receipt_sha)
+            or provenance.get("binary_hashes", {}).get("fullmag-bin") != binaries[0]):
+        raise BuildControlError("Recovery publication has no coherent native executable/receipt pins")
+    expected = {"binary_sha256": binaries[0], "receipt_sha256": receipt_sha}
+    if publication_pins is not None:
+        if (set(publication_pins) != {"receipt_sha256", "provenance_sha256"}
+                or publication_pins["receipt_sha256"] != receipt_sha
+                or not isinstance(publication_pins["provenance_sha256"], str)
+                or not _SHA256.fullmatch(publication_pins["provenance_sha256"])):
+            raise BuildControlError("Recovery publication raw evidence differs from its provenance")
+        expected["provenance_sha256"] = publication_pins["provenance_sha256"]
+    return expected
+
+
+def _recovery_build_publication(receipt, provenance, capability, request, *, expected=None):
+    pins = _recovery_build_source(receipt, provenance, request)
+    if expected is not None:
+        pins = expected
+    if (capability.get("receipt") != receipt or capability.get("provenance") != provenance
+            or any(capability.get(key) != value for key, value in pins.items())):
+        raise BuildControlError("Native recovery executable/publication changed from the pinned package")
+    value = capability.get("capabilities")
+    if (not isinstance(value, dict) or set(value) != {"schema_version", "supported_recovery_schemas", "build_identity"}
+            or value.get("schema_version") != "runtime_service_container_recovery_capabilities.v1"
+            or json.loads(capability["raw_utf8"]) != value):
+        raise BuildControlError("Invalid native recovery capabilities")
+    schemas = value["supported_recovery_schemas"]
+    build = value["build_identity"]
+    if (not isinstance(schemas, list) or not 1 <= len(schemas) <= 16
+            or any(not isinstance(item, str) or not re.fullmatch(r"runtime_service_container_recovery_request\.v[1-9][0-9]*", item) for item in schemas)
+            or len(schemas) != len(set(schemas)) or "runtime_service_container_recovery_request.v4" not in schemas
+            or not isinstance(build, dict) or set(build) != {"version", "built_at_utc", "git_commit", "worktree_state", "source_snapshot_sha256"}
+            or build.get("git_commit") != request["source_commit"]
+            or build.get("source_snapshot_sha256") != request["source_snapshot_sha256"]
+            or build.get("worktree_state") not in {"clean", "dirty", "unknown"}
+            or not isinstance(build.get("version"), str) or not 0 < len(build["version"]) <= 128
+            or not isinstance(build.get("built_at_utc"), str)
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", build["built_at_utc"])):
+        raise BuildControlError("Actual native package lacks matching v4 recovery capability")
+
+
+def _recovery_build_timeout(actual, started_at, logs):
+    from datetime import datetime
+    state = actual.get("State", {})
+    try:
+        def timestamp(value):
+            # Docker timestamps have nanoseconds; the launcher also supports Python 3.8.
+            return datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00"))
+        elapsed = (timestamp(state["FinishedAt"]) - timestamp(started_at)).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        elapsed = -1
+    if (elapsed < 240 or state.get("Status") != "exited" or state.get("Running") is not False or state.get("Pid") != 0
+            or state.get("StartedAt") != started_at or state.get("ExitCode") != 2
+            or state.get("OOMKilled") is not False or state.get("Error") not in (None, "")
+            or not state.get("FinishedAt")
+            or "phase=gate state=start profile=linux-native-v1" not in logs
+            or "backend-dev: Linux native host admission did not become ready" not in logs
+            or "phase=api state=exec" in logs or "phase=gate state=complete profile=linux-native-v1" in logs):
+        raise BuildControlError("Recovery build has no confirmed storage-gate timeout; outcome retained")
+
+
+def _retained_recovery_build(args, control, previous, document, selected, layout):
+    import docker_volume_container_recovery as recovery
+    import docker_backend_volume_cache as cache_adapter
+    path, digest = getattr(args, "build_for_recovery", None), getattr(args, "build_for_recovery_sha256", None)
+    if (os.name == "nt" or not path or not isinstance(digest, str) or not _SHA256.fullmatch(digest)
+            or not getattr(args, "restart_backend", False)
+            or any(getattr(args, name, None) for name in ("prestart_reconciliation", "prestart_reconciliation_sha256",
+                "script", "helper_source_root", "helper_source_commit"))):
+        raise BuildControlError("Recovery build requires paired pins and plain same-container restart on Linux")
+    raw = _read_cancelled_activation_bytes(control, path)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise BuildControlError("Recovery build request CAS differs")
+    request = _recovery_build_request(raw)
+    if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != request["controller_sha256"]:
+        raise BuildControlError("Recovery build controller SHA differs from the reviewed request")
+    pins = request["authorization_pins"]
+    if (pins["development_attempt"] != args.attempt or pins["compose_config_sha256"] != args.config_sha256
+            or pins["source_root"] != str(selected) or pins["compose_project"] != control.project
+            or pins["old_image_id"] != previous["inputs"]["image_id"]
+            or previous["inputs"]["source_root"] != str(selected)):
+        raise BuildControlError("Recovery build retained source/attempt/group differs")
+    state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Linux sessions")
+    def observe(operation_helper=None):
+        proof = recovery.prepare_abrupt_stop_proof(control, pins, document,
+            retained_terminal_runs=request["retained_terminal_runs"], retained_held_manual_runs=request["retained_held_manual_runs"])
+        owner = json.loads(proof["raw_records"]["owner"]["raw_utf8"])
+        if owner.get("state") != "ready" or hashlib.sha256(canonical(proof["storage_proof"])).hexdigest() != request["storage_proof_sha256"]:
+            raise BuildControlError("Recovery build requires the unchanged Ready owner and retained inventory")
+        backend = proof["containers"]["backend"]
+        config = backend.get("Config", {})
+        if (config.get("Entrypoint") != ["/usr/local/bin/python3", "/opt/fullmag/backend_dev.py"]
+                or config.get("Cmd") != ["start", "--source-root", "/opt/fullmag/source", "--git-common-root", "/opt/fullmag/source-git",
+                    "--output", "/opt/fullmag/package", "--build-root", "/build"]):
+            raise BuildControlError("Recovery build requires the fixed backend build-before-serve command")
+        environment = dict(item.split("=", 1) for item in config.get("Env", []) if "=" in item)
+        if environment.get("FULLMAG_SESSION_STORAGE_PROFILE") != "linux-native-v1" or environment.get("FULLMAG_DOCKER_ROLE") != "backend":
+            raise BuildControlError("Recovery build backend storage gate environment differs")
+        profile = control.read("development/attempts/" + args.attempt + "/backend-cache.json")
+        cache_adapter.validate_container(backend, profile)
+        volume_rows = json.loads(docker_text("volume", "inspect", *sorted(set(profile["volume_names"].values()))))
+        volumes = {row["Name"]: row for row in volume_rows}
+        if set(volumes) != set(profile["volume_names"].values()):
+            raise BuildControlError("Recovery build cache volume inventory differs")
+        profile = {**profile, "volume_documents": {role: volumes[name] for role, name in profile["volume_names"].items()}}
+        live_ids = docker_text("ps", "--quiet", "--no-trunc").split()
+        live = json.loads(docker_text("inspect", *live_ids)) if live_ids else []
+        if not isinstance(live, list) or {row.get("Id") for row in live} != set(live_ids):
+            raise BuildControlError("Recovery cache consumer inventory changed")
+        cache_adapter._assert_no_active_consumers(profile, [row for row in live if row.get("Id") != operation_helper])
+        certificate = _recovery_build_certificate(state, document, request)
+        _recovery_build_helpers(backend["Id"], request, selected)
+        if storage.git(selected, "rev-parse", "HEAD") != request["source_commit"]:
+            raise BuildControlError("Recovery build source HEAD changed")
+        return proof, certificate
+    before, certificate = observe()
+    with control.operation("recovery-build", {"attempt": args.attempt, "config_sha256": args.config_sha256,
+            "request": path, "request_sha256": digest, "source_root": str(selected),
+            "controller_sha256": request["controller_sha256"], "source_commit": request["source_commit"], "image_id": pins["old_image_id"]}) as operation:
+        if _read_cancelled_activation_bytes(control, path) != raw or observe(operation["helper_container_id"]) != (before, certificate):
+            raise BuildControlError("Recovery build evidence changed under the operation lease")
+        control.write(operation["root"] + "/before.json", before)
+        control.write(operation["root"] + "/request.json", request)
+        operation["daemon_pending"] = True
+        compose_capture(document, "start", "backend", timeout=90)
+        backend_id = pins["backend_container_id"]
+        publication_pins = {}
+        receipt, provenance = _wait_for_publication(control, operation, backend_id, publication_pins=publication_pins)
+        expected = _recovery_build_source(receipt, provenance, request, publication_pins)
+        started_at = operation["receipt"].get("backend_started_at")
+        if not started_at or started_at == before["containers"]["backend"]["State"].get("StartedAt"):
+            raise BuildControlError("Recovery publication has no fresh backend start")
+        capability = json.loads(docker_text("exec", backend_id, "/usr/local/bin/python3", "-B", "-c", _RECOVERY_BUILD_CAPABILITY,
+            json.dumps(expected), timeout=90))
+        _recovery_build_publication(receipt, provenance, capability, request, expected=expected)
+        control.write(operation["root"] + "/backend-build-receipt.json", receipt)
+        control.write(operation["root"] + "/provenance.json", provenance)
+        control.write(operation["root"] + "/native-capabilities.json", capability)
+        started_at = operation["receipt"]["backend_started_at"]
+        deadline = time.monotonic() + 300
+        while True:
+            if _recovery_build_certificate(state, document, request) != certificate:
+                raise BuildControlError("Prepared storage changed during recovery build")
+            actual = json.loads(docker_text("inspect", backend_id))[0]
+            if actual.get("Id") != backend_id or actual.get("State", {}).get("StartedAt") != started_at:
+                raise BuildControlError("Recovery backend incarnation changed")
+            if not actual["State"]["Running"]:
+                break
+            if time.monotonic() >= deadline:
+                raise BuildControlError("Recovery build storage-gate outcome is unknown")
+            time.sleep(3)
+        logs = docker_text("logs", "--since", started_at, "--tail", "200", backend_id, combined=True)
+        control.write(operation["root"] + "/storage-gate-timeout-log.json", {"started_at": started_at, "log": logs})
+        _recovery_build_timeout(actual, started_at, logs)
+        after, after_certificate = observe(operation["helper_container_id"])
+        if (after_certificate != certificate or after["raw_records"] != before["raw_records"]
+                or after["storage_proof"] != before["storage_proof"]
+                or after["containers"]["frontend"] != before["containers"]["frontend"]):
+            raise BuildControlError("Native records, retained data or stopped frontend changed during recovery build")
+        control.write(operation["root"] + "/after.json", after)
+        operation["daemon_pending"] = False
+        operation["receipt"].update(state="succeeded", image_id=pins["old_image_id"],
+            backend_container=backend_id, frontend_container=pins["frontend_container_id"],
+            package_built=True, runtime_started=False, storage_admitted=False, runtime_qualification="NOT VERIFIED")
+
+
 def _retained_operation(
     args, *, recreate_services, restart_idle_service=False, stop_after_drain=False,
     resume_recreation_id=None, refresh_frontend_service=False,
@@ -6558,6 +6849,10 @@ def _retained_operation(
     require_fresh_recreation(control, args, previous, recreate_services=recreate_services)
     from docker_volume_preparation_abort import require_fresh_archive
     preparation_abort = require_fresh_archive(control, args, previous, document, recreate_services=recreate_services)
+    if getattr(args, "build_for_recovery", None) or getattr(args, "build_for_recovery_sha256", None):
+        if recreate_services or restart_idle_service or stop_after_drain or refresh_frontend_service or resume_recreation_id is not None:
+            raise BuildControlError("Recovery build is supported only by plain retained resume")
+        return _retained_recovery_build(args, control, previous, document, selected, layout)
     operator_probe_record = _operator_probe_record_from_retained(previous, document)
     image = previous["inputs"]["image_id"]
     if previous["inputs"]["source_root"] != str(selected):
