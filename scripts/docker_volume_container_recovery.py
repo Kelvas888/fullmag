@@ -1667,6 +1667,12 @@ def _prove_foreign_alias_for_abrupt(control, backend, container, alias, compose)
     return prove_foreign_alias_disjoint(control, backend, container, alias, state_root)
 
 
+def _posix_paths_overlap(left, right):
+    # Keep host preflight compatible with Python 3.8 hosts.
+    left, right = PurePosixPath(left), PurePosixPath(right)
+    return left == right or left in right.parents or right in left.parents
+
+
 def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=None, *,
                                          prove_foreign_disjoint=None):
     """Fence every Docker consumer, including stopped containers able to restart."""
@@ -1743,8 +1749,7 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
             if raw_key[0] == "bind":
                 raw_source = PurePosixPath(raw_key[1])
                 raw_overlap = raw_overlap or any(kind == "bind" and isinstance(path, str)
-                    and (raw_source.is_relative_to(PurePosixPath(path))
-                         or PurePosixPath(path).is_relative_to(raw_source))
+                    and _posix_paths_overlap(raw_source, path)
                     for kind, path in protected)
             if raw_overlap:
                 _fail("a foreign Docker container references the recovery store/control/ledger")
@@ -1788,7 +1793,7 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
             if key[0] == "bind" and isinstance(key[1], str):
                 source = PurePosixPath(key[1])
                 overlap = overlap or any(kind == "bind" and isinstance(path, str)
-                    and (source.is_relative_to(PurePosixPath(path)) or PurePosixPath(path).is_relative_to(source))
+                    and _posix_paths_overlap(source, path)
                     for kind, path in protected)
             if overlap:
                 _fail("a foreign Docker container references the recovery store/control/ledger")

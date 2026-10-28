@@ -285,3 +285,36 @@ Obie usługi nadal Exited, bez nowych buildów i Solve. Kolejne bramki:
 commit/push integracji, zarządzany build, świeży namespace probe, natywne
 recovery pełnych 43 runów, cold-load H oraz rzeczywisty odbiór WebGL.
 Cały zakres E0–E12 pozostaje aktywny; zapisany wynik nadal Failed/unassessed.
+
+
+## Rzeczywisty preflight kanonicznego recovery v4
+
+Po integracji `b875ea8a3fe97250f103f0f4e17ab9a165ab3177` wykonano wyłącznie
+odczytowy preflight pełnych 43 runów: 41 terminalnych (22 succeeded, 12 failed,
+7 cancelled) i 2 Accepted/Blocked. Kompletne wejścia zachowano w control volume
+pod `verification/native-v4-canonical-preflight-20261028/inputs-v4.json`.
+Pierwsze odmowy dotyczyły formatu przygotowanego wejścia: request_id wymaga
+UUID z separatorami, a artifact_catalog_sha256 ma być obecne także jako null.
+Nie zmieniano katalogów ani walidatorów w celu dopasowania tych danych.
+
+Surowe bajty zachowanego Compose mają nadal SHA
+`e837e976cfed9ebac25b13ff2824f40e006e05dadb25763de5f13711ef1347b3`.
+Kanoniczny hash JSON wymagany przez nowy kontrakt wynosi
+`66401b85878924fb0ca043cad95c27b219264e52e78461de7535f014d947ca9c`.
+To różne sposoby przypięcia tego samego dokumentu, nie zmiana jego treści.
+
+Rzeczywisty host Python 3.8 wykazał brak PurePosixPath.is_relative_to w nowej
+kontroli obcych konsumentów. Dwie hostowe kontrole używają teraz równoważnego
+porównania równości i obu list parents; helper obrazu zachowuje własny kod.
+40 istniejących regresji abrupt/legacy recovery: PASS, zero failures/errors/skips.
+Dowody: `python38-overlap-regressions.json` i odpowiadający log w tym samym
+katalogu wolumenu. Faktyczny preflight przeszedł naprawione kontrole i zatrzymał
+się na nieobsługiwanym literalnym bind source Windows starego runnera.
+To nadal odmowa bez autoryzacji recovery, bez startu usług i bez Solve.
+
+Read-only Windows metadata potwierdziły obecne pliki VHD Ubuntu i Docker
+Desktop oraz odrębność ich ścieżek od katalogu runnera. Kwalifikowany,
+powtarzalny adapter tej obserwacji do kanonicznego guard nadal powstaje;
+jednorazowy odczyt metadanych nie zastępuje tej bramki. Równolegle przygotowywana
+jest jawna ścieżka buildu pakietu w zatrzymanym fixed backendzie za zamkniętą
+bramką storage. Obie zmiany wymagają osobnych regresji i przeglądu przed użyciem.
