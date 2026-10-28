@@ -273,13 +273,18 @@ sync PREFIX
 
 def confirm_release(control, helper_pin, attempt):
     from docker_build_control import bounded_capture
+    from docker_volume_activation_reconcile import _probe_helper_absence
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         active = control.read_bytes('active', optional=True)
         require(active in (None, (attempt + '\n').encode()), 'active helper owner changed during release')
         result = docker_capture('inspect', helper_pin['id'], allow_failure=True, timeout=30)
         if result.returncode:
-            require(b'No such' in result.stderr, 'helper absence is not confirmed')
+            lines = [line.strip() for line in (result.stdout + result.stderr).decode('utf-8', 'replace').splitlines() if line.strip()]
+            missing = re.compile(r'(?i:(?:Error(?:: response from daemon| response from daemon)?: )?No such (?:object|container): )'
+                                 + re.escape(helper_pin['id']))
+            require(result.returncode == 1 and lines and missing.fullmatch(lines[-1]), 'helper absence is not confirmed')
+            require(_probe_helper_absence('fullmag-control-' + attempt) is not None, 'original helper name is still occupied')
             if active is None:
                 lock = control.helper_args('test ! -e /control/active; test ! -L /control/active; '
                     'test -f /control/operation.lock; test ! -L /control/operation.lock; '

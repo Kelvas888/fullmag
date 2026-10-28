@@ -220,5 +220,30 @@ class ProtocolTests(ReceiptTests):
             helper.assert_not_called()
 
 
+class ReleaseTests(unittest.TestCase):
+    def test_exact_lowercase_and_uppercase_daemon_absence_confirm_release(self):
+        from unittest.mock import patch
+        helper={'id':'a'*64,'image_id':'sha256:'+'b'*64,'started_at':'original'}
+        control=SimpleNamespace(read_bytes=lambda *args,**kwargs:None,helper_args=lambda script:[script])
+        for prefix in ('error: no such object: ','Error: No such container: '):
+            with self.subTest(prefix=prefix),\
+                 patch.object(subject,'docker_capture',return_value=SimpleNamespace(returncode=1,stdout=b'[]\n',stderr=(prefix+helper['id']+'\n').encode())),\
+                 patch('docker_volume_activation_reconcile._probe_helper_absence',return_value='c'*64) as absence,\
+                 patch('docker_build_control.bounded_capture',return_value=SimpleNamespace(returncode=0)) as lock:
+                subject.confirm_release(control,helper,'d'*32)
+                absence.assert_called_once_with('fullmag-control-'+'d'*32)
+                lock.assert_called_once()
+
+    def test_daemon_error_is_never_an_absence_proof(self):
+        from unittest.mock import patch
+        helper={'id':'a'*64,'image_id':'sha256:'+'b'*64,'started_at':'original'}
+        control=SimpleNamespace(read_bytes=lambda *args,**kwargs:None)
+        with patch.object(subject,'docker_capture',return_value=SimpleNamespace(returncode=1,stdout=b'',stderr=b'cannot connect to daemon')),\
+             patch('docker_build_control.bounded_capture') as lock:
+            with self.assertRaisesRegex(ValueError,'absence is not confirmed'):
+                subject.confirm_release(control,helper,'d'*32)
+            lock.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
