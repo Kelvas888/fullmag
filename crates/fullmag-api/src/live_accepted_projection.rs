@@ -3928,7 +3928,9 @@ mod tests {
             let ledger = state.current_command_ledger.lock().await;
             assert_eq!(ledger[0].status, crate::types::CommandLifecycleState::Failed);
             assert_eq!(ledger[0].completion_status, Some(crate::types::CommandCompletionState::Failed));
-            assert_eq!(ledger[0].error.as_deref(), Some("accepted Study execution failed"));
+            assert_eq!(ledger[0].error.as_deref(), Some(
+                "Stage step:run failed: no failure detail was published. Inspect diagnostics and correct the cause before starting another run."
+            ));
             assert!(ledger.iter().skip(1).all(|record|
                 record.status == crate::types::CommandLifecycleState::Running));
             ledger[0].completed_at_unix_ms.unwrap()
