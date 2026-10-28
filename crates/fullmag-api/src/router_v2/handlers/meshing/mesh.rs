@@ -631,10 +631,11 @@ pub async fn replace_mesh_universe_config(
     let mut scene =
         crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
             .await?;
+    // The declared universe and the universe mesh policy are one authored
+    // value; the scene lowering rejects a document where they differ, so a
+    // second Airbox edit must update both (as the authoring routes do).
     scene.study.universe_mesh = Some(config.clone());
-    if scene.universe.is_none() {
-        scene.universe = Some(config.clone());
-    }
+    scene.universe = Some(config.clone());
     let committed =
         crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
             .await?;
