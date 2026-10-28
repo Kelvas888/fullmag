@@ -129,11 +129,16 @@ export function FooterTelemetry({
     [scene.data, selectedObjectId],
   );
   const objectMetrics = useObjectMetricsResource(generalTelemetryEnabled ? objectId : null);
+  // Frequency-response artifacts exist only for studies with such a stage;
+  // polling them elsewhere only produces 404s.
+  const loadsFrequencyResponse =
+    generalTelemetryEnabled &&
+    studyHasFrequencyResponseStage(solverStatus.data?.stage_kind, stageExecution.data);
   const responseProgress = useFrequencyDomainResponseProgressResource({
-    enabled: generalTelemetryEnabled,
+    enabled: loadsFrequencyResponse,
   });
   const responseSweep = useFrequencyDomainResponseSweepResource({
-    enabled: generalTelemetryEnabled,
+    enabled: loadsFrequencyResponse,
   });
   const currentRun = useCurrentRunResource({ enabled: generalTelemetryEnabled });
   const userSolvePhase = status
@@ -1044,6 +1049,19 @@ function activeStageRecord(
   const index = stageExecution?.active_stage_index;
   if (typeof index !== "number") return null;
   return stageExecution?.stages[index] ?? null;
+}
+
+function studyHasFrequencyResponseStage(
+  solverStageKind: string | null | undefined,
+  stageExecution: StageExecutionResource | null | undefined,
+): boolean {
+  return (
+    isFrequencyResponseStageKind(solverStageKind) ||
+    isFrequencyResponseStageKind(stageExecution?.active_stage_kind) ||
+    (stageExecution?.stages ?? []).some((stage) =>
+      isFrequencyResponseStageKind(stage.kind),
+    )
+  );
 }
 
 function isFrequencyResponseStageKind(kind: string | null | undefined): boolean {
