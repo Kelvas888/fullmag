@@ -152,8 +152,9 @@ nieczytelny katalog oraz historię większą niż 64 pliki. Dowody:
 Niezależny przegląd core: brak Required; dwa Required wrappera (serializacja raw
 archiwum i jawna odmowa błędu enumeracji) zostały poprawione przed użyciem.
 
-Rzeczywiste preview/apply, nowy probe w docelowym backendzie, managed build,
-native mixed-history recovery i odbiór H w WebGL pozostają niewykonane.
+W chwili zapisu pierwszego fragmentu rzeczywiste preview/apply były niewykonane;
+wynik późniejszego wznowienia v2 opisano poniżej. Nowy probe w docelowym backendzie,
+managed build, native mixed-history recovery i odbiór H w WebGL pozostają niewykonane.
 Wynik symulacji zachowuje Failed/unassessed. Nie powtarzano Solve.
 
 
@@ -203,6 +204,31 @@ lub zmienionych authority pins. Niezależny review: zero Required po poprawkach.
 Dowody: `verification/linux-native-readmission-20261028/v2-source-tests.json`
 i `v2-source-tests.log`. Nie kompilowano lokalnie testów Rust.
 
-V2 preview/apply i potwierdzenie niezmienności danych po wznowieniu pozostają
-wymagane. Storage nie jest jeszcze namespace-admitted; nowy backend build,
-native mixed-history recovery i rzeczywiste H w UI pozostają otwarte.
+V2 preview i apply wykonano poprawnie z commita
+`1df80cd630e6f7dd58fa8b3c3ddb9aaa9af3b2c3`, przez zarządzaną receptę just.
+Request SHA256: `95dc7f5d476f943e63fa011f9829a404e2ff0cbb27a22bf181443c874ac49fa5`.
+Wynik: **prepared-not-admitted**, `namespace_admitted=false`.
+Niezależna weryfikacja końcowa potwierdziła:
+
+- certyfikat i marker mają dokładnie docelowe bytes/SHA `954b615b…`;
+- zmieniły się wyłącznie host_device i restart_verified;
+- inode i metadane certyfikatu bind-mountu zostały zachowane;
+- probe, sentinel i restart pozostają identyczne;
+- wszystkie 15 919 plików / 537 825 914 B i ledger mają te same hashe jak
+  przed nieudaną próbą i przed wznowieniem;
+- natywne OWNER, LAUNCH i process-tree pozostają identyczne;
+- obie usługi pozostały w dokładnie tym samym stopped state, active nie istnieje;
+- plik FMS użytkownika pozostał identyczny; brak nowego Solve.
+
+Dowody w prywatnym control volume:
+`verification/linux-native-readmission-20261028/v2-preview-preservation.json`,
+`v2-apply.log` oraz `final-verification.json`. Oryginalny request, przygotowanie
+z surowymi bajtami i historia nieudanej próby pozostają zachowane.
+
+Storage nie jest jeszcze namespace-admitted. Nadal wymagane: nowy build w tym
+samym backendzie, rzeczywisty storage probe tej inkarnacji, pełne native v4
+mixed-history recovery oraz odbiór H w UI. Rzeczywisty kod starego obrazu różni
+się od checkoutu: backend_dev.py SHA `dcea3be09d4be564b406eb9c3287b0ae642c09baeb8aad1fc4286fe1158e9ce2`,
+entrypoint.py SHA `55a97db9c023a4324695364a030464f5be2cd67d09593333b17add0e862d300c`.
+Sprawdzony kod obrazu publikuje pakiet przed Linux admission i cgroup gate;
+nie można zastąpić tej weryfikacji samym odczytem nowego checkoutu.
