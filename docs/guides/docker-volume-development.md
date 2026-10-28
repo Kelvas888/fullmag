@@ -723,3 +723,50 @@ niezmieniony. Nie jest to ogólne odzyskiwanie lease ani trasa dla aktywnego run
 
 Po sukcesie użyj zwykłego przypiętego resume-volume --restart-backend.
 Inne zmiany tożsamości, aktywny/nieznany konsument albo różne piny blokują zapis.
+
+
+## Authored input after accepted recovery
+
+Accepted live runs retain the authored SceneDocument in the immutable project
+definition, with the same versioned execution-input identity as the RunIntent.
+The legacy default execution profile used to materialize the Study remains in
+the accepted Study and execution catalog; it does not become an authored scene
+change merely because the API restarts.
+
+Older definitions may contain that automatically inserted default profile.
+Recovery first validates the unchanged scene. Only if its input digest differs
+and the profile equals the exact canonical legacy default may recovery project
+that field back to absence, and only when the complete input digest then equals
+the immutable pin. Explicit profiles, actual input changes, and malformed pins
+remain protected. Stored definitions and RunIntent/CAS bytes are never rewritten.
+
+This keeps terminal cancellation visible to the accepted projector: a completed
+Stop must publish its terminal command resource and durable journal ACK instead
+of leaving the UI at accepted/stopping. It does not replay Solve, release a held
+run, or authorize editing historical journals.
+
+## Kolejne recovery po zatrzymaniu odtworzonej grupy
+
+Po potwierdzonym uruchomieniu isolated snapshot użytkownik może utworzyć nową
+sesję. Kolejne recovery musi jawnie wskazać jej aktualny held-manual run;
+ponowne użycie pierwotnego `start.json` przywróciłoby wcześniejszy model.
+`docker-dev-recover-isolated` przyjmuje ostatni argument `successor_snapshot=true`
+(CLI: `--successor-snapshot`). Domyślnie nadal odmawia wyboru innego recovery ID.
+
+Ścieżka successor wymaga natywnego admission poprzednika oraz zgodności
+`development/current.json` z przypiętym terminalnym receiptem. Zwykły udany start
+wymaga identycznego `verified.json`. Po potwierdzonej awarii kolejnego startu
+(`failed-confirmed`) verified musi wskazywać swój wcześniejszy, niezmienny
+terminal udanego startu i Compose, w tym samym namespace oraz z tymi samymi
+katalogami state i user-data. Obie pary dokumentów pozostają przypięte do CAS;
+awaria nie jest przedstawiana jako udany start ani dowód braku OWNER.
+Ścieżka sprawdza namespace, registry, attempt, konfigurację i dokładne
+kontenery, po czym wykonuje dotychczasowe kontrole wszystkich runów, ledgeru,
+blokad OWNER/WRITER i spójności SQLite. Kopiuje bieżące dane do nowej namespace;
+oryginały, poprzedni registry i `start.json` pozostają zachowane. Piny admission
+są ponownie sprawdzane przy publikacji. Podgląd niczego nie uruchamia, a apply
+nie odtwarza Solve ani nie kończy runów. Nowy start nadal przechodzi osobną
+natywną bramkę. Operacja dotyczy wyłącznie przypiętej, zatrzymanej grupy mastera.
+Nowy snapshot ma odrębną generację prywatnego ledgeru, wyprowadzoną z recovery ID;
+stary ledger pozostaje zachowany. Kontrole readmission poza tą jawną ścieżką
+nadal wymagają udanego terminalnego receiptu.
