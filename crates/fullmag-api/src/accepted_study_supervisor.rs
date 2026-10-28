@@ -816,6 +816,10 @@ fn retry_host_worker_launch<T>(
                         || cause.is::<
                             fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable,
                         >()
+                        // The sampler refreshes the compute-node sample.
+                        || cause.is::<
+                            fullmag_session::host_resource_ledger::ComputeNodeSampleNotCurrent,
+                        >()
                 }) && Instant::now() < deadline =>
             {
                 on_retry();
@@ -825,6 +829,7 @@ fn retry_host_worker_launch<T>(
                 attempt.hash(&mut hasher);
                 let inventory_unavailable = error.chain().any(|cause| {
                     cause.is::<fullmag_session::host_resource_ledger::TransientGpuInventoryUnavailable>()
+                        || cause.is::<fullmag_session::host_resource_ledger::ComputeNodeSampleNotCurrent>()
                 });
                 let delay = if inventory_unavailable {
                     Duration::from_secs(1)
