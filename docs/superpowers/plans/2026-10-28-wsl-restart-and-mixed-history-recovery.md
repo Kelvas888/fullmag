@@ -93,7 +93,12 @@ nie tworzy start release ani nie uruchamia zadania.
 
 Osiem nowych regresji Rust jest w źródłach; zgodnie z ograniczeniem lokalnym
 nie kompilowano ani nie uruchamiano testów Rust. Source review nie wykazał
-Required/Blocker. Nadal wymagane są CI, managed build i rzeczywisty preflight
+Required/Blocker. Parser rustfmt w helperze własnej grupy poprawnie odczytał
+osiem zmienionych plików; to kontrola składni, bez kompilacji i testów. Dowód:
+`verification/mixed-history-native-v4-20261028/rust-syntax.json`. CI pełnego
+`fullmag-session` obejmuje nowe regresje; dodano także jawne sprawdzenie CLI
+`cargo check -p fullmag-cli --bin fullmag` na GitHub. Wynik CI pozostaje wymagany.
+Nadal wymagane są CI, managed build i rzeczywisty preflight
 wszystkich historycznych runów. Obecny binarny pakiet nie obsługuje v4.
 
 ## Następne bramki

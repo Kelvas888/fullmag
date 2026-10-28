@@ -387,6 +387,16 @@ pub(crate) enum RuntimeCommand {
         #[arg(long)]
         run_id: String,
     },
+    /// Read-only canonical held-manual evidence for explicit v4 recovery.
+    #[command(name = "service-inspect-held-manual-run", hide = true)]
+    ServiceInspectHeldManualRun {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        config_sha256: String,
+        #[arg(long)]
+        run_id: String,
+    },
     /// Recover one exactly pinned unknown native service owner after a durable
     /// empty-store and host-quiescence proof.
     ServiceRecover {

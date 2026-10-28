@@ -58,6 +58,7 @@ struct ReadBudget {
     entries: usize,
     files: BTreeSet<String>,
     file_bytes: u64,
+    maximum_file_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,7 +98,7 @@ impl ReadBudget {
             .file_bytes
             .checked_add(metadata.len())
             .context("retained-run byte count overflow")?;
-        if self.file_bytes > MAX_OBSERVED_FILE_BYTES {
+        if self.file_bytes > self.maximum_file_bytes.unwrap_or(MAX_OBSERVED_FILE_BYTES) {
             bail!("retained-run preflight exceeds its aggregate byte limit");
         }
         Ok(())
@@ -121,6 +122,17 @@ pub(super) fn validate_retained_run_inputs(
     pins: &[RetainedCancelledRunPin],
     terminal_validation: Option<&dyn Fn(&str) -> Result<()>>,
 ) -> Result<RetainedCancelledRunsPreflight> {
+    validate_retained_run_inputs_with_budget(store, pins, terminal_validation, MAX_OBSERVED_FILE_BYTES)
+}
+
+/// v4 has a separate bounded aggregate budget; legacy callers keep 128 MiB.
+/// All inventory, CAS, task and per-file validation below remains shared.
+pub(super) fn validate_retained_run_inputs_with_budget(
+    store: &SessionStore,
+    pins: &[RetainedCancelledRunPin],
+    terminal_validation: Option<&dyn Fn(&str) -> Result<()>>,
+    maximum_file_bytes: u64,
+) -> Result<RetainedCancelledRunsPreflight> {
     if pins.is_empty() || pins.len() > MAX_RETAINED_CANCELLED_RUN_PINS {
         bail!("retained-run pin count must be between 1 and {MAX_RETAINED_CANCELLED_RUN_PINS}");
     }
@@ -138,7 +150,7 @@ pub(super) fn validate_retained_run_inputs(
         }
     }
 
-    let mut budget = ReadBudget::default();
+    let mut budget = ReadBudget { maximum_file_bytes: Some(maximum_file_bytes), ..ReadBudget::default() };
     let run_ids = list_run_inventory(store, &mut budget)?;
     let pinned_run_ids = pins_by_run.keys().cloned().collect::<BTreeSet<_>>();
     if run_ids.iter().cloned().collect::<BTreeSet<_>>() != pinned_run_ids {

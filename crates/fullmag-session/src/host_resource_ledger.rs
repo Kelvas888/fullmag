@@ -4131,6 +4131,45 @@ impl HostResourceLedger {
         store: &SessionStore,
         run_id: &str,
     ) -> Result<String> {
+        self.recovery_run_evidence_sha256_locked(store, run_id, false)
+    }
+
+    /// Read held-manual evidence under the same host-before-store writer order
+    /// as terminal evidence. This never creates a start release or runs work.
+    pub fn with_held_manual_run_evidence_fence<T>(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        operation: impl FnOnce(&HostResourceLedgerSnapshot, &str) -> Result<T>,
+    ) -> Result<T> {
+        crate::repository_path::validate_store_id(run_id)?;
+        let _host_writer = self.writer.acquire()?;
+        let _store_writer = store.write_transaction()?;
+        let document = self.read_document_locked()?;
+        let evidence_sha256 = self.held_manual_run_evidence_sha256_locked(store, run_id)?;
+        let snapshot = HostResourceLedgerSnapshot {
+            policy_history_sha256: document.policy_history_sha256()?,
+            policy: document.policy.clone(),
+            reservations: document.reservations.clone(),
+            node_policy: document.node_policy.clone(),
+        };
+        operation(&snapshot, &evidence_sha256)
+    }
+
+    pub(crate) fn held_manual_run_evidence_sha256_locked(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+    ) -> Result<String> {
+        self.recovery_run_evidence_sha256_locked(store, run_id, true)
+    }
+
+    fn recovery_run_evidence_sha256_locked(
+        &self,
+        store: &SessionStore,
+        run_id: &str,
+        held_manual: bool,
+    ) -> Result<String> {
         crate::repository_path::validate_store_id(run_id)?;
         let store_id = Self::store_id(store.root())?;
         let document = self.read_document_locked()?;
@@ -4334,11 +4373,14 @@ impl HostResourceLedger {
             }
         };
 
-        let store_value = store.terminal_run_evidence_value_locked(
-            run_id,
-            worker_proof,
-            preparation_proof,
-        )?;
+        let store_value = if held_manual {
+            if exact_rows.iter().any(|(row, _)| matches!(&row.identity.owner, HostReservationOwner::Solver { .. })) {
+                bail!("held manual run has a historical solver host reservation");
+            }
+            store.held_manual_run_evidence_value_locked(run_id, worker_proof, preparation_proof)?
+        } else {
+            store.terminal_run_evidence_value_locked(run_id, worker_proof, preparation_proof)?
+        };
         let host_rows = exact_rows
             .iter()
             .map(|(row, proof)| {

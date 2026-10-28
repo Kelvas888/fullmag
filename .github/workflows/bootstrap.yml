@@ -159,6 +159,9 @@ jobs:
       - name: Run runtime service sampler and control contracts
         run: cargo test -p fullmag-api --bin fullmag-runtime-service --no-fail-fast
 
+      - name: Check mixed-history recovery CLI contract
+        run: cargo check -p fullmag-cli --bin fullmag
+
       - name: Run explicit reaped-worker failure recovery contracts
         run: cargo test -p fullmag-api --bin fullmag-runtime-service failed_worker_recovery::tests --no-fail-fast
 

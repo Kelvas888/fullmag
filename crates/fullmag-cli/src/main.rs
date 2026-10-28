@@ -209,6 +209,18 @@ fn main() -> Result<()> {
                 "mutations_applied": false, "solve_replayed": false,
             }));
         }
+        Command::Runtime(RuntimeCommand::ServiceInspectHeldManualRun {
+            config, config_sha256, run_id,
+        }) => {
+            let digest = runtime_service_client::inspect_held_manual_run_evidence(
+                &config, &config_sha256, &run_id,
+            )?;
+            println!("{}", serde_json::json!({
+                "schema_version": "runtime_service_held_manual_run_evidence.v1",
+                "run_id": run_id, "held_evidence_sha256": digest,
+                "mutations_applied": false, "solve_replayed": false,
+            }));
+        }
         Command::Runtime(RuntimeCommand::ServiceRecover {
             config,
             request,

@@ -4532,22 +4532,66 @@ impl SessionStore {
             Option<&FmsPreparationProcessExitReceipt>,
         ) -> Result<Option<&'static str>>,
     {
+        self.recovery_run_evidence_value_locked(run_id, worker_proof, preparation_proof, false)
+    }
+
+    /// Separate v4 evidence for a never-released manual run. Completed
+    /// preparation is preserved and validated by the same execution fences.
+    pub(crate) fn held_manual_run_evidence_value_locked<WF, PF>(
+        &self,
+        run_id: &str,
+        worker_proof: WF,
+        preparation_proof: PF,
+    ) -> Result<serde_json::Value>
+    where
+        WF: Fn(&FmsResourceLease, Option<&FmsWorkerProcessExitReceipt>) -> Result<Option<&'static str>>,
+        PF: Fn(
+            &FmsPreparationResourceLease,
+            Option<&FmsPreparationProcessExitReceipt>,
+        ) -> Result<Option<&'static str>>,
+    {
+        self.recovery_run_evidence_value_locked(run_id, worker_proof, preparation_proof, true)
+    }
+
+    fn recovery_run_evidence_value_locked<WF, PF>(
+        &self,
+        run_id: &str,
+        worker_proof: WF,
+        preparation_proof: PF,
+        held_manual: bool,
+    ) -> Result<serde_json::Value>
+    where
+        WF: Fn(&FmsResourceLease, Option<&FmsWorkerProcessExitReceipt>) -> Result<Option<&'static str>>,
+        PF: Fn(
+            &FmsPreparationResourceLease,
+            Option<&FmsPreparationProcessExitReceipt>,
+        ) -> Result<Option<&'static str>>,
+    {
         validate_store_id(run_id)?;
         let catalog = self
             .read_run_catalog(run_id)?
             .context("terminal evidence requires a durable run catalog")?;
         catalog.validate()?;
-        if catalog.tasks.is_empty()
-            || catalog
-                .tasks
-                .iter()
-                .any(|task| !matches!(
-                    task.lifecycle,
-                    FmsTaskLifecycle::Succeeded
-                        | FmsTaskLifecycle::Failed
-                        | FmsTaskLifecycle::Cancelled
-                        | FmsTaskLifecycle::Interrupted
-                ))
+        if held_manual {
+            // Automatic/missing/invalid policies and any existing release are
+            // refused by the canonical gate; no record is rewritten here.
+            if self.accepted_run_start_permitted(run_id)? || catalog.tasks.is_empty()
+                || catalog.tasks.iter().any(|task| {
+                    !matches!(task.lifecycle, FmsTaskLifecycle::Accepted | FmsTaskLifecycle::Queued)
+                        || task.attempt_id.is_some() || task.ownership_epoch.is_some()
+                        || task.resource_id.is_some() || task.resolved_input_fingerprint.is_some()
+                        || task.coordinator_genesis.is_some() || task.coordinator_watermark.is_some()
+                        || !task.artifact_ids.is_empty()
+                })
+            {
+                anyhow::bail!("held evidence requires an unreleased manual run without solver ownership");
+            }
+        } else if catalog.tasks.is_empty()
+            || catalog.tasks.iter().any(|task| !matches!(
+                task.lifecycle,
+                FmsTaskLifecycle::Succeeded | FmsTaskLifecycle::Failed
+                    | FmsTaskLifecycle::Cancelled | FmsTaskLifecycle::Interrupted
+            ))
         {
             anyhow::bail!("terminal evidence requires every catalog task to be terminal");
         }
@@ -4586,6 +4630,9 @@ impl SessionStore {
 
         let admissions = self.list_task_admissions_for_run_locked(run_id)?;
         let leases = self.list_resource_leases_for_run_locked(run_id)?;
+        if held_manual && (!admissions.is_empty() || !leases.is_empty()) {
+            anyhow::bail!("held manual run has historical solver admission or lease");
+        }
         if leases
             .iter()
             .any(|lease| lease.state == FmsResourceLeaseState::Active)
@@ -11604,6 +11651,134 @@ mod admission_tests {
             evidence["preparation_evidence"].as_array().unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn held_manual_evidence_preserves_completed_preparation_retry_and_refuses_active_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("session-store")).unwrap();
+        let run_id = "run-admission";
+        let task_id = "task-terminal-historical-prep-retry";
+        let mut task = queued_task(task_id);
+        task.lifecycle = FmsTaskLifecycle::Accepted;
+        task.readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        seed_catalog(&store, vec![task]);
+        store.commit_run_intent(&FmsRunIntent::new(
+            run_id, "submit-held-preparation", serde_json::json!({
+                "run_id": run_id, "parameters": {"fullmag.accepted_run_start": {
+                    "schema_version": "accepted_run_start_policy.v1", "mode": "manual"
+                }}
+            }),
+        )).unwrap();
+        let now = Utc::now();
+        let lease = FmsPreparationResourceLease {
+            schema_version: FMS_PREPARATION_RESOURCE_LEASE_SCHEMA.into(),
+            resource_id: "cpu-terminal-historical-prep".into(),
+            budget: FmsResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                gpu_memory_bytes: 0,
+                storage_bytes: 4096,
+            },
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: "prep-terminal-historical-first".into(),
+            lease_token: "prep-lease-terminal-historical-first".into(),
+            state: FmsResourceLeaseState::Active,
+            acquired_at: now,
+            heartbeat_at: now,
+            heartbeat_sequence: 0,
+            released_at: None,
+            host_launch_binding: None,
+        };
+        store.commit_preparation_resource_lease(&lease).unwrap();
+        {
+            let _writer = store.write_transaction().unwrap();
+            let error = store.held_manual_run_evidence_value_locked(run_id,
+                |_lease, _exit| Ok(None), |_lease, _exit| Ok(None)).unwrap_err();
+            assert!(error.to_string().contains("active preparation lease"));
+        }
+        let launch = FmsPreparationProcessLaunch {
+            schema_version: FMS_PREPARATION_PROCESS_LAUNCH_SCHEMA.into(),
+            launch_id: "prep-launch-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            resource_id: lease.resource_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_heartbeat_sequence: lease.heartbeat_sequence,
+            supervisor_process_id: 501,
+            supervisor_start_token: Some("historical-prep".into()),
+            created_at: now,
+        };
+        store.commit_preparation_process_launch(&launch).unwrap();
+        let exit = FmsPreparationProcessExitReceipt {
+            schema_version: FMS_PREPARATION_PROCESS_EXIT_RECEIPT_SCHEMA.into(),
+            receipt_id: "prep-exit-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            resource_id: lease.resource_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_heartbeat_sequence: lease.heartbeat_sequence,
+            process_id: 502,
+            process_start_token: Some("historical-prep-child".into()),
+            status_success: false,
+            exit_code: Some(1),
+            timed_out: false,
+            failure_reason: Some("fixture preparation failure".into()),
+            observed_at: now,
+        };
+        store.commit_preparation_process_exit_receipt(&exit).unwrap();
+        assert_eq!(
+            store.finalize_preparation_process_exit(&exit).unwrap(),
+            PreparationProcessFinalizationDisposition::Failed
+        );
+        let decision = FmsPreparationRetryDecision {
+            schema_version: FMS_PREPARATION_RETRY_DECISION_SCHEMA.into(),
+            decision_id: "prep-retry-terminal-historical-first".into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            failed_preparation_attempt_id: lease.preparation_attempt_id.clone(),
+            retry_sequence: 1,
+            max_attempts: 2,
+            reason: "fixture preparation retry".into(),
+            created_at: Utc::now(),
+        };
+        store.commit_preparation_retry_decision(&decision).unwrap();
+        let mut terminal = store.read_run_catalog(run_id).unwrap().unwrap();
+        terminal.revision += 1;
+        terminal.updated_at = Utc::now();
+        terminal.tasks[0].lifecycle = FmsTaskLifecycle::Accepted;
+        terminal.tasks[0].readiness = FmsTaskReadiness::Blocked {
+            reason: FMS_TASK_AWAITING_PREPARATION_REASON.into(),
+        };
+        store.commit_run_catalog(&terminal).unwrap();
+
+        let catalog_before = fs::read(store.root().join(format!("runs/{run_id}/run_catalog.json"))).unwrap();
+        let _writer = store.write_transaction().unwrap();
+        let evidence = store
+            .held_manual_run_evidence_value_locked(
+                run_id,
+                |_lease, exit| Ok(exit.map(|_| "worker")),
+                |_lease, exit| Ok(exit.map(|_| "preparation")),
+            )
+            .unwrap();
+        assert_eq!(
+            evidence["preparation_retry_decisions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            evidence["preparation_evidence"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(fs::read(store.root().join(format!("runs/{run_id}/run_catalog.json"))).unwrap(), catalog_before);
+        assert!(!store.root().join(format!("runs/{run_id}/start_release.json")).exists());
     }
 
     #[cfg(unix)]
