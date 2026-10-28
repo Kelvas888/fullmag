@@ -56,11 +56,11 @@ przed startem workera; `docs/specs/native-runtime-service-v1.md`;
 - [x] Dodać managed wrapper natywnego no-spawn cancellation, jego Python
   regresje, receptę just i dokumentację istniejącego operatora. Przed apply
   ponownie sprawdzić rzeczywiste piny i wszystkie chronione dane runów.
-- [ ] Wykonać jedną kontrolowaną cancellation; potwierdzić `Cancelled`,
+- [x] Wykonać jedną kontrolowaną cancellation; potwierdzić `Cancelled`,
   `Closed`, oba release i niezmienność pozostałych runów. Zachować receipt.
-- [ ] Zakwalifikować i wykonać bezpieczny stop/restart wyłącznie własnej grupy;
+- [x] Zakwalifikować i wykonać bezpieczny stop/restart wyłącznie własnej grupy;
   poprawić właściwy managed guard, jeżeli brakuje zgodnej ścieżki Linux.
-- [ ] Build aplikacji w tej grupie; sprawdzić scheduler po odświeżeniu próbki
+- [x] Build aplikacji w tej grupie; sprawdzić scheduler po odświeżeniu próbki
   i terminalny wynik kontrolnego FDM z jawnym output storage i limitem czasu.
 - [ ] UI: Airbox ma H_demag/H_eff/H_ext i nie ma m; dane H_demag mapują się
   dokładnie na pusty support, widoczne strzałki w screenshot, niezagubiony
@@ -85,3 +85,30 @@ przed startem workera; `docs/specs/native-runtime-service-v1.md`;
 - Managed preview reconciliacji: PASS, 12 plików target runu, inventory
   `acb6ddc2a1841193a511ff4c1a4e2807ad5e3fc33f401ba6cba94cd107df5e09`.
   Na tym checkpointcie apply, przebudowa i końcowy render pozostają niewykonane.
+
+## Checkpoint runtime i poprawki po CI
+
+- `c6ad1e0c0be98b888ee40b5ecdcdecb0b58ae289` oraz
+  `6375bd7fa954920b5cfb80eb705cc03fe7f84b70`: operator i dowód Linux,
+  177 lekkich regresji Python PASS; kwalifikowana reconciliacja helpera PASS.
+- Native cancellation runu `run-live-3e280...`: Cancelled / Closed,
+  oba release; proof `67b6398174e2ce5b0c81f955f20d1375df8c6bf27e3ecc81b515bc610aa400ea`.
+- 86 chronionych plików / 324022 B identycznych po cancellation i stop/recreate.
+- Development `15e3ae3b65934ae38af6baa5f9ab7c96`, config
+  `643f32a06034dde9cc217c49118d05844296e5500d60c1587780996ff1050877`:
+  API Ready, HEAD 6375bd7fa, dirty (dwa prywatne skrypty operatora), snapshot
+  `f1398590eee9ba81c998f8bc5560108c9ab27136875e3369c5d4d80571db3b61`.
+- Jeden Compute Study z UI: run `run-live-b2c435...`, 200 kroków, 2e-11 s,
+  CPU double, command `fm-cddd02a1-ff8d-4140-b5dd-7f4dabd17d3c` completed.
+  Oba schedulery pozostają Ready. Binary proof: 576 komórek, 448 magnetycznych,
+  128 pustych; każde H_demag finite/nonzero, dokładny mask/full-domain match.
+  Sam render nadal wymaga końcowego potwierdzenia.
+- CI `40785689859`, rust-contracts: dwie nowe regresje wykazały wcześniejszy
+  generyczny brak próbki w `current_compute_node_owner_for_admission` oraz
+  błędną asercję context marker przez `chain()` zamiast `downcast_ref()`.
+  Poprawka zachowuje typ także przy rekonstrukcji requestu hosta; brak
+  aktywnego inventory ownera jest availability failure, konfiguracja/I/O
+  oraz konflikt tożsamości pozostają fatalne. Dodatkowa regresja utraty
+  inventory ownera zachowuje claim, lease i Pending gate.
+- Regresje Rust ponawia wyłącznie GitHub CI; lokalny zakaz kompilacji testów
+  pozostaje w mocy. Nie oznaczono PR gotowym do merge przed zielonym CI.

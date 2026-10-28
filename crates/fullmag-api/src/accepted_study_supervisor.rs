@@ -3780,6 +3780,36 @@ mod tests {
     }
 
     #[test]
+    fn inactive_inventory_owner_retries_before_spawn_without_releasing_claim() {
+        let fixture = host_launch_test_fixture();
+        drop(fixture._inventory_owner);
+        let mut retries = 0;
+        let error = verify_host_solver_claim_before_spawn_with_timeout(
+            &fixture.host,
+            &fixture.store,
+            &fixture.claim,
+            Duration::from_millis(250),
+            || retries += 1,
+        )
+        .unwrap_err();
+        assert!(retries > 0, "{error:#}");
+        assert!(error.downcast_ref::<
+            fullmag_session::host_resource_ledger::ComputeNodeSampleNotCurrent,
+        >().is_some());
+        assert!(format!("{error:#}").contains("no active compute-node inventory owner"));
+        assert_eq!(fullmag_runtime_control::load_current_task_claim(
+            &fixture.store, &fixture.claim.run_id, fixture.claim.task_id.as_str(),
+        ).unwrap(), fixture.claim);
+        assert_eq!(fixture.store.read_resource_lease(
+            &fixture.lease.run_id, &fixture.lease.resource_id, &fixture.lease.lease_token,
+        ).unwrap().unwrap(), fixture.lease);
+        let reservation = fixture.ledger.read().unwrap().reservations.into_iter()
+            .find(|row| row.identity.lease_token == fixture.lease.lease_token).unwrap();
+        assert_eq!(reservation.worker_launch_gate,
+            Some(fullmag_session::host_resource_ledger::HostWorkerLaunchGate::Pending));
+    }
+
+    #[test]
     fn exhausted_stale_sample_retry_defers_second_read_and_authorization_without_consuming_claim_start_lease() {
         let fixture = host_launch_test_fixture();
         let task = fullmag_application::TaskRecord {
@@ -3897,7 +3927,9 @@ mod tests {
         .unwrap();
         assert!(slot_path.exists());
         let deferred = defer_pre_spawn_worker_launch_error(slot, error);
-        assert!(deferred.chain().any(|cause| cause.is::<WorkerLaunchDeferred>()));
+        // The scheduler downcasts anyhow context, which is not a standalone
+        // std::error::Error source in the cause iterator.
+        assert!(deferred.downcast_ref::<WorkerLaunchDeferred>().is_some());
         assert!(format!("{deferred:#}").contains("freshness is Stale"));
         assert!(!slot_path.exists(), "deferred launch must release its supervision slot");
 
