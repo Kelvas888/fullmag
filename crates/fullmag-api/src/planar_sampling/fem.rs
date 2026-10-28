@@ -279,7 +279,13 @@ pub(super) fn build_plane_operator(
     let mut cut_extents = Vec::new();
     let du = (frame.bounds[1] - frame.bounds[0]) / request.resolution[0] as f64;
     let dv = (frame.bounds[3] - frame.bounds[2]) / request.resolution[1] as f64;
-    for (element_index, element) in field.elements().iter().enumerate() {
+    // Only elements whose box meets the plane (PM-N17), in ascending order so
+    // pixel claims and cut extents equal the full traversal.
+    let index = super::element_index::cached_fem_element_index(field, topology_fingerprint);
+    let mut candidates = Vec::new();
+    index.candidates_crossing_plane(frame.origin, frame.normal, &mut candidates);
+    for element_index in candidates.into_iter().map(|index| index as usize) {
+        let element = &field.elements()[element_index];
         if field.markers().get(element_index).copied().unwrap_or(1) == 0 {
             continue;
         }

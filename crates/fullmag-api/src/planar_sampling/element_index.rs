@@ -109,6 +109,44 @@ impl ElementBvh {
         (min, max)
     }
 
+    /// Element indices whose padded box meets the plane through `origin` with
+    /// unit `normal`, ascending. Conservative: every element with nodes on both
+    /// sides of (or on) the plane is returned, since its nodes lie in its box.
+    pub(crate) fn candidates_crossing_plane(&self, origin: [f64; 3], normal: [f64; 3], out: &mut Vec<u32>) {
+        out.clear();
+        if self.nodes.is_empty() {
+            return;
+        }
+        let crosses = |min: &[f64; 3], max: &[f64; 3]| {
+            let mut distance = 0.0;
+            let mut reach = 0.0;
+            for axis in 0..3 {
+                distance += normal[axis] * (0.5 * (min[axis] + max[axis]) - origin[axis]);
+                reach += 0.5 * (max[axis] - min[axis]) * normal[axis].abs();
+            }
+            distance.abs() <= reach * (1.0 + 1.0e-12) + f64::MIN_POSITIVE
+        };
+        let mut stack = vec![0u32];
+        while let Some(node_index) = stack.pop() {
+            let node = &self.nodes[node_index as usize];
+            if !crosses(&node.min, &node.max) {
+                continue;
+            }
+            if node.count > 0 {
+                for &element in &self.order[node.start as usize..(node.start + node.count) as usize] {
+                    let (min, max) = &self.boxes[element as usize];
+                    if crosses(min, max) {
+                        out.push(element);
+                    }
+                }
+            } else {
+                stack.push(node.right);
+                stack.push(node.start);
+            }
+        }
+        out.sort_unstable();
+    }
+
     /// Element indices whose padded box contains `point`, ascending.
     pub(crate) fn candidates(&self, point: [f64; 3], out: &mut Vec<u32>) {
         out.clear();
@@ -138,6 +176,33 @@ impl ElementBvh {
         }
         out.sort_unstable();
     }
+}
+
+/// Indexes of recently sampled carriers, keyed by topology fingerprint (nodes,
+/// connectivity and markers), so plane operators for new planes of the same
+/// mesh reuse one hierarchy instead of rebuilding it.
+pub(crate) fn cached_fem_element_index(
+    field: &super::FemPlanarField,
+    topology_fingerprint: u64,
+) -> std::sync::Arc<ElementBvh> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    const CAPACITY: usize = 4;
+    static CACHE: OnceLock<Mutex<Vec<(u64, Arc<ElementBvh>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut entries) = cache.lock() {
+        if let Some(position) = entries.iter().position(|(key, _)| *key == topology_fingerprint) {
+            let entry = entries.remove(position);
+            let index = Arc::clone(&entry.1);
+            entries.insert(0, entry);
+            return index;
+        }
+    }
+    let index = Arc::new(super::fem::element_index(field));
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(0, (topology_fingerprint, Arc::clone(&index)));
+        entries.truncate(CAPACITY);
+    }
+    index
 }
 
 #[cfg(test)]
@@ -229,6 +294,44 @@ mod tests {
             let indexed = crate::planar_sampling::fem::interpolate_at_indexed(&field, &index, &mut candidates, point);
             assert_eq!(direct, indexed, "point {point:?}");
             assert!(candidates.len() <= 48, "candidate count {} at {point:?}", candidates.len());
+        }
+    }
+
+    #[test]
+    fn plane_candidates_cover_every_crossing_element() {
+        // 12³ cells × 6 = 10 368 Tet4 (the 10k point of PM-N17).
+        let n = 12;
+        let field = tet_cube(n);
+        let index = crate::planar_sampling::fem::element_index(&field);
+        let mut candidates = Vec::new();
+        let planes: [([f64; 3], [f64; 3]); 4] = [
+            ([0.0, 0.0, 6.0e-9], [0.0, 0.0, 1.0]),
+            ([0.0, 0.0, 6.0e-9 + 1e-13], [0.0, 0.0, 1.0]),
+            ([3.0e-9, 4.0e-9, 5.0e-9], [0.48, 0.6, 0.64]),
+            ([0.0, 7.0e-9, 0.0], [0.0, 1.0, 0.0]),
+        ];
+        for (origin, normal) in planes {
+            index.candidates_crossing_plane(origin, normal, &mut candidates);
+            let crossing = (0..field.elements().len() as u32)
+                .filter(|element| field.markers()[*element as usize] != 0)
+                .filter(|element| {
+                    let distances = field.elements()[*element as usize]
+                        .nodes()
+                        .iter()
+                        .map(|node| {
+                            let p = field.nodes()[*node as usize];
+                            (0..3).map(|axis| normal[axis] * (p[axis] - origin[axis])).sum::<f64>()
+                        })
+                        .collect::<Vec<_>>();
+                    let lowest = distances.iter().copied().fold(f64::INFINITY, f64::min);
+                    let highest = distances.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    lowest <= 0.0 && highest >= 0.0
+                })
+                .collect::<Vec<_>>();
+            assert!(crossing.iter().all(|element| candidates.binary_search(element).is_ok()));
+            assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]), "ascending");
+            // A plane meets O(n²) of the n³ cells, not the whole mesh.
+            assert!(candidates.len() < field.elements().len() / 3, "{} candidates", candidates.len());
         }
     }
 

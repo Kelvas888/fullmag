@@ -922,10 +922,15 @@ mesh diagonal to cover the $10^{-11}$ weight tolerance of the containment
 test, contains the point. Candidates are tested in ascending element index,
 the order of the direct scan (gate PM-N28), so a point on a shared face resolves to the same
 element and the value, entity id and occupancy are identical to the direct
-traversal; the index changes cost, never results. It is built per request and
-discarded with it; a single probe keeps the direct scan, which is cheaper than
-building the index. The plane operator keeps its per-element rasterization,
-and gathering the cached operator on the device for the FEM GPU lane is not
+traversal; the index changes cost, never results. For point batches it is built per request and discarded with it; a single
+probe keeps the direct scan, which is cheaper than building the index. The
+plane operator (gate PM-N17) uses the same hierarchy, cached by the carrier's
+topology fingerprint (nodes, connectivity, markers; four most recent
+carriers), and rasterizes only the elements whose box meets the plane, in
+ascending element order: the box test is conservative because an element's
+nodes lie in its box, and the exact node-distance test that follows is the
+direct traversal's, so pixel claims, weights and cut extents are unchanged.
+Gathering the cached operator on the device for the FEM GPU lane is not
 implemented.
 
 ### In-plane streamlines (presentation)
