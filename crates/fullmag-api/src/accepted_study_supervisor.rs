@@ -3138,7 +3138,9 @@ mod tests {
                     plan_version: STUDY_PLAN_SCHEMA_VERSION.into(), plan_sha256: study_ref.clone() },
                 catalog_ref.clone(), serde_json::json!({}),
                 RequestedExecution { backend: "fdm".into(), device: "cpu".into(), precision: "double".into(),
-                    mode: "strict".into(), minimum_resources: None },
+                    mode: "strict".into(), minimum_resources: Some(fullmag_application::RequestedResourceBudget {
+                        cpu_millis: 100, memory_bytes: 1024, gpu_memory_bytes: 0, storage_bytes: 1024,
+                    }) },
             );
             let mut intent = fullmag_session::FmsRunIntent::new(specification.run_id.as_str(),
                 "reported-failure-fixture", serde_json::to_value(&specification).unwrap());
