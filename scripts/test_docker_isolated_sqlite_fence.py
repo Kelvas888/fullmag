@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import struct
 import subprocess
@@ -327,24 +328,206 @@ class IsolatedSqliteFenceTests(unittest.TestCase):
                     group_add=(), database_read_only=True,
                 )
 
+    def test_each_phase_accepts_its_own_ephemeral_wsl_alias_for_the_same_requested_file(self):
+        # Docker Desktop can allocate a daemon-private alias per container.
+        # The owner alias is accepted only after the helper's lock conflicts
+        # with this exact host FD, and HostConfig/Mounts agree within inspect.
+        aliases = (
+            "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/"
+            + "a" * 64 + "/workspace.db",
+            "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/"
+            + "b" * 64 + "/workspace.db",
+        )
+        read_only_args = fence._managed_helper_args(
+            self.control, "print READY", name=self.name,
+            database_source=self.requested_source, user="65532:65532",
+            group_add=(), database_read_only=True,
+        )
+        probe_document = _inspection(
+            self.control, read_only_args, self.name, aliases[0], aliases[0],
+            user="65532:65532", groups=(), database_read_only=True,
+        )
+        self.assertEqual(fence._validate_helper_inspection(
+            control=self.control, document=probe_document, name=self.name,
+            arguments=read_only_args, host_mount_source=self.requested_source,
+            expected_daemon_source=None, user="65532:65532", group_add=(),
+            database_read_only=True,
+        ), "c" * 64)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "workspace.db"
+            import sqlite3
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE fixture(value INTEGER)")
+                connection.execute("INSERT INTO fixture VALUES (1)")
+            original_bytes = database.read_bytes()
+            host_fd = os.open(database, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            process = None
+            read_lock_held = False
+            try:
+                fence._acquire_host_read_lock(host_fd)
+                read_lock_held = True
+                owner_program = shlex.split(fence._owner_script())[-1].replace(
+                    'Path("/sqlite-source/workspace.db")', f"Path({str(database)!r})")
+                process = subprocess.Popen(
+                    [sys.executable, "-I", "-B", "-c", owner_program],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, bufsize=0,
+                )
+                process._fullmag_helper_name = self.name
+                blocked = json.loads(fence.retained._readline(process, timeout=10))
+                self.assertEqual(blocked["state"], "BLOCKED")
+                host_info = os.fstat(host_fd)
+                self.assertEqual(
+                    (blocked["device"], blocked["inode"], blocked["uid"], blocked["gid"]),
+                    (host_info.st_dev, host_info.st_ino, host_info.st_uid, host_info.st_gid),
+                )
+                fence._release_host_read_lock(host_fd)
+                read_lock_held = False
+                process.stdin.write(b"GO\n")
+                process.stdin.flush()
+                ready = json.loads(fence.retained._readline(process, timeout=10))
+                self.assertEqual(ready["state"], "READY")
+
+                owner_user = str(host_info.st_uid) + ":" + str(host_info.st_gid)
+                owner_args = fence._managed_helper_args(
+                    self.control, "print READY", name=self.name,
+                    database_source=str(database), user=owner_user,
+                    group_add=(), database_read_only=False,
+                )
+                owner_document = _inspection(
+                    self.control, owner_args, self.name, aliases[1], aliases[1],
+                    user=owner_user, groups=(), database_read_only=False,
+                )
+                with self.assertRaises(BuildControlError):
+                    fence._validate_helper_inspection(
+                        control=self.control, document=owner_document, name=self.name,
+                        arguments=owner_args, host_mount_source=str(database),
+                        expected_daemon_source=None, user=owner_user, group_add=(),
+                        database_read_only=False,
+                    )
+                changed = json.loads(json.dumps(owner_document))
+                changed["HostConfig"]["Mounts"][2]["Source"] = aliases[0]
+                with self.assertRaises(BuildControlError):
+                    fence._owner_inspect_source(changed, str(database))
+                with patch.object(
+                        fence, "docker_capture",
+                        return_value=SimpleNamespace(
+                            stdout=json.dumps([owner_document]).encode("utf-8"))):
+                    self.assertEqual(fence._inspect_helper(
+                        self.control, process, self.name, owner_args,
+                        requested_source=str(database), expected_daemon_source=None,
+                        user=owner_user, group_add=(), database_read_only=False,
+                        owner_lock_fd=host_fd,
+                    )[0], "c" * 64)
+            finally:
+                if read_lock_held:
+                    fence._release_host_read_lock(host_fd)
+                if process is not None:
+                    if process.stdin is not None and not process.stdin.closed:
+                        process.stdin.close()
+                    if process.poll() is None:
+                        released = json.loads(fence.retained._readline(process, timeout=10))
+                        self.assertEqual(released["state"], "RELEASED")
+                    self.assertEqual(process.wait(timeout=10), 0)
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    if process.stderr is not None:
+                        process.stderr.close()
+                fence._prove_host_read_lock_available(host_fd)
+                os.close(host_fd)
+            self.assertEqual(database.read_bytes(), original_bytes)
+
+    def test_workspace_fence_verify_callback_is_not_in_json_receipt(self):
+        calls = []
+        receipt = fence.WorkspaceDatabaseFence(
+            {"database_present": True, "inode": 7}, lambda: calls.append("verified"))
+        receipt.verify()
+        self.assertEqual(calls, ["verified"])
+        self.assertEqual(json.loads(json.dumps(receipt)),
+                         {"database_present": True, "inode": 7})
+
+    def test_absent_workspace_fence_verify_rejects_a_later_database(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(
+                    BuildControlError,
+                    "Workspace database appeared during absent-source validation"):
+                with patch.object(fence, "validate_host_path", return_value=root):
+                    with fence.hold_managed_workspace_database(
+                            self.control, self.backend(), root) as receipt:
+                        self.assertEqual(dict(receipt), {"database_present": False})
+                        receipt.verify()
+                        (root / "workspace.db").write_bytes(b"appeared")
+
     def test_stopped_backend_validation_does_not_require_control_only_labels(self):
         backend = self.backend()
         self.assertNotIn("org.fullmag.build-control", backend["Config"]["Labels"])
         self.assertEqual(fence._validate_backend_source(self.control, backend),
                          "/home/test/storage/user-data")
 
-    def test_probe_host_identity_requires_same_device_inode_and_size(self):
+    def test_probe_host_identity_requires_same_file_and_owner_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             database = Path(temporary) / "workspace.db"
             database.write_bytes(b"temporary fixture")
             info = database.stat()
-            identity = {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size}
+            identity = {
+                "device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+                "uid": info.st_uid, "gid": info.st_gid,
+                "mode": stat.S_IMODE(info.st_mode), "links": info.st_nlink,
+                "regular": stat.S_ISREG(info.st_mode),
+            }
             fence._validate_probe_host_identity(identity, info)
-            for field in ("device", "inode", "size"):
+            for field in ("device", "inode", "size", "uid", "gid", "mode", "links"):
                 changed = dict(identity)
                 changed[field] += 1
                 with self.subTest(field=field), self.assertRaises(BuildControlError):
                     fence._validate_probe_host_identity(changed, info)
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(fcntl, "F_OFD_SETLK"),
+                         "Linux OFD locks are required")
+    def test_permission_error_is_not_mistaken_for_a_lock_conflict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "workspace.db"
+            database.write_bytes(b"temporary fixture")
+            fd = os.open(database, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                with patch.object(fence, "_host_lock_command",
+                                  side_effect=OSError(errno.EPERM, "permission denied")):
+                    with self.assertRaisesRegex(
+                            BuildControlError,
+                            "Host could not verify the SQLite lock conflict"):
+                        fence._prove_host_read_lock_conflict(fd)
+            finally:
+                os.close(fd)
+
+    def test_owner_blocked_metadata_must_match_probe_and_host_before_go(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "host.db"
+            foreign = root / "foreign.db"
+            host.write_bytes(b"host fixture")
+            foreign.write_bytes(b"other fixture")
+            host_info = host.stat()
+            foreign_info = foreign.stat()
+            probe = {
+                "device": host_info.st_dev, "inode": host_info.st_ino,
+                "size": host_info.st_size, "uid": host_info.st_uid,
+                "gid": host_info.st_gid, "mode": stat.S_IMODE(host_info.st_mode),
+                "links": host_info.st_nlink, "regular": True,
+            }
+            foreign_owner = {
+                "device": foreign_info.st_dev, "inode": foreign_info.st_ino,
+                "size": foreign_info.st_size, "uid": foreign_info.st_uid,
+                "gid": foreign_info.st_gid, "mode": stat.S_IMODE(foreign_info.st_mode),
+                "links": foreign_info.st_nlink, "regular": True,
+            }
+            with self.assertRaises(BuildControlError):
+                fence._validate_owner_probe_identity(foreign_owner, probe, host_info)
+            changed_owner = dict(probe, gid=probe["gid"] + 1)
+            with self.assertRaises(BuildControlError):
+                fence._validate_owner_probe_identity(changed_owner, probe, host_info)
 
     def test_yield_exception_releases_helper_and_closes_host_fd_once(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -353,15 +536,17 @@ class IsolatedSqliteFenceTests(unittest.TestCase):
             database.write_bytes(b"temporary fixture")
             info = database.stat()
             probe_process = SimpleNamespace()
-            owner_process = SimpleNamespace()
+            owner_process = SimpleNamespace(poll=lambda: None)
             ready = json.dumps({"state": "READY"})
+            blocked = json.dumps({"state": "BLOCKED"})
             start_results = [
                 (probe_process, "probe", ["probe"], ready, {}),
-                (owner_process, "owner", ["owner"], ready, {}),
+                (owner_process, "owner", ["owner"], blocked, None),
             ]
             metadata = {
                 "device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
-                "uid": 1234, "gid": 1234, "mode": 0o600,
+                "uid": info.st_uid, "gid": info.st_gid,
+                "mode": stat.S_IMODE(info.st_mode),
                 "links": 1, "regular": True,
             }
             released = []
@@ -386,6 +571,8 @@ class IsolatedSqliteFenceTests(unittest.TestCase):
                 patch.object(fence, "_database_daemon_source", return_value=self.daemon_source),
                 patch.object(fence, "_validate_helper_inspection"),
                 patch.object(fence, "_metadata_ack", side_effect=lambda _line, owner: dict(metadata)),
+                patch.object(fence, "_continue_owner_helper", return_value=dict(metadata)),
+                patch.object(fence, "_inspect_helper", return_value=("c" * 64, {})),
                 patch.object(fence, "_release_helper", side_effect=lambda process: released.append(process)),
                 patch.object(fence, "_prove_host_read_lock_conflict"),
                 patch.object(fence, "_assert_host_identity"),
@@ -490,6 +677,88 @@ print(json.dumps({'state':'RELEASED'}), flush=True)
                               after_info.st_mtime_ns, stat.S_IMODE(after_info.st_mode)),
                              (original_info.st_dev, original_info.st_ino, original_info.st_size,
                               original_info.st_mtime_ns, stat.S_IMODE(original_info.st_mode)))
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and hasattr(fcntl, "F_OFD_SETLK"),
+                         "Linux OFD locks are required")
+    def test_fence_on_different_database_does_not_conflict_with_host_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host_root = root / "host"
+            foreign_root = root / "foreign"
+            host_root.mkdir()
+            foreign_root.mkdir()
+            import sqlite3
+            for database in (host_root / "workspace.db", foreign_root / "workspace.db"):
+                with sqlite3.connect(database) as connection:
+                    connection.execute("CREATE TABLE fixture(value INTEGER)")
+                    connection.execute("INSERT INTO fixture VALUES (1)")
+            program = fence._sqlite_module_source() + """
+import json, sys
+with hold_workspace_database(Path(sys.argv[1])):
+    info = os.stat(Path(sys.argv[1]) / 'workspace.db', follow_symlinks=False)
+    print(json.dumps({'state':'READY','device':info.st_dev,'inode':info.st_ino}), flush=True)
+    sys.stdin.buffer.read()
+print(json.dumps({'state':'RELEASED'}), flush=True)
+"""
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-B", "-c", program, str(foreign_root)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0,
+            )
+            host_fd = None
+            try:
+                ready = json.loads(fence.retained._readline(process, timeout=10))
+                self.assertEqual(ready["state"], "READY")
+                host_fd = os.open(host_root / "workspace.db",
+                                  os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                host_info = os.fstat(host_fd)
+                self.assertNotEqual((host_info.st_dev, host_info.st_ino),
+                                    (ready["device"], ready["inode"]))
+                with self.assertRaisesRegex(
+                        BuildControlError,
+                        "Managed SQLite exclusive fence is not visible to the host"):
+                    fence._prove_host_read_lock_conflict(host_fd)
+
+                owner_user = str(host_info.st_uid) + ":" + str(host_info.st_gid)
+                owner_args = fence._managed_helper_args(
+                    self.control, "print READY", name=self.name,
+                    database_source=str(host_root / "workspace.db"),
+                    user=owner_user, group_add=(), database_read_only=False,
+                )
+                foreign_alias = (
+                    "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu2/"
+                    + "f" * 64 + "/workspace.db"
+                )
+                owner_document = _inspection(
+                    self.control, owner_args, self.name, foreign_alias, foreign_alias,
+                    user=owner_user, groups=(), database_read_only=False,
+                )
+                process._fullmag_helper_name = self.name
+                with patch.object(
+                        fence, "docker_capture",
+                        return_value=SimpleNamespace(
+                            stdout=json.dumps([owner_document]).encode("utf-8"))):
+                    with self.assertRaises(BuildControlError):
+                        fence._inspect_helper(
+                            self.control, process, self.name, owner_args,
+                            requested_source=str(host_root / "workspace.db"),
+                            expected_daemon_source=None, user=owner_user,
+                            group_add=(), database_read_only=False,
+                            owner_lock_fd=host_fd,
+                        )
+            finally:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                if process.poll() is None:
+                    released = json.loads(fence.retained._readline(process, timeout=10))
+                    self.assertEqual(released["state"], "RELEASED")
+                self.assertEqual(process.wait(timeout=10), 0)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                if host_fd is not None:
+                    os.close(host_fd)
 
 
 if __name__ == "__main__":

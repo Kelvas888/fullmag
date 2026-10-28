@@ -32,8 +32,15 @@ Przy mapowaniu UID wykluczającym właścicielskie otwarcie na hoście używamy
 krótkiego przypiętego helpera BuildControl z rzeczywistym UID/GID właściciela
 odczytanym przez Docker, bez capabilities. Root/control/registry są readonly,
 a jedynym RW bindem jest sam plik workspace.db. Operator przez readonly FD
-potwierdza konflikt własnego OFD read lock z helperem na tym samym inode.
-Brak konfliktu oznacza odmowę. Nie ma chmod/chown ani słabszej blokady źródła;
+wiąże blokadę przez handshake na jednym zachowanym FD: najpierw skutecznie
+trzyma OFD read lock, helper musi potwierdzić odmowę exclusive, następnie po
+jawnym zwolnieniu i GO zdobywa exclusive i host musi zobaczyć konflikt.
+Po potwierdzonym RELEASED host ponownie uzyskuje read lock. To odróżnia
+blokadę helpera od przypadkowego obcego writera. Tożsamość pliku, helpera,
+sidecars i konflikt są ponawiane bezpośrednio przed COMMIT. Obie fazy wskazują
+kanoniczną ścieżkę hosta; świeży alias WSL w inspect jest wyłącznie propozycją,
+uwierzytelnianą pełną kontrolą helpera i pozytywnym dowodem tego samego pliku.
+Brak któregokolwiek etapu oznacza odmowę. Nie ma chmod/chown ani słabszej blokady źródła;
 sprawdzenie bazy może modyfikować wyłącznie nową kopię.
 
 Natywny walidator wyłącznie do odczytu ponownie sprawdza pełny union runów,

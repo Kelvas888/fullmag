@@ -51309,7 +51309,14 @@ async fn frequency_domain_response_field_meta_rejects_complex_pair_count_overflo
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let status = response.status();
+    let body = body_bytes(response).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "overflow metadata unexpectedly accepted: {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 #[tokio::test]

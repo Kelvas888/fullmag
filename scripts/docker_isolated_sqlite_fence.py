@@ -33,7 +33,28 @@ from docker_dev_host import validate_host_path
 
 _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _UINT32_MAX = (1 << 32) - 1
+_SQLITE_LOCK_OFFSET = 0x40000000
+_SQLITE_LOCK_LENGTH = 512
 _UNCERTAIN_HELPERS: list[subprocess.Popen[bytes]] = []
+
+
+class WorkspaceDatabaseFence(dict):
+    """JSON-compatible fence receipt with a live pre-commit verifier."""
+
+    def __init__(self, receipt: dict, verifier):
+        super().__init__(receipt)
+        self._verifier = verifier
+
+    def verify(self) -> None:
+        self._verifier()
+
+
+class _OwnerLockConflict(BuildControlError):
+    """The authenticated helper failed its post-GO exclusive-lock retry."""
+
+
+class _OwnerUnexpectedAcquisition(BuildControlError):
+    """The owner helper acquired before the host's GO handshake."""
 
 
 def _require_posix_bind_source(source: str) -> str:
@@ -416,13 +437,81 @@ def _sqlite_module_source() -> str:
 
 def _owner_script() -> str:
     code = _sqlite_module_source() + r'''
-import json, os, sys
-with hold_workspace_database(Path("/sqlite-source")):
-    info = os.stat("/sqlite-source/workspace.db", follow_symlinks=False)
-    print(json.dumps({"state":"READY", "device":info.st_dev,
-                      "inode":info.st_ino, "size":info.st_size},
-                     sort_keys=True, separators=(",", ":")), flush=True)
+import errno, json, os, sys
+path = Path("/sqlite-source/workspace.db")
+fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+locked = False
+offset = 0x40000000
+length = 512
+def record(state):
+    info = os.fstat(fd)
+    return {"state":state, "device":info.st_dev, "inode":info.st_ino,
+            "size":info.st_size, "uid":info.st_uid, "gid":info.st_gid,
+            "mode":stat.S_IMODE(info.st_mode), "links":info.st_nlink,
+            "regular":stat.S_ISREG(info.st_mode)}
+def check_identity(before):
+    opened = os.fstat(fd)
+    current = os.lstat(path)
+    expected = (before.st_dev, before.st_ino, before.st_size,
+                before.st_uid, before.st_gid, before.st_mtime_ns)
+    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+            or (opened.st_dev, opened.st_ino, opened.st_size,
+                opened.st_uid, opened.st_gid, opened.st_mtime_ns) != expected
+            or (current.st_dev, current.st_ino, current.st_size,
+                current.st_uid, current.st_gid, current.st_mtime_ns) != expected):
+        raise RuntimeError("workspace database identity changed while fenced")
+def acquire():
+    lock = struct.pack("@hhqqi4x", fcntl.F_WRLCK, os.SEEK_SET, offset, length, 0)
+    fcntl.fcntl(fd, fcntl.F_OFD_SETLK, lock)
+def release():
+    unlock = struct.pack("@hhqqi4x", fcntl.F_UNLCK, os.SEEK_SET, offset, length, 0)
+    fcntl.fcntl(fd, fcntl.F_OFD_SETLK, unlock)
+def run():
+    global locked
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise RuntimeError("workspace database is linked or not regular")
+    if os.pread(fd, 16, 0) != b"SQLite format 3\x00":
+        raise RuntimeError("workspace database has an invalid SQLite header")
+    try:
+        acquire()
+        locked = True
+    except OSError as error:
+        if error.errno not in (errno.EAGAIN, errno.EACCES):
+            raise
+        check_identity(before)
+        print(json.dumps(record("BLOCKED"), sort_keys=True,
+                         separators=(",", ":")), flush=True)
+        if sys.stdin.buffer.readline(64) != b"GO\n":
+            return
+        try:
+            acquire()
+            locked = True
+        except OSError as second:
+            if second.errno in (errno.EAGAIN, errno.EACCES):
+                print(json.dumps(record("CONFLICT"), sort_keys=True,
+                                 separators=(",", ":")), flush=True)
+                raise SystemExit(4)
+            raise
+    else:
+        print(json.dumps(record("UNEXPECTED_READY"), sort_keys=True,
+                         separators=(",", ":")), flush=True)
+        sys.stdin.buffer.read()
+        check_identity(before)
+        return
+    check_identity(before)
+    print(json.dumps(record("READY"), sort_keys=True,
+                     separators=(",", ":")), flush=True)
     sys.stdin.buffer.read()
+    check_identity(before)
+try:
+    run()
+finally:
+    try:
+        if locked:
+            release()
+    finally:
+        os.close(fd)
 print(json.dumps({"state":"RELEASED"}, separators=(",", ":")), flush=True)
 '''
     return "python3 -B -c " + shlex.quote(code)
@@ -439,10 +528,37 @@ def _helper_label(process) -> str:
     return name + (" (container ID " + identifier + ")" if identifier else "")
 
 
+def _owner_inspect_source(document: dict, requested_source: str) -> str:
+    """Return one owner mount proposal after host lock proof has succeeded."""
+    requested_source = _require_posix_bind_source(requested_source)
+    host_config = _strict_inspect_mapping(document, "HostConfig")
+    host_mounts = host_config.get("Mounts")
+    mounts = document.get("Mounts")
+    host_db = [mount for mount in host_mounts if isinstance(mount, dict)
+               and mount.get("Target") == "/sqlite-source/workspace.db"] \
+        if isinstance(host_mounts, list) else []
+    actual_db = [mount for mount in mounts if isinstance(mount, dict)
+                 and mount.get("Destination") == "/sqlite-source/workspace.db"] \
+        if isinstance(mounts, list) else []
+    if (len(host_db) != 1 or len(actual_db) != 1
+            or host_db[0].get("Type") != "bind"
+            or actual_db[0].get("Type") != "bind"):
+        raise BuildControlError("SQLite owner helper has no unique database bind")
+    host_source = _require_posix_bind_source(host_db[0].get("Source"))
+    actual_source = _require_posix_bind_source(actual_db[0].get("Source"))
+    if host_source != actual_source:
+        raise BuildControlError("SQLite owner inspect sources differ")
+    if (actual_source != requested_source
+            and not actual_source.startswith(retained._WSL_ALIAS_PREFIXES)):
+        raise BuildControlError("SQLite owner inspect source is not the canonical path or a known WSL alias")
+    return actual_source
+
+
 def _inspect_helper(control, process, name: str, args: list[str], *,
                     requested_source: str, expected_daemon_source: str | None,
                     user: str, group_add: tuple[int, ...],
-                    database_read_only: bool) -> tuple[str, dict]:
+                    database_read_only: bool,
+                    owner_lock_fd: int | None = None) -> tuple[str, dict]:
     if process.poll() is not None:
         raise BuildControlError("SQLite helper exited before inspection")
     try:
@@ -461,10 +577,18 @@ def _inspect_helper(control, process, name: str, args: list[str], *,
     if isinstance(candidate_id, str) and _CONTAINER_ID.fullmatch(candidate_id):
         process._fullmag_helper_id = candidate_id
     try:
+        validation_source = requested_source
+        validation_daemon_source = expected_daemon_source
+        if not database_read_only:
+            if owner_lock_fd is None:
+                raise BuildControlError("SQLite owner inspect requires a proved host lock conflict")
+            _prove_host_read_lock_conflict(owner_lock_fd)
+            validation_source = _owner_inspect_source(document, requested_source)
+            validation_daemon_source = validation_source
         identifier = _validate_helper_inspection(
             control=control, document=document, name=name, arguments=args,
-            host_mount_source=requested_source,
-            expected_daemon_source=expected_daemon_source, user=user,
+            host_mount_source=validation_source,
+            expected_daemon_source=validation_daemon_source, user=user,
             group_add=group_add, database_read_only=database_read_only,
         )
     except Exception as error:
@@ -476,7 +600,8 @@ def _inspect_helper(control, process, name: str, args: list[str], *,
 
 
 def _start_helper(control, script: str, *, database_source: str, user: str,
-                  group_add: tuple[int, ...], database_read_only: bool):
+                  group_add: tuple[int, ...], database_read_only: bool,
+                  initial_state: str = "READY", authenticate_initial: bool = True):
     name = "fullmag-sqlite-fence-" + uuid.uuid4().hex
     args = _managed_helper_args(
         control, script, name=name, database_source=database_source,
@@ -493,12 +618,25 @@ def _start_helper(control, script: str, *, database_source: str, user: str,
     process._fullmag_helper_name = name
     try:
         line = retained._readline(process, timeout=90)
-        ready = _json_ack(line, "READY")
-        _, document = _inspect_helper(
-            control, process, name, args, requested_source=database_source,
-            expected_daemon_source=None, user=user, group_add=group_add,
-            database_read_only=database_read_only,
-        )
+        try:
+            acknowledgement = json.loads(line)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise BuildControlError("SQLite helper acknowledgement is malformed") from error
+        if not isinstance(acknowledgement, dict):
+            raise BuildControlError("SQLite helper acknowledgement is malformed")
+        if (initial_state == "BLOCKED"
+                and acknowledgement.get("state") == "UNEXPECTED_READY"):
+            _release_helper(process)
+            raise _OwnerUnexpectedAcquisition(
+                "Owner helper acquired its database lock before the host GO handshake")
+        ready = _json_ack(line, initial_state)
+        document = None
+        if authenticate_initial:
+            _, document = _inspect_helper(
+                control, process, name, args, requested_source=database_source,
+                expected_daemon_source=None, user=user, group_add=group_add,
+                database_read_only=database_read_only,
+            )
     except Exception as error:
         if process.poll() is None:
             _retain_uncertain(process)
@@ -531,6 +669,38 @@ def _release_helper(process, *, expected_state: str = "RELEASED") -> None:
             + "; resources are retained") from error
 
 
+def _continue_owner_helper(process) -> dict:
+    """Let a source-matched owner helper retry only after host RDLCK release."""
+    if process.stdin is None or process.stdin.closed:
+        _retain_uncertain(process)
+        raise ControlOutcomeUnknown("Owner helper control pipe is unavailable; resources are retained")
+    try:
+        process.stdin.write(b"GO\n")
+        process.stdin.flush()
+        line = retained._readline(process, timeout=90)
+        acknowledgement = json.loads(line)
+        if not isinstance(acknowledgement, dict):
+            raise ValueError("owner acknowledgement is not an object")
+        if acknowledgement.get("state") == "CONFLICT":
+            code = process.wait(timeout=30)
+            if code != 4:
+                raise ControlOutcomeUnknown(
+                    "Owner helper conflict exit was not confirmed for "
+                    + _helper_label(process) + "; resources are retained")
+            raise _OwnerLockConflict(
+                "Owner helper remained blocked after the host released its read lock")
+        if acknowledgement.get("state") != "READY":
+            raise ValueError("owner helper did not report READY")
+        return acknowledgement
+    except _OwnerLockConflict:
+        raise
+    except Exception as error:
+        _retain_uncertain(process)
+        raise ControlOutcomeUnknown(
+            "Owner helper acquisition is unknown for " + _helper_label(process)
+            + "; resources are retained") from error
+
+
 def _lstat_optional(path: Path):
     try:
         return path.lstat()
@@ -559,21 +729,87 @@ def _validate_host_database(root: Path):
     return database, database_info
 
 
-def _host_fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+def _host_fingerprint(info: os.stat_result) -> tuple[int, ...]:
     return (
         info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
-        info.st_ctime_ns, stat.S_IMODE(info.st_mode), info.st_nlink,
+        info.st_ctime_ns, info.st_uid, info.st_gid,
+        stat.S_IMODE(info.st_mode), info.st_nlink,
     )
 
 
 def _validate_probe_host_identity(metadata: dict[str, int], host_info: os.stat_result) -> None:
-    if (metadata["device"], metadata["inode"], metadata["size"]) != (
-            host_info.st_dev, host_info.st_ino, host_info.st_size):
+    expected = (
+        metadata.get("device"), metadata.get("inode"), metadata.get("size"),
+        metadata.get("uid"), metadata.get("gid"),
+    )
+    actual = (
+        host_info.st_dev, host_info.st_ino, host_info.st_size,
+        host_info.st_uid, host_info.st_gid,
+    )
+    if expected != actual:
         raise BuildControlError("Read-only probe and host identify different database files")
+    if ("mode" in metadata and metadata["mode"] != stat.S_IMODE(host_info.st_mode)
+            or "links" in metadata and metadata["links"] != host_info.st_nlink
+            or "regular" in metadata and metadata["regular"] is not stat.S_ISREG(host_info.st_mode)):
+        raise BuildControlError("Read-only probe and host database metadata differ")
+
+
+def _validate_owner_probe_identity(owner: dict[str, int], probe: dict[str, int],
+                                   host_info: os.stat_result) -> None:
+    _validate_probe_host_identity(owner, host_info)
+    fields = ("device", "inode", "size", "uid", "gid", "mode", "links", "regular")
+    if any(owner.get(field) != probe.get(field) for field in fields):
+        raise BuildControlError("Owner fence and read-only probe metadata differ")
+
+
+def _host_sidecar_fingerprint(root: Path) -> dict[str, tuple[int, ...] | None]:
+    result = {}
+    for suffix in ("-journal", "-wal", "-shm"):
+        path = root / ("workspace.db" + suffix)
+        info = _lstat_optional(path)
+        result[suffix] = None if info is None else (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_uid, info.st_gid,
+            stat.S_IMODE(info.st_mode), info.st_nlink,
+        )
+    return result
+
+
+def _assert_host_sidecars(root: Path, expected: dict[str, tuple[int, ...] | None]) -> None:
+    _validate_host_database(root)
+    if _host_sidecar_fingerprint(root) != expected:
+        raise BuildControlError("Workspace SQLite sidecar identity changed while fenced")
+
+
+def _host_lock_command(fd: int, command: int) -> None:
+    lock = struct.pack("@hhqqi4x", command, os.SEEK_SET,
+                       _SQLITE_LOCK_OFFSET, _SQLITE_LOCK_LENGTH, 0)
+    fcntl.fcntl(fd, fcntl.F_OFD_SETLK, lock)
+
+
+def _acquire_host_read_lock(fd: int) -> None:
+    try:
+        _host_lock_command(fd, fcntl.F_RDLCK)
+    except OSError as error:
+        if error.errno in (errno.EAGAIN, errno.EACCES):
+            raise BuildControlError("Workspace database has an active writer before fencing") from error
+        raise BuildControlError("Host could not acquire the initial SQLite read lock") from error
+
+
+def _release_host_read_lock(fd: int) -> None:
+    try:
+        _host_lock_command(fd, fcntl.F_UNLCK)
+    except OSError as error:
+        raise BuildControlError("Host could not release its SQLite read lock") from error
+
+
+def _prove_host_read_lock_available(fd: int) -> None:
+    _acquire_host_read_lock(fd)
+    _release_host_read_lock(fd)
 
 
 def _assert_host_identity(database: Path, fd: int,
-                          expected: tuple[int, int, int, int, int, int, int]) -> None:
+                          expected: tuple[int, ...]) -> None:
     descriptor_info = os.fstat(fd)
     path_info = database.lstat()
     if (not stat.S_ISREG(path_info.st_mode) or path_info.st_nlink != 1
@@ -585,15 +821,13 @@ def _assert_host_identity(database: Path, fd: int,
 def _prove_host_read_lock_conflict(fd: int) -> None:
     if not hasattr(fcntl, "F_OFD_SETLK"):
         raise BuildControlError("SQLite source fence requires Linux OFD locks")
-    lock = struct.pack("@hhqqi4x", fcntl.F_RDLCK, os.SEEK_SET, 0x40000000, 512, 0)
     try:
-        fcntl.fcntl(fd, fcntl.F_OFD_SETLK, lock)
+        _host_lock_command(fd, fcntl.F_RDLCK)
     except OSError as error:
         if error.errno not in (errno.EAGAIN, errno.EACCES):
             raise BuildControlError("Host could not verify the SQLite lock conflict") from error
         return
-    unlock = struct.pack("@hhqqi4x", fcntl.F_UNLCK, os.SEEK_SET, 0x40000000, 512, 0)
-    fcntl.fcntl(fd, fcntl.F_OFD_SETLK, unlock)
+    _host_lock_command(fd, fcntl.F_UNLCK)
     raise BuildControlError("Managed SQLite exclusive fence is not visible to the host")
 
 
@@ -648,8 +882,8 @@ def hold_managed_workspace_database(control, backend, user_data: Path):
     """Fence one stopped backend's workspace.db without changing source data.
 
     The caller must validate the stopped Compose pair and canonical declared
-    storage root first. The yielded record is evidence only; the managed helper
-    and host descriptor stay open until the context exits.
+    storage root first. The receipt stays JSON-compatible and exposes verify()
+    while the managed helper and host descriptor remain open.
     """
     if not sys.platform.startswith("linux"):
         raise BuildControlError("Managed SQLite source fencing is Linux-only")
@@ -657,15 +891,22 @@ def hold_managed_workspace_database(control, backend, user_data: Path):
     helper_control = _python_helper_control(control, backend)
     root = _canonical_user_data(user_data)
     database, info = _validate_host_database(root)
+    sidecars = _host_sidecar_fingerprint(root)
     if info is None:
-        yield {"database_present": False}
+        def verify_absent():
+            _assert_host_sidecars(root, sidecars)
+            if _lstat_optional(database) is not None:
+                raise BuildControlError("Workspace database appeared during absent-source validation")
+
+        receipt = WorkspaceDatabaseFence({"database_present": False}, verify_absent)
+        yield receipt
+        receipt.verify()
         return
 
     if not hasattr(fcntl, "F_OFD_SETLK"):
         raise BuildControlError("Managed SQLite source fencing requires Linux OFD locks")
     database_source = _require_posix_bind_source(str(database))
-    # The fresh probe observes the daemon's actual alias for the canonical host
-    # path. The owner fence reuses that exact inspect source after the probe exits.
+    original_fingerprint = _host_fingerprint(info)
     probe_process, probe_name, probe_args, probe_line, probe_document = _start_helper(
         helper_control, _probe_script(), database_source=database_source,
         user="65532:65532", group_add=(), database_read_only=True,
@@ -680,7 +921,13 @@ def hold_managed_workspace_database(control, backend, user_data: Path):
             group_add=(), database_read_only=True,
         )
         _validate_probe_host_identity(probe_metadata, info)
-        _validate_host_database(root)
+        _assert_host_sidecars(root, sidecars)
+        _, current_info = _validate_host_database(root)
+        if current_info is None:
+            raise BuildControlError("Workspace database disappeared during metadata probe")
+        _validate_probe_host_identity(probe_metadata, current_info)
+        if _host_fingerprint(current_info) != original_fingerprint:
+            raise BuildControlError("Workspace database metadata changed during metadata probe")
     except Exception as error:
         _release_helper(probe_process)
         raise BuildControlError(
@@ -692,40 +939,67 @@ def hold_managed_workspace_database(control, backend, user_data: Path):
     gid = probe_metadata["gid"]
     owner_user = str(uid) + ":" + str(gid)
     owner_groups = () if gid == 65532 else (65532,)
-    owner_process, owner_name, owner_args, owner_line, owner_document = _start_helper(
-        helper_control, _owner_script(), database_source=daemon_source,
-        user=owner_user, group_add=owner_groups, database_read_only=False,
-    )
-    try:
-        owner_metadata = _metadata_ack(owner_line, owner=False)
-    except Exception as error:
-        _retain_uncertain(owner_process)
-        raise ControlOutcomeUnknown(
-            "Owner fence acknowledgement is invalid for " + _helper_label(owner_process)
-            + "; helper resources are retained") from error
     host_fd = None
+    host_read_lock_held = False
+    owner_process = None
+    owner_id = None
+    owner_release_confirmed = False
     try:
-        _validate_helper_inspection(
-            control=helper_control, document=owner_document, name=owner_name,
-            arguments=owner_args, host_mount_source=daemon_source,
-            expected_daemon_source=daemon_source, user=owner_user,
-            group_add=owner_groups, database_read_only=False,
-        )
-        if (owner_metadata["device"], owner_metadata["inode"], owner_metadata["size"]) != (
-                probe_metadata["device"], probe_metadata["inode"], probe_metadata["size"]):
-            raise BuildControlError("Metadata probe and owner fence identify different database bytes")
-        _validate_host_database(root)
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         host_fd = os.open(database, flags)
         host_info = os.fstat(host_fd)
-        if (host_info.st_dev, host_info.st_ino, host_info.st_size) != (
-                owner_metadata["device"], owner_metadata["inode"], owner_metadata["size"]):
-            raise BuildControlError("Host and managed fence do not identify the same database file")
+        _validate_probe_host_identity(probe_metadata, host_info)
+        _assert_host_identity(database, host_fd, original_fingerprint)
+        _assert_host_sidecars(root, sidecars)
+
+        # Hold this exact host open-file-description read lock while the owner
+        # helper proves that its first write-lock attempt is blocked.
+        _acquire_host_read_lock(host_fd)
+        host_read_lock_held = True
+        owner_process, owner_name, owner_args, blocked_line, _ = _start_helper(
+            helper_control, _owner_script(), database_source=database_source,
+            user=owner_user, group_add=owner_groups, database_read_only=False,
+            initial_state="BLOCKED", authenticate_initial=False,
+        )
+        blocked_metadata = _metadata_ack(blocked_line, owner=True)
+        _validate_owner_probe_identity(blocked_metadata, probe_metadata, host_info)
+        _assert_host_identity(database, host_fd, original_fingerprint)
+        _assert_host_sidecars(root, sidecars)
+        if owner_process.poll() is not None:
+            raise ControlOutcomeUnknown(
+                "Owner helper exited before the host GO handshake for "
+                + _helper_label(owner_process) + "; resources are retained")
+
+        _release_host_read_lock(host_fd)
+        host_read_lock_held = False
+        owner_ready = _continue_owner_helper(owner_process)
+        owner_metadata = _metadata_ack(owner_ready, owner=True)
+        _validate_owner_probe_identity(owner_metadata, probe_metadata, host_info)
+
+        owner_id, _ = _inspect_helper(
+            helper_control, owner_process, owner_name, owner_args,
+            requested_source=database_source, expected_daemon_source=None,
+            user=owner_user, group_add=owner_groups,
+            database_read_only=False, owner_lock_fd=host_fd,
+        )
         expected_fingerprint = _host_fingerprint(host_info)
-        _prove_host_read_lock_conflict(host_fd)
         _assert_host_identity(database, host_fd, expected_fingerprint)
-        _validate_host_database(root)
-        yield {
+        _assert_host_sidecars(root, sidecars)
+
+        def verify_owned():
+            _assert_host_identity(database, host_fd, expected_fingerprint)
+            _assert_host_sidecars(root, sidecars)
+            current_id, _ = _inspect_helper(
+                helper_control, owner_process, owner_name, owner_args,
+                requested_source=database_source, expected_daemon_source=None,
+                user=owner_user, group_add=owner_groups,
+                database_read_only=False, owner_lock_fd=host_fd,
+            )
+            if current_id != owner_id:
+                raise ControlOutcomeUnknown(
+                    "Authenticated SQLite owner helper identity changed; resources are retained")
+
+        receipt = WorkspaceDatabaseFence({
             "database_present": True,
             "device": host_info.st_dev,
             "inode": host_info.st_ino,
@@ -733,18 +1007,30 @@ def hold_managed_workspace_database(control, backend, user_data: Path):
             "owner_uid": uid,
             "owner_gid": gid,
             "fence": "managed-ofd-exclusive",
-        }
-        _assert_host_identity(database, host_fd, expected_fingerprint)
-        _validate_host_database(root)
-    except BaseException:
-        # The authenticated helper has a simple EOF release protocol. If that
-        # protocol cannot be confirmed, retain the process and do not kill it.
-        _release_helper(owner_process)
+        }, verify_owned)
+        receipt.verify()
+        yield receipt
+        receipt.verify()
+    except BaseException as error:
+        if owner_process is not None and owner_process.poll() is None:
+            _release_helper(owner_process)
+            owner_release_confirmed = True
+        elif isinstance(error, _OwnerUnexpectedAcquisition):
+            owner_release_confirmed = True
+        if host_read_lock_held and host_fd is not None:
+            _release_host_read_lock(host_fd)
+            host_read_lock_held = False
+        if owner_release_confirmed and host_fd is not None:
+            _prove_host_read_lock_available(host_fd)
         raise
     else:
         _release_helper(owner_process)
+        owner_release_confirmed = True
+        _prove_host_read_lock_available(host_fd)
         _assert_host_identity(database, host_fd, expected_fingerprint)
-        _validate_host_database(root)
+        _assert_host_sidecars(root, sidecars)
     finally:
+        if host_read_lock_held and host_fd is not None:
+            _release_host_read_lock(host_fd)
         if host_fd is not None:
             os.close(host_fd)

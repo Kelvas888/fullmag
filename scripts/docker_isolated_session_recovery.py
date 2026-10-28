@@ -217,6 +217,7 @@ def recover(args):
             if (pinned.st_dev,pinned.st_ino)!=(current.st_dev,current.st_ino):
                 raise BuildControlError('Source store differs from the locked directory')
         verify_store_binding()
+        workspace_fence.verify()
         pair_before=_stopped_pair(context,pins,compose)
         live_workspace=snapshot_control_workspace(control,token,image_id=pins['old_image_id'])['source']
         source={'schema':'fullmag.isolated-session-snapshot-manifest.v1',
@@ -306,6 +307,7 @@ def recover(args):
         # switch occurs under the same global lock, with a byte-exact CAS.
         verify_store_binding()
         _stopped_pair(context,pins,compose)
+        workspace_fence.verify()
         registry={'schema':REGISTRY_SCHEMA,'recovery_id':token,'namespace':namespace,
                   'receipt_path':root+'/terminal.json','receipt_sha256':digest(receipt_raw),
                   'compose_project':control.project,'control_volume':control.volume,
