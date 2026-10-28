@@ -723,3 +723,24 @@ niezmieniony. Nie jest to ogólne odzyskiwanie lease ani trasa dla aktywnego run
 
 Po sukcesie użyj zwykłego przypiętego resume-volume --restart-backend.
 Inne zmiany tożsamości, aktywny/nieznany konsument albo różne piny blokują zapis.
+
+
+## Authored input after accepted recovery
+
+Accepted live runs retain the authored SceneDocument in the immutable project
+definition, with the same versioned execution-input identity as the RunIntent.
+The legacy default execution profile used to materialize the Study remains in
+the accepted Study and execution catalog; it does not become an authored scene
+change merely because the API restarts.
+
+Older definitions may contain that automatically inserted default profile.
+Recovery first validates the unchanged scene. Only if its input digest differs
+and the profile equals the exact canonical legacy default may recovery project
+that field back to absence, and only when the complete input digest then equals
+the immutable pin. Explicit profiles, actual input changes, and malformed pins
+remain protected. Stored definitions and RunIntent/CAS bytes are never rewritten.
+
+This keeps terminal cancellation visible to the accepted projector: a completed
+Stop must publish its terminal command resource and durable journal ACK instead
+of leaving the UI at accepted/stopping. It does not replay Solve, release a held
+run, or authorize editing historical journals.

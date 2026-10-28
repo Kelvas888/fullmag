@@ -2051,7 +2051,10 @@ fn prepare_live_accepted(
         _ => None,
     };
 
-    let scene_value = serde_json::to_value(&effective_scene).map_err(|error| {
+    // Keep the authored document identical to the execution_input pin. The
+    // derived legacy profile belongs to the accepted Study, not the editable
+    // scene restored after a restart.
+    let scene_value = serde_json::to_value(scene).map_err(|error| {
         ApiError::internal(format!("failed to serialize accepted SceneDocument: {error}"))
     })?;
     let mut definition = fullmag_application::ProjectEnvelope::blank(
