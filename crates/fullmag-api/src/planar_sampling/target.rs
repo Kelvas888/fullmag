@@ -81,7 +81,7 @@ impl ResolvedSpatialTarget {
     }
 
     /// Locator for `expected_points` evaluations. FEM targets with many points
-    /// build an element AABB hierarchy once (PM-N17); a few points keep the
+    /// build an element AABB hierarchy once (PM-N28); a few points keep the
     /// direct scan, which is cheaper than building the index.
     pub(crate) fn point_locator(&self, expected_points: usize) -> PointLocator<'_> {
         let index = match &self.field {

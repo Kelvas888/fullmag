@@ -1,5 +1,5 @@
 //! Bounding-volume hierarchy over element AABBs for point location (note
-//! 0970 § Spatial index for point location, gate PM-N17).
+//! 0970 § Spatial index for point location, gate PM-N28).
 //!
 //! The index only narrows the candidate elements; the containment test and
 //! the shape functions stay those of the direct scan. Candidates are visited

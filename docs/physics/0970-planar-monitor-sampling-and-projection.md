@@ -920,7 +920,7 @@ elements (median split on the longest centroid axis, leaves of at most 8
 elements) and tests only the elements whose box, padded by $10^{-9}$ of the
 mesh diagonal to cover the $10^{-11}$ weight tolerance of the containment
 test, contains the point. Candidates are tested in ascending element index,
-the order of the direct scan, so a point on a shared face resolves to the same
+the order of the direct scan (gate PM-N28), so a point on a shared face resolves to the same
 element and the value, entity id and occupancy are identical to the direct
 traversal; the index changes cost, never results. It is built per request and
 discarded with it; a single probe keeps the direct scan, which is cheaper than
@@ -1065,7 +1065,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N13 | FDM target × dynamic-extent cross-product | `target_bounds`, `magnetic_domain`, and `universe` resolve independently of target masking for `domain`, `magnetic_domain`, `object`, and `region`; the current distinct-bounds source path requires fresh per-lane qualification |
 | PM-N14 | FDM procedural grid overlay | `FMFG v1` zawiera skończone, nieduplikowane segmenty przecięcia wybranych komórek z $s=0$, zachowuje sample identity i odrzuca przekroczenie budżetu zamiast zwracać uciętą geometrię |
 | PM-N16 | cached operator vs. direct evaluation on Tet4, Prism6 and FDM | relative agreement $\le 10^{-13}$ of the occupied range; two operator builds bitwise identical |
-| PM-N17 | spatial index for batched point location on structured and graded Tet4 meshes (interior, face, edge and outside points; unselected elements) | located element and value identical to the direct scan for every point; candidate count bounded by the elements around a node; plane-operator indexing and the 200k/2M scale points remain open |
+| PM-N17 | spatial index on 10k, 200k and 2M Tet4 elements | identical raster to the direct traversal; bounded candidate count per plane |
 | PM-N18 | Hex8 linear and trilinear manufactured fields, axis and oblique planes | reproduction within $10^{-12}$ relative; no tetrahedral split |
 | PM-N19 | Pyramid5 basis against the linked MFEM first-order pyramid | pointwise agreement of all five shape functions at interior and face points |
 | PM-N20 | Prism6/Hex8/Pyramid5 slab of the element interpolant ($q=\xi\tau$) | integral exact to quadrature tolerance; linear clipping fails this gate |
@@ -1074,6 +1074,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
 | PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
 | PM-N25 | line profile through an affine FEM field across several elements, and through an FDM field | FEM values equal the affine field at uniform and face-crossing points within $10^{-12}$ relative; every in-plane element-face crossing is present; FDM values equal the containing cell values; outside/empty points carry no value |
+| PM-N28 | batched point location through the element AABB hierarchy (structured Tet4 with unselected elements; interior, face, edge and outside points; runtime profile on a mixed FEM carrier) | located element, value and occupancy identical to the direct scan for every point; candidate count bounded by the elements around a node |
 | PM-N26 | in-plane streamlines on a uniform field, a vortex raster and a masked raster | uniform field gives straight parallel lines along $\mathbf w$ within $10^{-9}$ of the pixel pitch; vortex lines close or stay within the disk; no point lies in a non-renderable cell; repeated runs are identical; budget overflow is reported as truncated |
 | PM-N27 | multislice of an FDM stack at $\phi\in\{0.25,0.5,0.75\}$ and of an FEM film | each panel equals the single default section at the same $\phi$ (same resolved coordinate and bitwise-equal raster); the panels' sample tokens differ; the auto range is the union of the panels' renderable extrema; a monitor source with `position_fraction` is rejected |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |

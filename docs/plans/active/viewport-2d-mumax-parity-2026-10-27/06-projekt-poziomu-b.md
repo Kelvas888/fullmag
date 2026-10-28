@@ -68,7 +68,7 @@ Status: **zrobione częściowo** (2026-10-28). Uchwyt przesunięcia wzdłuż nor
 
 ## B6. Indeks przestrzenny i gather na GPU
 
-Status: **zrobione częściowo** (2026-10-28). BVH po AABB wybranych elementów dla wsadowej lokalizacji punktów (profil liniowy od 32 punktów), kandydaci w rosnącej kolejności elementów, więc wynik równy skanowi bezpośredniemu (nota 0970 § Spatial index for point location, PM-N17 przeformułowana; runtime: 61 punktów profilu bitowo równych sondzie). Nie zrobione: indeks dla operatora płaszczyzny i cache BVH między żądaniami; gather na GPU **BLOCKED** (tor FEM GPU zablokowany).
+Status: **zrobione częściowo** (2026-10-28). BVH po AABB wybranych elementów dla wsadowej lokalizacji punktów (profil liniowy od 32 punktów), kandydaci w rosnącej kolejności elementów, więc wynik równy skanowi bezpośredniemu (nota 0970 § Spatial index for point location; nowa bramka PM-N28 spełniona w runtime: 61 punktów profilu bitowo równych sondzie; PM-N17 dla operatora płaszczyzny pozostaje otwarta). Nie zrobione: indeks dla operatora płaszczyzny i cache BVH między żądaniami; gather na GPU **BLOCKED** (tor FEM GPU zablokowany).
 
 - BVH po AABB elementów (budowane raz na `topology_fingerprint`) dla płaszczyzn skośnych, sondy i profili; obecnie płaszczyzna rasteryzuje element po elemencie, a sonda skanuje elementy liniowo.
 - Gather operatora (rzadkie mnożenie) na urządzeniu dla FEM GPU, aby nie kopiować całego pola przy każdym kroku; wymaga noty i kwalifikacji parytetu z CPU.
