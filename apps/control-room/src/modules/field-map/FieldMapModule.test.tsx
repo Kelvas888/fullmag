@@ -553,7 +553,7 @@ describe("FieldMapModule planar state ownership", () => {
     expect(html).toContain("2 kA/m");
     expect(html).toContain('class="fm-field-map__colorbar-ramp" data-colormap="viridis"');
     expect(html).toContain(
-      "background:linear-gradient(to right, rgb(68, 1, 84), rgb(49, 104, 142), rgb(53, 183, 121), rgb(253, 231, 37))",
+      "background:linear-gradient(to right in srgb, rgb(68, 1, 84), rgb(49, 104, 142), rgb(53, 183, 121), rgb(253, 231, 37))",
     );
 
     const minIndex = html.indexOf("-1 kA/m");
