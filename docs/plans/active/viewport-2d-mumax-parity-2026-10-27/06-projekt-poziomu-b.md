@@ -21,6 +21,8 @@ Status: **zrobione** (2026-10-28). Odstępstwo: odpowiedź JSON (jak sonda), nie
 
 ## B2. Multislice
 
+Status: **zrobione** (2026-10-28). Nota 0970 § Multislice panels, bramka PM-N27 (sprawdzona w runtime, `docs/diagnostics/viewport-2d-multislice-2026-10-28/`). Odstępstwa od projektu: stan to `planar.multislice: { enabled, position_fractions }` jako pole addytywne `serde(default)` bez migracji wersji schematu; parametr zapytania nazywa się `position_fraction` (zgodnie z `default_slice`); wspólny zakres liczony z ekstremów renderowalnych próbek paneli tą samą redukcją co widok pojedynczy (nie z `occupied_range` meta); panele nie mają sondy ani podglądu zestawu płaszczyzn w 3D; liczba paneli 2–4.
+
 | Aspekt | Projekt |
 |---|---|
 | Forma | siatka 2×2 lub 1×N paneli 2D; wspólna wielkość, składowa, zakres i paleta; każdy panel ma własne `sample_token` |
