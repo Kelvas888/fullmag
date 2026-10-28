@@ -3121,7 +3121,8 @@ mod tests {
                     "solver_config": {"preset_id": "s", "version": "v1"},
                     "discretization": {"recipe_id": "d", "version": "v1"},
                     "execution_profile": {"profile_id": "e", "version": "v1"},
-                    "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive"
+                    "until_seconds": 1e-9, "acceptance": {"kind": "any"}, "acquisition": "exclusive",
+                    "completion_dependencies": []
                 }]
             })).unwrap();
             let problems = StudyProblemCatalog::from_entries(&study, vec![
