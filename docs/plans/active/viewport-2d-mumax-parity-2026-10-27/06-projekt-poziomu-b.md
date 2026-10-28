@@ -8,6 +8,8 @@ Wspólna zasada: każda funkcja jest **zasobem pochodnym tej samej klatki** (`sa
 
 ## B1. Profil liniowy
 
+Status: **zrobione** (2026-10-28). Odstępstwo: odpowiedź JSON (jak sonda), nie FMVP — liczba punktów jest ograniczona (≤ 16 384), a wartości są punktowymi ewaluacjami tej samej próbki.
+
 | Aspekt | Projekt |
 |---|---|
 | Interakcja | Shift + przeciągnięcie na mapie rysuje odcinek w (u,v); uchwyty końców edytowalne; `Esc` usuwa |

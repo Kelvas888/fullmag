@@ -143,6 +143,11 @@
       "id": "PM-N24",
       "status": "unqualified",
       "requirement": "An object-layer slab on an even FDM cell count stays centred on the object, and region scope on two regions of opposite m yields two different maps, each empty outside its region."
+    },
+    {
+      "id": "PM-N25",
+      "status": "unqualified",
+      "requirement": "A line profile reproduces an affine FEM field at uniform and element-face crossing points, includes every in-plane face crossing, equals FDM cell values, and leaves outside/empty points without values."
     }
   ],
   "equations": [
@@ -288,6 +293,15 @@
       "sources": [
         "fem-navigation-step",
         "default-section"
+      ]
+    },
+    {
+      "id": "eq-planar-line-profile",
+      "symbols": [
+        "pn_res"
+      ],
+      "sources": [
+        "line-profile"
       ]
     }
   ],
@@ -749,6 +763,13 @@
       "path": "crates/fullmag-api/src/planar_sampling/fem.rs",
       "symbol": "section_extent",
       "responsibility": "Median normal extent and count of the target elements cut by a FEM sampling plane, from the plane-operator geometry pass; published as the continuous navigation step.",
+      "evidence_status": "implemented-compiled-unit-tests-not-run"
+    },
+    {
+      "id": "line-profile",
+      "path": "crates/fullmag-api/src/router_v2/handlers/data/planar_profile.rs",
+      "symbol": "planar_profile_response",
+      "responsibility": "Line profile of one planar sample: uniform and FEM face-crossing arc lengths, point evaluation with the probe locator and basis.",
       "evidence_status": "implemented-compiled-unit-tests-not-run"
     }
   ],
