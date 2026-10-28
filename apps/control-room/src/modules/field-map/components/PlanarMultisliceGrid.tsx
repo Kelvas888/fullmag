@@ -48,7 +48,9 @@ export interface PlanarMultisliceGridProps {
  */
 export function PlanarMultisliceGrid(props: PlanarMultisliceGridProps) {
   const [extents, setExtents] = useState<readonly (MultisliceExtent | null)[]>([]);
-  const count = props.positionFractions.length;
+  // One panel per distinct position: a repeated fraction is the same sample.
+  const fractions = useMemo(() => [...new Set(props.positionFractions)], [props.positionFractions]);
+  const count = fractions.length;
   const onExtent = useCallback((index: number, extent: MultisliceExtent | null) => {
     setExtents((current) => {
       const previous = current[index] ?? null;
@@ -68,10 +70,9 @@ export function PlanarMultisliceGrid(props: PlanarMultisliceGridProps) {
         className="fm-field-map__multislice-grid"
         style={{ gridTemplateColumns: `repeat(${count <= 2 ? count : 2}, minmax(0, 1fr))` }}
       >
-        {props.positionFractions.map((fraction, index) => (
+        {fractions.map((fraction, index) => (
           <PlanarMultislicePanel
-            // A panel is its slot plus position: a new fraction is a new sample.
-            key={`${index}:${fraction}`}
+            key={fraction}
             fraction={fraction}
             index={index}
             onExtent={onExtent}
