@@ -98,12 +98,11 @@ def digest_binary(name):
     descriptor = os.open("/opt/fullmag/package/bin/" + name, FLAGS)
     try:
         metadata = os.fstat(descriptor)
-        # Verified packages are shared between DEV groups as sealed (read-only)
-        # hardlinks; a writable binary must still have exactly one link. The
-        # digest below is checked against the build receipt either way.
-        sealed = not metadata.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-        if not stat.S_ISREG(metadata.st_mode) or (metadata.st_nlink != 1 and not sealed):
-            raise RuntimeError("runtime binary is not one regular file")
+        # Sealed immutable packages are legitimately hardlinked by the shared
+        # store. Mutable handoff JSON above still requires a unique inode.
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink < 1
+                or (metadata.st_nlink != 1 and metadata.st_mode & 0o222)):
+            raise RuntimeError("runtime binary is not a regular or sealed shared file")
         digest = hashlib.sha256()
         total = 0
         while True:
@@ -114,6 +113,13 @@ def digest_binary(name):
             if total > 16 * 1024 * 1024 * 1024:
                 raise RuntimeError("runtime binary exceeds its size bound")
             digest.update(block)
+        after = os.fstat(descriptor)
+        signature = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                   value.st_mtime_ns, value.st_mode)
+        if signature(metadata) != signature(after):
+            raise RuntimeError("runtime binary changed while hashing")
+        # Link-count changes from shared-cache retention do not change bytes.
+        # The caller binds this hash to both build receipt and provenance.
         return digest.hexdigest()
     finally:
         os.close(descriptor)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import stat
 import os
 import shutil
 import subprocess
@@ -16,6 +18,59 @@ import docker_dev_codegen as codegen  # noqa: E402
 
 
 class DockerDevCodegenTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX hardlinks and O_NOFOLLOW")
+    def test_backend_probe_accepts_only_sealed_shared_binaries(self) -> None:
+        script = codegen.BACKEND_DOCUMENTS_SCRIPT
+        functions = script[script.index("def read(path):"):script.index("\nprint(json.dumps({")]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "api"
+            target.write_bytes(b"sealed test binary")
+            alias = Path(directory) / "shared"
+            os.link(target, alias)
+            target.chmod(0o555)
+            proxy = mock.Mock(wraps=os)
+            proxy.open.side_effect = lambda _path, flags: os.open(target, flags)
+            namespace = {"os": proxy, "stat": stat, "hashlib": hashlib, "json": json,
+                         "MAXIMUM": 16 * 1024 * 1024,
+                         "FLAGS": os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW}
+            exec(compile(functions, "<backend-provenance-probe>", "exec"), namespace)
+            digest = namespace["digest_binary"]
+            expected = hashlib.sha256(target.read_bytes()).hexdigest()
+            self.assertEqual(digest("fullmag-api"), expected)
+            # Mutable metadata must never inherit the binary hardlink policy.
+            with self.assertRaisesRegex(RuntimeError, "handoff"):
+                namespace["read"]("receipt.json")
+            target.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "sealed shared"):
+                digest("fullmag-api")
+            target.chmod(0o555)
+            original = target
+            symlink = Path(directory) / "symlink"
+            symlink.symlink_to(original)
+            target = symlink
+            with self.assertRaises(OSError):
+                digest("fullmag-api")
+            target = original
+            # Legitimate concurrent retention may release another hardlink.
+            def read_and_release(fd, size):
+                if alias.exists():
+                    alias.unlink()
+                return os.read(fd, size)
+            proxy.read.side_effect = read_and_release
+            self.assertEqual(digest("fullmag-api"), expected)
+            changed = False
+            def read_and_touch(fd, size):
+                nonlocal changed
+                if not changed:
+                    before = target.stat()
+                    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+                    changed = True
+                return os.read(fd, size)
+            proxy.read.side_effect = read_and_touch
+            with self.assertRaisesRegex(RuntimeError, "changed while hashing"):
+                digest("fullmag-api")
+
+
     @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires executable POSIX shell fixture")
     def test_just_wrapper_preserves_explicit_codegen_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -92,11 +147,6 @@ class DockerDevCodegenTests(unittest.TestCase):
             self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
         with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(Path, "samefile", side_effect=OSError("missing")):
             self.assertFalse(codegen._source_mount_matches_selected(alias, selected))
-
-    def test_backend_binary_digest_accepts_only_sealed_shared_hardlinks(self) -> None:
-        script = codegen.BACKEND_DOCUMENTS_SCRIPT
-        self.assertIn("metadata.st_nlink != 1 and not sealed", script)
-        self.assertIn("stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH", script)
 
     def test_source_match_binds_build_inputs_not_documentation_edits(self) -> None:
         backend = {"commit": "c" * 40, "snapshot": "s" * 64, "source_digest": "d" * 64, "native": {"n": 1}}

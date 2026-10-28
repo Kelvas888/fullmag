@@ -4939,6 +4939,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/workspace/items/{id}/playback/geometry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["workspace_items_get_workspace_items_id_playback_geometry"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/workspace/items/{id}/thumbnail": {
         parameters: {
             query?: never;
@@ -13617,12 +13633,24 @@ export interface components {
             topology_binary_sha256?: string | null;
             topology_fingerprint: string;
         };
+        /** @description Bounded, JSON-only metadata for a saved FEM P1 playback mesh. */
+        SavedPlaybackFemMesh: {
+            cell_count: number;
+            facet_count: number;
+            geometry_sha256: string;
+            node_count: number;
+            support_byte_length?: number | null;
+            support_sha256?: string | null;
+            topology_byte_length?: number | null;
+            topology_sha256?: string | null;
+        };
         /** @description The small JSON read model for a completed saved-result playback. */
         SavedPlaybackResource: {
-            cell_size_m: number[];
-            grid_cells_xyz: number[];
+            cell_size_m?: number[] | null;
+            fem_mesh?: null | components["schemas"]["SavedPlaybackFemMesh"];
+            grid_cells_xyz?: number[] | null;
             name: string;
-            origin_m: number[];
+            origin_m?: number[] | null;
             /** @description SHA-256 identity of the sidecar and all playback array metadata. */
             revision: string;
             schema: string;
@@ -16876,6 +16904,13 @@ export interface components {
         };
         WorkspacePinRequest: {
             pinned: boolean;
+        };
+        /** @description Revision-pinned binary topology/support selection for saved FEM playback. */
+        WorkspacePlaybackGeometryQuery: {
+            /** @description `topology` returns FMMT v2; `support` returns FMSP v1. */
+            part: string;
+            /** @description Exact revision returned by `GET /v2/workspace/items/{id}/playback`. */
+            revision: string;
         };
         WorkspaceRibbonReplaceRequest: {
             active_contextual_tab?: string | null;
@@ -32525,6 +32560,62 @@ export interface operations {
                 content?: never;
             };
             /** @description Playback metadata or frame values are invalid */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    workspace_items_get_workspace_items_id_playback_geometry: {
+        parameters: {
+            query: {
+                /** @description Exact revision returned by `GET /v2/workspace/items/{id}/playback`. */
+                revision: string;
+                /** @description `topology` returns FMMT v2; `support` returns FMSP v1. */
+                part: string;
+            };
+            header?: never;
+            path: {
+                /** @description Registered result item id (decimal string) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revision-pinned saved FEM topology (FMMT v2) or active-node support (FMSP v1) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            /** @description Invalid item id or geometry part */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The item or geometry file is missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The supplied playback revision is stale or the source changed during the read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The result has no FEM geometry or its metadata is invalid */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -1,4 +1,4 @@
-import { WORKSPACE_ITEM_PLAYBACK_PATH, WORKSPACE_ITEM_PLAYBACK_FRAME_PATH } from "./apiPaths";
+import { WORKSPACE_ITEM_PLAYBACK_PATH, WORKSPACE_ITEM_PLAYBACK_FRAME_PATH, WORKSPACE_ITEM_PLAYBACK_GEOMETRY_PATH } from "./apiPaths";
 import type { SavedPlaybackResource } from "./savedResultsPlayback";
 import { artifactFieldResponseIdentityError } from "./artifactFieldResponseIdentity";
 import { objectMeshPolicyWireRequest } from "./objectMeshPolicyWire";
@@ -1137,6 +1137,9 @@ export class ControlRoomApi {
   readonly workspace = {
     playback: (id: string, options?: RequestOptions) =>
       this.requestJson<SavedPlaybackResource>(WORKSPACE_ITEM_PLAYBACK_PATH, options, {path: {id}}),
+    playbackGeometry: (id: string, revision: string, part: "topology"|"support", options?: BinaryRequestOptions) =>
+      this.requestBinaryBytes(WORKSPACE_ITEM_PLAYBACK_GEOMETRY_PATH, {...options, maxResponseBytes: part === "support" ? 1024*1024 : 64*1024*1024},
+        {id}, {revision, part}),
     playbackFrame: (id: string, stageId: string, frameIndex: number, revision: string, options?: BinaryRequestOptions) =>
       this.requestBinaryBytes(WORKSPACE_ITEM_PLAYBACK_FRAME_PATH, {...options, maxResponseBytes: 64 * 1024 * 1024},
         {id, frame_index: String(frameIndex)}, {stage_id: stageId, revision}),

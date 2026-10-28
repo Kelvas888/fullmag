@@ -34103,6 +34103,59 @@
         ],
         "type": "object"
       },
+      "SavedPlaybackFemMesh": {
+        "description": "Bounded, JSON-only metadata for a saved FEM P1 playback mesh.",
+        "properties": {
+          "cell_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "facet_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "geometry_sha256": {
+            "type": "string"
+          },
+          "node_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "support_byte_length": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "support_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "topology_byte_length": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "topology_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_count",
+          "cell_count",
+          "facet_count",
+          "geometry_sha256"
+        ],
+        "type": "object"
+      },
       "SavedPlaybackResource": {
         "description": "The small JSON read model for a completed saved-result playback.",
         "properties": {
@@ -34111,14 +34164,31 @@
               "format": "double",
               "type": "number"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fem_mesh": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SavedPlaybackFemMesh",
+                "description": "Canonical FEM P1 mesh metadata. The heavy mesh and active-node mask\nremain behind the revision-pinned binary geometry endpoint."
+              }
+            ]
           },
           "grid_cells_xyz": {
             "items": {
               "minimum": 0,
               "type": "integer"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -34128,7 +34198,10 @@
               "format": "double",
               "type": "number"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "revision": {
             "description": "SHA-256 identity of the sidecar and all playback array metadata.",
@@ -34155,9 +34228,6 @@
           "schema",
           "revision",
           "name",
-          "grid_cells_xyz",
-          "cell_size_m",
-          "origin_m",
           "stages"
         ],
         "type": "object"
@@ -46994,6 +47064,24 @@
         },
         "required": [
           "pinned"
+        ],
+        "type": "object"
+      },
+      "WorkspacePlaybackGeometryQuery": {
+        "description": "Revision-pinned binary topology/support selection for saved FEM playback.",
+        "properties": {
+          "part": {
+            "description": "`topology` returns FMMT v2; `support` returns FMSP v1.",
+            "type": "string"
+          },
+          "revision": {
+            "description": "Exact revision returned by `GET /v2/workspace/items/{id}/playback`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "part"
         ],
         "type": "object"
       },
@@ -69302,6 +69390,63 @@
           },
           "422": {
             "description": "Playback metadata or frame values are invalid"
+          }
+        },
+        "tags": [
+          "workspace_items"
+        ]
+      }
+    },
+    "/v2/workspace/items/{id}/playback/geometry": {
+      "get": {
+        "operationId": "workspace_items_get_workspace_items_id_playback_geometry",
+        "parameters": [
+          {
+            "description": "Registered result item id (decimal string)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact revision returned by `GET /v2/workspace/items/{id}/playback`.",
+            "in": "query",
+            "name": "revision",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`topology` returns FMMT v2; `support` returns FMSP v1.",
+            "in": "query",
+            "name": "part",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {}
+            },
+            "description": "Revision-pinned saved FEM topology (FMMT v2) or active-node support (FMSP v1)"
+          },
+          "400": {
+            "description": "Invalid item id or geometry part"
+          },
+          "404": {
+            "description": "The item or geometry file is missing"
+          },
+          "409": {
+            "description": "The supplied playback revision is stale or the source changed during the read"
+          },
+          "422": {
+            "description": "The result has no FEM geometry or its metadata is invalid"
           }
         },
         "tags": [

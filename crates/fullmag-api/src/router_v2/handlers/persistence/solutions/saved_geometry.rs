@@ -546,7 +546,7 @@ fn parse_response_budget(value: &str) -> Result<usize, ApiError> {
     usize::try_from(parsed).map_err(|_| ApiError::bad_request("max_response_bytes is too large"))
 }
 
-fn fem_mesh_payload(
+pub(crate) fn fem_mesh_payload(
     geometry: SavedFemP1FieldGeometry,
     topology_fingerprint: String,
 ) -> Result<fullmag_runner::FemMeshPayload, ApiError> {
@@ -596,7 +596,7 @@ fn fem_mesh_payload_borrowed(
     }
 }
 
-fn topology_binary_identity(
+pub(crate) fn topology_binary_identity(
     geometry: &SavedFemP1FieldGeometry,
 ) -> Result<Option<(usize, String)>, ApiError> {
     let topology_fingerprint = geometry.mesh.topology_fingerprint_v6();
@@ -703,7 +703,7 @@ fn support_body_len(node_count: usize) -> Result<usize, ApiError> {
     })
 }
 
-fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
     if mask.is_empty() {
         return Err(ApiError::unprocessable(
             "SAVED_GEOMETRY_SUPPORT_INVALID: active-node support is empty",
@@ -737,7 +737,7 @@ fn encode_saved_support(mask: &[bool]) -> Result<Vec<u8>, ApiError> {
     Ok(body)
 }
 
-fn support_binary_identity(mask: &[bool]) -> Result<(Vec<u8>, String), ApiError> {
+pub(crate) fn support_binary_identity(mask: &[bool]) -> Result<(Vec<u8>, String), ApiError> {
     let body = encode_saved_support(mask)?;
     let hash = sha256_hex(&body);
     Ok((body, hash))
