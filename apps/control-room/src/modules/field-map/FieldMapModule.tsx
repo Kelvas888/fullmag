@@ -320,9 +320,15 @@ function useFieldMapModuleController() {
   }, [interactionPublisher]);
   const onPlanarPatch = useCallback((patch: PlanarPatch) => {
     visualizationSync.queuePatch({ planar: patch });
+    // Quantity, component and section are sample identity: send them now
+    // instead of after the debounce window (D2D-12).
+    if (patch.quantity_id !== undefined || patch.component !== undefined || patch.default_slice !== undefined) {
+      void visualizationSync.flushNow?.();
+    }
   }, [visualizationSync]);
   const onSectionChange = useCallback((defaultSlice: SectionDefaultSlice) => {
     visualizationSync.queuePatch({ planar: { default_slice: defaultSlice } });
+    void visualizationSync.flushNow?.();
   }, [visualizationSync]);
   const sectionDefaultSlice =
     canonicalPlanar?.source.kind === "default"
