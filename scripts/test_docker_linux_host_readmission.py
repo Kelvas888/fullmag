@@ -260,6 +260,23 @@ def _tracking_lock(flags, name):
 
 
 class DockerLinuxHostReadmissionTests(unittest.TestCase):
+    def test_snapshot_pins_allow_stable_device_without_granting_readmission(self):
+        stable={**REQUEST,'schema_version':readmission.SNAPSHOT_OPERATOR_SCHEMA,
+                'new_host_device':REQUEST['old_host_device']}
+        self.assertEqual(readmission.parse_snapshot_operator_bytes(_raw(stable)),stable)
+        with self.assertRaises(ValueError):
+            readmission.parse_operator_bytes(_raw(stable))
+        with self.assertRaises(ValueError):
+            readmission.parse_operator_bytes(_raw({**REQUEST,'new_host_device':REQUEST['old_host_device']}))
+
+    def test_snapshot_pins_keep_strict_scalar_and_field_validation(self):
+        stable={**REQUEST,'schema_version':readmission.SNAPSHOT_OPERATOR_SCHEMA,
+                'new_host_device':REQUEST['old_host_device']}
+        for changed in ({'expected_inode':True},{'old_host_device':False},
+                        {'unexpected':'field'},{'runtime_config_sha256':'invalid'}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                readmission.parse_snapshot_operator_bytes(_raw({**stable,**changed}))
+
     def test_operator_schema_is_exact_and_strict_integer_rejects_boolean(self):
         parsed = readmission.parse_operator_bytes(_raw(REQUEST))
         self.assertEqual(parsed, REQUEST)

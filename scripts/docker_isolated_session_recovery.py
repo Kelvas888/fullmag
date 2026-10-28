@@ -47,6 +47,34 @@ def _once(control, relative, raw):
         raise BuildControlError('Isolated snapshot evidence readback differs: '+relative)
 
 
+def _successor_admission_pins(control, pins, terminal_raw):
+    """Require a completed prior admission; preserve its immutable authority."""
+    from docker_control_namespace import assert_namespace_activation
+    native_path='isolated-snapshot/native-validation.json'
+    native_raw=control.read_bytes(native_path)
+    assert_namespace_activation(control)
+    if control.read_bytes(native_path)!=native_raw:
+        raise BuildControlError('Successor snapshot native admission changed during validation')
+    terminal=json.loads(terminal_raw)
+    expected={'schema':'fullmag.docker-build-operation.v1','phase':'development',
+              'state':'succeeded','attempt':pins['development_attempt'],
+              'config_sha256':pins['compose_config_sha256'],
+              'backend_container':pins['backend_container_id'],
+              'frontend_container':pins['frontend_container_id'],
+              'control_namespace':control.namespace,
+              'namespace_registry_sha256':control.namespace_registry_sha256}
+    if any(terminal.get(key)!=value for key,value in expected.items()):
+        raise BuildControlError('Successor snapshot requires the exact admitted predecessor')
+    result={}
+    for path in ('development/current.json','development/verified.json'):
+        raw=control.read_bytes(path)
+        if raw!=terminal_raw:
+            raise BuildControlError('Successor snapshot predecessor pointer differs: '+path)
+        result[control.namespace+'/'+path]=raw
+    result[control.namespace+'/'+native_path]=native_raw
+    return result
+
+
 def _stopped_pair(context, pins, compose):
     control=context['control']; ids=[pins[k+'_container_id'] for k in ('backend','frontend')]
     rows=json.loads(docker_capture('inspect',*ids,timeout=60).stdout)
@@ -157,28 +185,38 @@ def _remove_stopped(record):
 def recover(args):
     if not re.fullmatch('[0-9a-f]{32}',args.recovery_id):
         raise BuildControlError('Recovery requires an explicit 32-hex identity')
-    pins,pin_raw,pin_path=retained._read_operator_file(args.operator_pins)
+    parser=(retained.parse_snapshot_operator_bytes if getattr(args,'successor_snapshot',False)
+            else retained.parse_operator_bytes)
+    pins,pin_raw,pin_path=retained._read_operator_file(args.operator_pins,parser=parser)
     context=retained._request_context(args,pins); control=context['control']; raw_control=_root_control(control)
     if control.project!='fullmag-master':
         raise BuildControlError('Initial isolated retained-snapshot route is qualified only for master')
     prior=(control.namespace_registry or {}).get('retirement',{})
+    successor=False
     if prior.get('schema')==SNAPSHOT_SCHEMA:
-        if prior['recovery_id']!=args.recovery_id:
-            raise BuildControlError('A different isolated snapshot is already selected')
-        if control.read('isolated-snapshot/start.json')['restore_run_id'] != args.restore_run_id:
-            raise BuildControlError('Snapshot selected model differs from this recovery')
-        if args.apply: _remove_stopped(prior)
-        return {'state':'snapshot-awaiting-gated-start','namespace':control.namespace,'original_preserved':True}
+        if prior['recovery_id']==args.recovery_id:
+            if control.read('isolated-snapshot/start.json')['restore_run_id'] != args.restore_run_id:
+                raise BuildControlError('Snapshot selected model differs from this recovery')
+            if args.apply: _remove_stopped(prior)
+            return {'state':'snapshot-awaiting-gated-start','namespace':control.namespace,'original_preserved':True}
+        if not getattr(args,'successor_snapshot',False):
+            raise BuildControlError('A different isolated snapshot is already selected; explicit successor required')
+        successor=True
+    elif getattr(args,'successor_snapshot',False):
+        raise BuildControlError('Successor snapshot requires a selected isolated predecessor')
     token=args.recovery_id; root='namespace-recovery/'+token; namespace='namespaces/'+token
     terminal_rel,compose_rel=retained._terminal_paths(pins['development_attempt'])
     terminal_raw=retained._read_control(control,terminal_rel); compose_raw=retained._read_control(control,compose_rel)
     terminal,compose,state=retained._validate_terminal_and_compose(control,pins,context['identity'],terminal_raw,compose_raw,context['layout'])
+    admission_pins=_successor_admission_pins(control,pins,terminal_raw) if successor else {}
     runtime=retained._read_runtime_records(control,pins)
     if digest(host.read_owned_regular(state/host.CERTIFICATE_NAME))!=pins['expected_certificate_sha256'] or digest(host.read_owned_regular(state/host.OWNER_NAME))!=pins['expected_owner_sha256']:
         raise BuildControlError('Original host admission bytes changed')
     certificate=json.loads(host.read_owned_regular(state/host.CERTIFICATE_NAME))
     if (state.stat().st_ino!=pins['expected_inode']
             or certificate.get('host_inode')!=pins['expected_inode']
+            or certificate.get('host_device')!=pins['old_host_device']
+            or state.stat().st_dev!=pins['new_host_device']
             or certificate.get('engine_id')!=retained._engine_id()
             or retained._filesystem_uuid(state)!=pins['filesystem_uuid']):
         raise BuildControlError('Source state inode, engine or current filesystem identity differs')
@@ -197,6 +235,7 @@ def recover(args):
     destination_user=Path(context['layout']['storage_root'])/'user-data'/(control.project+'-isolated-'+token)
     prefix=(control.namespace+'/') if control.namespace else ''
     paths={prefix+terminal_rel:terminal_raw,prefix+compose_rel:compose_raw}
+    paths.update(admission_pins)
     for name,relative in retained._RUNTIME_RECORDS.items(): paths[prefix+relative]=runtime[name]
     previous_registry_path=root+'/previous-registry.json'; paths[previous_registry_path]=old_registry
     record={
@@ -339,6 +378,8 @@ def main(argv=None):
     p.add_argument('--operator-pins',type=Path,required=True);p.add_argument('--recovery-id',required=True)
     p.add_argument('--retained-terminal-runs',type=Path,required=True);p.add_argument('--retained-held-manual-runs',type=Path,required=True)
     p.add_argument('--restore-run-id',required=True,help='Explicit held-manual model to restore without script replay')
+    p.add_argument('--successor-snapshot',action='store_true',
+                   help='Copy a stopped, previously admitted snapshot into a new pinned namespace')
     p.add_argument('--apply',action='store_true')
     args=p.parse_args(argv)
     try: print(json.dumps(recover(args),indent=2,ensure_ascii=False))

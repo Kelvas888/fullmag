@@ -3,10 +3,91 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import docker_isolated_session_recovery as recovery
 from docker_build_control import BuildControlError, canonical
+
+
+class SuccessorAdmissionTests(unittest.TestCase):
+    def fixture(self):
+        control=mock.Mock(namespace='namespaces/'+'a'*32,
+                          namespace_registry_sha256='b'*64)
+        pins={'development_attempt':'c'*32,'compose_config_sha256':'d'*64,
+              'backend_container_id':'e'*64,'frontend_container_id':'f'*64}
+        terminal=canonical({'schema':'fullmag.docker-build-operation.v1',
+            'phase':'development','state':'succeeded','attempt':pins['development_attempt'],
+            'config_sha256':pins['compose_config_sha256'],
+            'backend_container':pins['backend_container_id'],
+            'frontend_container':pins['frontend_container_id'],
+            'control_namespace':control.namespace,
+            'namespace_registry_sha256':control.namespace_registry_sha256})
+        documents={'development/current.json':terminal,'development/verified.json':terminal,
+                   'isolated-snapshot/native-validation.json':b'validated-native-proof'}
+        control.read_bytes.side_effect=lambda path: documents[path]
+        return control,pins,terminal,documents
+
+    def test_admitted_predecessor_pins_all_admission_evidence(self):
+        control,pins,terminal,documents=self.fixture()
+        with mock.patch('docker_control_namespace.assert_namespace_activation') as validate:
+            result=recovery._successor_admission_pins(control,pins,terminal)
+        validate.assert_called_once_with(control)
+        self.assertEqual(result,{control.namespace+'/'+path:raw for path,raw in documents.items()})
+
+    def test_unadmitted_or_changed_current_receipt_is_refused(self):
+        for path in ('development/current.json','development/verified.json'):
+            with self.subTest(path=path):
+                control,pins,terminal,documents=self.fixture()
+                documents[path]=canonical({'state':'starting'})
+                with mock.patch('docker_control_namespace.assert_namespace_activation'):
+                    with self.assertRaises(BuildControlError):
+                        recovery._successor_admission_pins(control,pins,terminal)
+        control,pins,terminal,_=self.fixture()
+        with mock.patch('docker_control_namespace.assert_namespace_activation',
+                        side_effect=BuildControlError('native admission absent')):
+            with self.assertRaises(BuildControlError):
+                recovery._successor_admission_pins(control,pins,terminal)
+
+    def test_wrong_attempt_config_containers_or_namespace_are_refused(self):
+        for key in ('attempt','config_sha256','backend_container','frontend_container',
+                    'control_namespace','namespace_registry_sha256','state','phase'):
+            with self.subTest(key=key):
+                control,pins,terminal,documents=self.fixture()
+                value=json.loads(terminal);value[key]='wrong'
+                terminal=canonical(value)
+                documents['development/current.json']=documents['development/verified.json']=terminal
+                with mock.patch('docker_control_namespace.assert_namespace_activation'):
+                    with self.assertRaises(BuildControlError):
+                        recovery._successor_admission_pins(control,pins,terminal)
+
+    def test_native_receipt_cannot_change_during_validation(self):
+        control,pins,terminal,documents=self.fixture()
+        def changed(_control):
+            documents['isolated-snapshot/native-validation.json']=b'changed'
+        with mock.patch('docker_control_namespace.assert_namespace_activation',side_effect=changed):
+            with self.assertRaises(BuildControlError):
+                recovery._successor_admission_pins(control,pins,terminal)
+
+    def test_successor_is_explicit_and_existing_retry_keeps_original_start(self):
+        control=mock.Mock(project='fullmag-master',namespace='namespaces/'+'a'*32,
+            namespace_registry={'retirement':{'schema':recovery.SNAPSHOT_SCHEMA,'recovery_id':'a'*32}})
+        original_start={'restore_run_id':'original-held-run'}
+        control.read.return_value=original_start.copy()
+        args=SimpleNamespace(recovery_id='b'*32,successor_snapshot=False,apply=False,
+            operator_pins=Path('pins.json'),restore_run_id='new-held-run')
+        with mock.patch.object(recovery.retained,'_read_operator_file',return_value=({},b'{}',Path('pins.json'))), \
+             mock.patch.object(recovery.retained,'_request_context',return_value={'control':control}):
+            with self.assertRaises(BuildControlError):
+                recovery.recover(args)
+            args.recovery_id='a'*32;args.restore_run_id='original-held-run'
+            self.assertEqual(recovery.recover(args)['state'],'snapshot-awaiting-gated-start')
+            args.restore_run_id='new-held-run'
+            with self.assertRaises(BuildControlError):
+                recovery.recover(args)
+        self.assertEqual(control.read.return_value,original_start)
+        control.write.assert_not_called()
+        control.write_bytes.assert_not_called()
 
 
 class IsolatedCommitTests(unittest.TestCase):

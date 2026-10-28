@@ -27,10 +27,31 @@
 
 ## Kroki
 
-- [ ] Zapis źródłowego authored SceneDocument zamiast effective clone w nowo materializowanym projekcie.
-- [ ] Wspólny helper recovery: najpierw dokładna walidacja, potem jedyna dopuszczona rekonstrukcja historyczna z pełnym porównaniem digestu. Wywołanie przy odczycie niezmiennej definicji przed publikacją API.
-- [ ] Regression cases: nowa scena, profil migrowany, profil jawny/custom, zmiana fizyki, malformed pin, legacy revision; odzyskany input przechodzi istniejący terminalny Stop projector i journal completion.
+- [x] Zapis źródłowego authored SceneDocument zamiast effective clone w nowo materializowanym projekcie.
+- [x] Wspólny helper recovery: najpierw dokładna walidacja, potem jedyna dopuszczona rekonstrukcja historyczna z pełnym porównaniem digestu. Wywołanie przy odczycie niezmiennej definicji przed publikacją API.
+- [x] Regression cases: nowa scena, profil migrowany, profil jawny/custom, zmiana fizyki, malformed pin, legacy revision; odzyskany input przechodzi istniejący terminalny Stop projector i journal completion.
 - [ ] Review diffu, adekwatna weryfikacja źródłowa i CI, commit → PR → wymagane kontrole → merge → FF master.
 - [ ] Bezpieczne wdrożenie zarządzaną ścieżką z zachowaniem istniejącej sesji i wyników; weryfikacja Stop w izolowanej kopii/teście bez mutacji naukowych mastera.
 - [ ] Niezależna kontrola FDM H_demag w powietrzu: najpierw istniejące dane i Ms=0/full-domain, potem screenshot/WebGL; żadnego obliczania bez potrzeby.
 - [ ] Receipty, raport i kwalifikowany cleanup własnych zasobów. Jeżeli app blokuje archiwizację aktywnego primary worktree, zachować go i opisać konkretny powód.
+
+## Checkpoint po przerwaniu Docker Desktop
+
+- Pierwszy commit implementacji: `0dfbb69bfafb2cf3a718eb44fc4b7260e5806f17`;
+  synchronizacja mastera i poprawka kompilacji testu: `493604b6390e2bb7db03dd7cc9591ff313c13e19`.
+- W CI regression `recovered_legacy_profile_completes_stop_in_snapshot_and_durable_journal`
+  przeszedł. Uruchomienie pełnego filtra ujawniło nieaktualne oczekiwanie tekstu błędu
+  w istniejącym teście failed-run; dopasowano je do obecnego szczegółowego komunikatu.
+- Obie usługi mastera zakończyły się kodem 255 podczas przerwy Desktop/Engine.
+  Bieżąca sesja zawiera dwie sfery, 18 runów i run oczekujący bez Solve. Kontrola
+  46 pinów po przerwie nie wykazała zmian.
+- Dawny isolated snapshot przy zwykłym wznowieniu wskazywałby poprzedni model.
+  Dodano jawny successor verified-copy po potwierdzonym admission poprzednika;
+  nowe piny obejmują natywne admission oraz current/verified/terminal poprzednika.
+  Kontrole źródłowe i niezależny review przeszły. Podgląd runtime potwierdził
+  16 runów terminalnych, 2 held-manual i 1272 pliki; nie wykonał kopii ani startu.
+- Własna grupa testowa zbudowała pakiet, lecz nie ukończyła hostowego Linux admission.
+  Pozostał lease po zniknięciu launchera. Odrębna, ścisła ścieżka fail-only reconciliation
+  ma zachować certyfikat, owner, pakiet i wszystkie dane; dopiero potem wolno wznowić build.
+- Integracja, native admission, Stop w przeglądarce i widoczny H_demag w pustych
+  komórkach aktualnego renderera nadal wymagają dowodów runtime.

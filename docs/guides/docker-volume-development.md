@@ -744,3 +744,21 @@ This keeps terminal cancellation visible to the accepted projector: a completed
 Stop must publish its terminal command resource and durable journal ACK instead
 of leaving the UI at accepted/stopping. It does not replay Solve, release a held
 run, or authorize editing historical journals.
+
+## Kolejne recovery po zatrzymaniu odtworzonej grupy
+
+Po potwierdzonym uruchomieniu isolated snapshot użytkownik może utworzyć nową
+sesję. Kolejne recovery musi jawnie wskazać jej aktualny held-manual run;
+ponowne użycie pierwotnego `start.json` przywróciłoby wcześniejszy model.
+`docker-dev-recover-isolated` przyjmuje ostatni argument `successor_snapshot=true`
+(CLI: `--successor-snapshot`). Domyślnie nadal odmawia wyboru innego recovery ID.
+
+Ścieżka successor wymaga natywnego admission poprzednika oraz identycznych
+`development/current.json`, `verified.json` i przypiętego terminalnego receiptu
+udanego startu. Sprawdza namespace, registry, attempt, konfigurację i dokładne
+kontenery, po czym wykonuje dotychczasowe kontrole wszystkich runów, ledgeru,
+blokad OWNER/WRITER i spójności SQLite. Kopiuje bieżące dane do nowej namespace;
+oryginały, poprzedni registry i `start.json` pozostają zachowane. Piny admission
+są ponownie sprawdzane przy publikacji. Podgląd niczego nie uruchamia, a apply
+nie odtwarza Solve ani nie kończy runów. Nowy start nadal przechodzi osobną
+natywną bramkę. Operacja dotyczy wyłącznie przypiętej, zatrzymanej grupy mastera.
