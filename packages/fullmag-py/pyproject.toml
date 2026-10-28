@@ -10,6 +10,8 @@ name = "fullmag"
 dynamic = ["version"]
 description = "Python DSL and API client for the Fullmag FDM/FEM micromagnetics platform."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Mateusz Zelent" }]
 keywords = ["micromagnetics", "magnonics", "spintronics", "finite-element", "finite-difference", "LLG"]
