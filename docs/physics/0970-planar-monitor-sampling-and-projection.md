@@ -910,6 +910,29 @@ cells is applied. Points outside the frame are `outside`, points outside the
 sampled target are `empty`, and neither carries a value. A profile is a derived
 resource of one sample (`sample_token`); it never resamples the raster.
 
+### Spatial index for point location
+
+Point evaluations of a FEM sample ({ref}`planar-monitor-probe-evaluation`,
+{eq}`eq-planar-line-profile`) locate the element that contains a world point.
+For a batch of points (a line profile, from 32 points on) the locator first
+builds a bounding-volume hierarchy over the axis-aligned boxes of the selected
+elements (median split on the longest centroid axis, leaves of at most 8
+elements) and tests only the elements whose box, padded by $10^{-9}$ of the
+mesh diagonal to cover the $10^{-11}$ weight tolerance of the containment
+test, contains the point. Candidates are tested in ascending element index,
+the order of the direct scan (gate PM-N28), so a point on a shared face resolves to the same
+element and the value, entity id and occupancy are identical to the direct
+traversal; the index changes cost, never results. For point batches it is built per request and discarded with it; a single
+probe keeps the direct scan, which is cheaper than building the index. The
+plane operator (gate PM-N17) uses the same hierarchy, cached by the carrier's
+topology fingerprint (nodes, connectivity, markers; four most recent
+carriers), and rasterizes only the elements whose box meets the plane, in
+ascending element order: the box test is conservative because an element's
+nodes lie in its box, and the exact node-distance test that follows is the
+direct traversal's, so pixel claims, weights and cut extents are unchanged.
+Gathering the cached operator on the device for the FEM GPU lane is not
+implemented.
+
 ### In-plane streamlines (presentation)
 
 Streamlines are a presentation of the in-plane projection of one vector
@@ -1056,6 +1079,7 @@ silent clamp. New HTTP and OpenAPI payloads expose only `range` and
 | PM-N23 | continuous FEM section through a graded Tet4 film (fine film, coarse air) | published $h_\perp$ equals {eq}`eq-planar-navigation-step` over the cut elements and changes with the plane; raster bitwise unchanged by the step |
 | PM-N24 | FDM stack of two objects, object-layer slab on an even cell count; region scope on one object with two regions of opposite $\mathbf m$ | slab centre equals the object centre (no half-cell shift); the two region maps differ and each is empty outside its region |
 | PM-N25 | line profile through an affine FEM field across several elements, and through an FDM field | FEM values equal the affine field at uniform and face-crossing points within $10^{-12}$ relative; every in-plane element-face crossing is present; FDM values equal the containing cell values; outside/empty points carry no value |
+| PM-N28 | batched point location through the element AABB hierarchy (structured Tet4 with unselected elements; interior, face, edge and outside points; runtime profile on a mixed FEM carrier) | located element, value and occupancy identical to the direct scan for every point; candidate count bounded by the elements around a node |
 | PM-N26 | in-plane streamlines on a uniform field, a vortex raster and a masked raster | uniform field gives straight parallel lines along $\mathbf w$ within $10^{-9}$ of the pixel pitch; vortex lines close or stay within the disk; no point lies in a non-renderable cell; repeated runs are identical; budget overflow is reported as truncated |
 | PM-N27 | multislice of an FDM stack at $\phi\in\{0.25,0.5,0.75\}$ and of an FEM film | each panel equals the single default section at the same $\phi$ (same resolved coordinate and bitwise-equal raster); the panels' sample tokens differ; the auto range is the union of the panels' renderable extrema; a monitor source with `position_fraction` is rejected |
 | PM-D01 | default source identity | `Default` resolves from session state and domain metadata without creating a monitor, changing `ProblemIR`, or changing canonical Python |

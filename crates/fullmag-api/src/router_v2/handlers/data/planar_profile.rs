@@ -152,6 +152,8 @@ pub(super) async fn planar_profile_response(
     });
 
     let mut points = Vec::with_capacity(parameters.len());
+    // One element index for the whole profile instead of a scan per point.
+    let mut locator = built.target.point_locator(parameters.len());
     for (t, kind) in parameters {
         let u_m = profile.u0_m + t * du;
         let v_m = profile.v0_m + t * dv;
@@ -163,7 +165,7 @@ pub(super) async fn planar_profile_response(
         let inside_frame =
             u_m >= bounds[0] && u_m <= bounds[1] && v_m >= bounds[2] && v_m <= bounds[3];
         let point = if inside_frame {
-            built.target.evaluate_point(world_m)
+            locator.evaluate(world_m)
         } else {
             None
         };

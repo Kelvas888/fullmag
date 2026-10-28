@@ -46,6 +46,8 @@ Status: **zrobione** (2026-10-28). Nota 0970 § In-plane streamlines (presentati
 
 ## B4. Nawigator czasu i etapu
 
+Status: **zaimplementowane, runtime zablokowany** (2026-10-28). Nawigator nad mapą 2D dla migawek `m` etapu histerezy (‹ ›, odtwarzanie klatka po klatce, „Live”), przez to samo zaznaczenie co wykres histerezy. Odstępstwa: tylko `m` (zgodnie z ograniczeniem `snapshot_quantity_unsupported`; rozszerzenie runtime na inne wielkości — osobne zadanie); brak prefetchu N klatek (odtwarzanie czeka na narysowanie bieżącej); wejście w tryb migawek przez wybór punktu histerezy. Runtime: master odrzuca aktywację etapu histerezy (`study pipeline primitive stage 'hysteresis' is not yet executable by the runtime`), dowody w `docs/diagnostics/viewport-2d-level-b-b4-b6-2026-10-28/`.
+
 | Aspekt | Projekt |
 |---|---|
 | UI | pasek pod mapą: etap, migawka, czas symulacji; strzałki ‹ › między migawkami; tryb „na żywo” |
@@ -55,6 +57,8 @@ Status: **zrobione** (2026-10-28). Nota 0970 § In-plane streamlines (presentati
 
 ## B5. Gizmo płaszczyzny w 3D
 
+Status: **zrobione** (2026-10-28). Uchwyt przesunięcia wzdłuż normalnej, dwa pierścienie obrotu (wokół u i v; Shift przyciąga do 5°), `Shift+[`/`Shift+]` (obrót wokół u o 5°) i pick-from-face („Pick face in 3D” w Inspectorze: normalna ściany przez punkt trafienia). Inspector rejestruje się jako właściciel szkicu, a gizmo proponuje zmiany ramki tą samą ścieżką aktualizacji szkicu; `Esc` przywraca ramkę; ramki reortonormalizowane (v = n × u). Dowody przeglądarkowe dla wszystkich czterech interakcji w `docs/diagnostics/viewport-2d-level-b-b4-b6-2026-10-28/`.
+
 | Aspekt | Projekt |
 |---|---|
 | Interakcja | uchwyt przesunięcia wzdłuż normalnej i dwa pierścienie obrotu w widoku 3D; pick-from-face ustawia płaszczyznę na ścianie obiektu |
@@ -63,6 +67,8 @@ Status: **zrobione** (2026-10-28). Nota 0970 § In-plane streamlines (presentati
 | Dowód | smoke przeglądarkowy z kontekstem WebGL i porównaniem ramki z meta próbki |
 
 ## B6. Indeks przestrzenny i gather na GPU
+
+Status: **zrobione częściowo** (2026-10-28). BVH po AABB wybranych elementów dla wsadowej lokalizacji punktów (profil liniowy od 32 punktów), kandydaci w rosnącej kolejności elementów, więc wynik równy skanowi bezpośredniemu (nota 0970 § Spatial index for point location; nowa bramka PM-N28 spełniona w runtime: 61 punktów profilu bitowo równych sondzie; operator płaszczyzny rasteryzuje tylko elementy, których pudełko przecina płaszczyznę, z BVH cache'owanego po fingerprincie topologii — PM-N17: test pokrycia na 10k Tet4, A/B runtime 12/12 przekrojów bitowo identycznych, na 164k Tet4 168/168 pikseli równych sondzie i 0 zgubionych elementów; przyspieszenie end-to-end przy 164k niewykazane (380 vs 419 ms), 2M nieuruchomione). Gather na GPU **BLOCKED** (tor FEM GPU zablokowany).
 
 - BVH po AABB elementów (budowane raz na `topology_fingerprint`) dla płaszczyzn skośnych, sondy i profili; obecnie płaszczyzna rasteryzuje element po elemencie, a sonda skanuje elementy liniowo.
 - Gather operatora (rzadkie mnożenie) na urządzeniu dla FEM GPU, aby nie kopiować całego pola przy każdym kroku; wymaga noty i kwalifikacji parytetu z CPU.
