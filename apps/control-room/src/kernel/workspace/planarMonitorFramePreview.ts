@@ -88,8 +88,18 @@ export function planarMonitorFramePreviewFromDraft(
 
 type Listener = () => void;
 
+/**
+ * The Inspector panel that owns a monitor draft. 3D handles propose frame
+ * changes through it, so the draft keeps a single owner and one apply path.
+ */
+export interface PlanarMonitorDraftEditor {
+  monitorId: string;
+  proposeOrigin: (originM: readonly [number, number, number]) => void;
+}
+
 let preview: PlanarMonitorFramePreview | null = null;
 let draftPreview: PlanarMonitorDraft | null = null;
+let draftEditor: PlanarMonitorDraftEditor | null = null;
 const listeners = new Set<Listener>();
 
 export const planarMonitorFramePreviewStore = {
@@ -127,7 +137,34 @@ export const planarMonitorFramePreviewStore = {
     listeners.add(listener);
     return () => listeners.delete(listener);
   },
+  getDraftEditorMonitorId() {
+    return draftEditor?.monitorId ?? null;
+  },
+  /** Registers the draft owner; returns the matching unregister. */
+  registerDraftEditor(editor: PlanarMonitorDraftEditor) {
+    draftEditor = editor;
+    emit();
+    return () => {
+      if (draftEditor !== editor) return;
+      draftEditor = null;
+      emit();
+    };
+  },
+  /** Proposes a new frame origin to the owning editor; false when none owns `monitorId`. */
+  proposeDraftOrigin(monitorId: string, originM: readonly [number, number, number]) {
+    if (draftEditor?.monitorId !== monitorId) return false;
+    draftEditor.proposeOrigin(originM);
+    return true;
+  },
 };
+
+export function usePlanarMonitorDraftEditorId(): string | null {
+  return useSyncExternalStore(
+    planarMonitorFramePreviewStore.subscribe,
+    planarMonitorFramePreviewStore.getDraftEditorMonitorId,
+    planarMonitorFramePreviewStore.getDraftEditorMonitorId,
+  );
+}
 
 export function usePlanarMonitorFramePreview(): PlanarMonitorFramePreview | null {
   return useSyncExternalStore(

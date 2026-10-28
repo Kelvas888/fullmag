@@ -162,6 +162,19 @@ function CommittedPlanarMonitorEditor({
     planarMonitorFramePreviewStore.setDraft(dirty ? draft : null);
     return () => planarMonitorFramePreviewStore.clearDraft();
   }, [dirty, draft]);
+  // The 3D normal handle edits this draft through the same update as the fields.
+  useEffect(() => planarMonitorFramePreviewStore.registerDraftEditor({
+    monitorId: monitor.id,
+    proposeOrigin: (originM) => {
+      const current = draftRef.current;
+      const next = {
+        ...current,
+        monitor: { ...current.monitor, frame: { ...current.monitor.frame, origin_m: [...originM] } },
+      };
+      draftRef.current = next;
+      setDraft(next);
+    },
+  }), [monitor.id]);
   const run = (commandId: string, input?: Record<string, unknown>) =>
     kernel.commands.execute(
       commandId,
