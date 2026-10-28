@@ -170,7 +170,7 @@ export function FieldMapToolbar({
         >
           Mesh
         </Button>
-        {planar.source.kind === "default" ? (
+        {planar.source?.kind === "default" ? (
           <Button
             aria-pressed={planar.multislice?.enabled ?? false}
             size="sm"
@@ -187,7 +187,7 @@ export function FieldMapToolbar({
             Slices
           </Button>
         ) : null}
-        {planar.source.kind === "default" && planar.multislice?.enabled ? (
+        {planar.source?.kind === "default" && planar.multislice?.enabled ? (
           <SegmentedControl
             aria-label="Slice panels"
             options={["2", "3", "4"].map((value) => ({ label: value, value }))}
