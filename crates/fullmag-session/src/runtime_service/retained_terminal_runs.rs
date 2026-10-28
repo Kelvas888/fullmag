@@ -2526,6 +2526,10 @@ mod tests {
 
     fn validate_history(fixture: &Fixture, pin: &super::super::retained_attempt_histories::RetainedAttemptHistoryPin) -> Result<()> {
         let _writer = fixture.store.write_transaction()?;
+        validate_history_locked(fixture, pin)
+    }
+
+    fn validate_history_locked(fixture: &Fixture, pin: &super::super::retained_attempt_histories::RetainedAttemptHistoryPin) -> Result<()> {
         let mut budget = ReadBudget::for_attempt_history_v5();
         let mut refs = BTreeSet::new();
         super::super::retained_attempt_histories::validate_pins(std::slice::from_ref(pin), std::slice::from_ref(&fixture.pin))?;
@@ -2540,9 +2544,14 @@ mod tests {
         for heartbeats in [0, 168] {
             let fixture = historical_retry_fixture(heartbeats);
             let pin = history_pin(&fixture);
-            let before = tree_snapshot(fixture.store.root());
-            validate_history(&fixture, &pin).unwrap();
-            assert_eq!(before, tree_snapshot(fixture.store.root()));
+            {
+                // Lock acquisition/release writes ownership metadata. Compare
+                // every byte while holding the same lock as production.
+                let _writer = fixture.store.write_transaction().unwrap();
+                let before = tree_snapshot(fixture.store.root());
+                validate_history_locked(&fixture, &pin).unwrap();
+                assert_eq!(before, tree_snapshot(fixture.store.root()));
+            }
             assert!(validate(&fixture).is_err(), "v3 must continue refusing historical attempts");
         }
     }
@@ -2571,7 +2580,13 @@ mod tests {
                     else { lease.lease_token = "foreign-token".into(); }
                     write_json(&path, &lease);
                 }
-                "pending" => write_inbox(&fixture.store, Some(serde_json::json!({"unknown":"command"}))),
+                "pending" => {
+                    let path = run.join("coordinator_journal/command/command-three.json");
+                    let entry: FmsCoordinatorJournalEntry = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                    // A valid pending envelope must reach the recovery gate;
+                    // malformed protocol data would fail in fixture creation.
+                    write_inbox(&fixture.store, Some(entry.payload["message"]["envelope"].clone()));
+                }
                 "heartbeat-gap" => {
                     let path = run.join("coordinator_journal/command/command-three.json");
                     let mut entry: FmsCoordinatorJournalEntry = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

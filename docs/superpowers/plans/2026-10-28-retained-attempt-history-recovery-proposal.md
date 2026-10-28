@@ -170,3 +170,49 @@ Dowód: `verification/recovery-v5-20261028/full-preflight-readonly.json`.
 Jest to niezależna bramka identyfikacji współdzielonego storage; pozytywny
 snapshot historii nie upoważnia do jej pominięcia. Nie wykonano buildu,
 restartu ani recovery. Zmiany v5 pozostają niezakwalifikowane natywnie.
+
+
+## Dalsza diagnostyka aliasów i uruchomione CI
+
+Dla commita `311c597505fc648265414aa7061fc7937aa7ea71` uruchomiono
+[bootstrap / rust](https://github.com/MateuszZelent/fullmag/actions/runs/40653088821).
+Kontrola przeglądarkowa zakończyła się sukcesem; stan Rust należy sprawdzić
+w tym konkretnym runie przed uznaniem kompilacji lub testów za zaliczone.
+
+Diagnostyka tylko do odczytu dwóch mountów wykazała, że
+`/run/desktop/mnt/host/d/git/storage` w obecnym daemonie ma typ `tmpfs`,
+device 111 i inode 861. Niezależny widok `/mnt/d/git/storage` ma typ `9p`,
+device 118 i inode 20547673300136202. Metadane przed i po były zgodne.
+Dowód: `verification/recovery-v5-20261028/desktop-alias-pair-diagnostic-v2.json`.
+Nie jest to dowód tożsamości aliasów ani izolacji i nie wolno na tej podstawie
+przepisać prefiksu i dopuścić restartu.
+
+Rozważone drogi: (1) samo przepisanie prefiksu — odrzucone przez powyższą
+obserwację; (2) dowód tożsamości fizycznej — obecna para go nie spełnia;
+(3) odtworzenie mountów cudzych kontenerów — zmienia cudze środowisko;
+(4) usunięcie dokładnie wskazanych zakończonych kontenerów — wymaga osobnego
+przeglądu warstw i zgody, bez usuwania mountowanych danych ani wolumenów.
+Nie zmieniono żadnej bramki ani kontenera.
+
+Metadane sześciu zakończonych kontenerów zapisano jako
+`stopped-legacy-containers-inspect.json` i `stopped-legacy-containers-review.json`
+w tym samym katalogu kontrolnym. Próba odczytu zmian pierwszej warstwy przez
+`docker diff` przekroczyła limit obserwacji 30 s; nie dowodzi to braku danych.
+Przegląd usunięcia nie jest kompletny i żadnego kontenera nie usunięto.
+
+Źródło kontraktu mountów:
+https://docs.docker.com/engine/storage/bind-mounts/ — źródło jest rozwiązywane
+na hoście demona; Docker Desktop pośredniczy w dostępie do plików Windows.
+
+
+CI 40653088821 skompilowało testy sesji, lecz etap recovery zakończył się
+wynikiem 17 zaliczonych / 2 niezaliczonych. Pełny log zachowano w kontrolnym
+`ci-rust-40653088821.log`. Porównanie snapshotów wykazało zmianę wyłącznie
+`WRITER.owner.json` wskutek nabycia/zwolnienia blokady przez wrapper testu.
+Druga awaria wystąpiła podczas tworzenia fixture: brak schematu protokołu
+komendy, przed wywołaniem walidatora.
+
+Poprawka przenosi porównanie wszystkich bajtów pod jedną utrzymywaną blokadę
+(nie pomija żadnych plików) i używa poprawnej koperty oczekującej komendy
+z fixture dziennika. Kod produkcyjny pozostaje bez zmian. Parser przeszedł;
+wynik ponownego wykonania tych regresji musi pochodzić z kolejnego CI.
