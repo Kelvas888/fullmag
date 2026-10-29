@@ -657,6 +657,7 @@ pub(crate) fn test_app_state() -> Arc<AppState> {
     let (control_events_tx, _rx) = watch::channel(0u64);
 
     Arc::new(AppState {
+        api_started_at: std::time::Instant::now(),
         development_admission: Default::default(),
         development_restored_authoring: Default::default(),
         development_backend: crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig::Disabled,
@@ -780,6 +781,7 @@ pub(crate) async fn test_app_state_with_live_session() -> Arc<AppState> {
         simulation_preparation: None,
         scene_document: None,
         scalar_rows: Vec::new(),
+        latest_scalar_source: None,
         engine_log: Vec::new(),
         solver_profile: crate::schemas::diagnostics::SolverProfileResource::default(),
         quantities: Vec::new(),
@@ -3097,6 +3099,7 @@ async fn test_router_with_session_state_and_artifact_dir() -> (axum::Router, Arc
         simulation_preparation: None,
         scene_document: None,
         scalar_rows: Vec::new(),
+        latest_scalar_source: None,
         engine_log: Vec::new(),
         solver_profile: crate::schemas::diagnostics::SolverProfileResource::default(),
         quantities: Vec::new(),
@@ -3154,6 +3157,7 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
     let (control_events_tx, _rx) = watch::channel(0u64);
 
     let state = Arc::new(AppState {
+        api_started_at: std::time::Instant::now(),
         development_admission: Default::default(),
         development_restored_authoring: Default::default(),
         development_backend: crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig::Disabled,
@@ -3308,6 +3312,7 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
         simulation_preparation: None,
         scene_document: None,
         scalar_rows: Vec::new(),
+        latest_scalar_source: None,
         engine_log: Vec::new(),
         solver_profile: crate::schemas::diagnostics::SolverProfileResource::default(),
         quantities: Vec::new(),
