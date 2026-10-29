@@ -713,6 +713,11 @@ class AirboxOptions:
         boundary_marker: Gmsh physical group tag for the outer boundary Γ_out.
         maximum_element_size: Maximum element size for the airbox mesh (far field).
         minimum_element_size: Minimum element size for the airbox mesh (at interface).
+        curvature_factor: Air target ``c * R`` next to curved magnetic surfaces
+                          (note 0107); requires ``maximum_element_size``.
+        narrow_region_resolution: Element-count control across air gaps
+                                  between walls (note 0107); requires
+                                  ``maximum_element_size``.
     """
 
     padding_factor: float = 3.0
@@ -724,8 +729,30 @@ class AirboxOptions:
     center: tuple[float, float, float] | None = None
     maximum_element_size: float | None = None
     minimum_element_size: float | None = None
+    curvature_factor: float | None = None
+    narrow_region_resolution: float | None = None
+
+    @property
+    def has_feature_refinement(self) -> bool:
+        return self.curvature_factor is not None or self.narrow_region_resolution is not None
 
     def __post_init__(self) -> None:
+        for name in ("curvature_factor", "narrow_region_resolution"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            parsed = parse_finite_float(
+                value,
+                f"/study_universe/airbox_{name}",
+                positive=True,
+                allow_numeric_string=True,
+            )
+            object.__setattr__(self, name, float(parsed))
+        if self.has_feature_refinement and self.maximum_element_size is None:
+            raise ValueError(
+                "study_universe airbox curvature_factor/narrow_region_resolution "
+                "require the airbox maximum_element_size"
+            )
         # ``grading_ratio`` is a multiplicative layer-to-layer growth law for
         # the typed FEM airbox.  Values at or below one used to be accepted and
         # then silently disabled the field in the Gmsh builder, producing a
