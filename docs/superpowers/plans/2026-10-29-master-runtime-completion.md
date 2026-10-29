@@ -250,3 +250,71 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   preflightu, bez autoryzacji, startu lub zatrzymania obcej grupy. AST trzech
   Pythonów i diff-check przechodzą; istniejąca negatywna fixture uwzględnia
   wcześniejsze odrzucenie niepoprawnego snapshotu. Testów nie uruchamiano.
+
+### Checkpoint: działające API i domknięcie kontraktu stopki
+
+- Kanoniczna próba recovery zakończyła się `succeeded`, kod 0: development
+  `62a6ac2bfb2549399ecef3d7c09ef836`, konfiguracja
+  `0ed804fb5b3848cd1f9ecb321a8caa8ae0a9a828945ec5498a4a47608da733f3`.
+  Toolchain/dev/backend image były cache hit. Pełne kontrole obcych bindów
+  przeszły bez zatrzymywania cudzych grup. Długiego czasu tej kontroli
+  kontrolera nie przypisywać materializacji modelu ani solverowi.
+- Nowa para: backend
+  `78c873c76f86b236ee8578bd746cf9c2ce0251f29f13fe1dd4c69cfeb1b5d1b4`,
+  frontend `a90e0914a903` (skrót inspekcji). Oba `healthy`.
+  Inspekcja backendu potwierdziła Memory `137438953472` B i NanoCpus
+  `16000000000`, czyli 128 GiB/16 CPU; kompilator użył `cargo_jobs=16`.
+  Zachowano named volumes i grupowy ledger.
+- Build aplikacji w stałym backendzie: `make` exit0, `352902` ms, pakiet
+  24 plików; gate `linux-native-v1` i `worker-cgroup` zakończone. API i runtime
+  zgłosiły Ready o `2026-10-29T16:24:13Z`. Zbudowany commit:
+  `d4c925b43d160b99a44bea9715bb157d9fe2c7e7`, snapshot
+  `00bdceddb93e8d7432db6945ff7559699ec75e883bc86e37260cbfc24c06d17f`.
+  GET health zwrócił `status=ok`, `active_session=false`. To potwierdza
+  start API; nie jest odbiorem solvera, odtworzenia sesji ani GPU.
+- Kanoniczne `docker-dev-codegen` zakończone `succeeded`; receipt
+  `/opt/fullmag/control/backend/codegen/openapi-v2/f86efabaff68f7f37dd0befa8cc2687c4c858b1d76f8dd84f1edf8b35cfb767f.json`.
+  Zmienione są schema i typy `ScalarObservationSource/current_observation`;
+  wygenerowany klient i ścieżki zachowały identyczne hashe.
+- Dalszy remote obejmował trzy commity do
+  `455b67be7db2ba5569c902eb6e9e00ec8a868994`. Brak przecięć z cudzym WIP
+  i stopką; merge bez konfliktów zapisano jako
+  `01fe2cdf8e785c5c324810ebc643d95499755781`. Te nowsze źródła wymagają
+  przyrostowej przebudowy przed odbiorem docelowego CoFeB.
+- Review stopki wykryło próbkę RT przeżywającą zmianę API scope. Scope jest
+  teraz przekazywany z konkretnej, zaakceptowanej konekcji WebSocket przez
+  bridge do eventu. Czysty resolver odrzuca null/inny scope przed runem,
+  krokiem i arbitrażem rewizji. Nie przypisuje aktualnego scope starej próbce.
+  Ograniczone niezależne re-review: PASS, bez dalszych P1/P2.
+- Typecheck pierwszej próby wykrył brak scope w istniejącej kontrolowanej
+  stronie fixture; uzupełniono jej własną stałą tożsamość. Ponowiony pełny
+  typecheck produkcji oraz focused ESLint produkcji i zmienionych fixtures:
+  exit0, wejścia i tożsamości usług stabilne. Receipt w wolumenie control:
+  `/opt/fullmag/control/backend/source-checks/d7848729f6cd493ba8dca32b4e87b569.json`.
+  Nie uruchamiano testów jednostkowych. Nie zaliczać fixture jako dowodu
+  rzeczywistego renderu, skalara ani obliczeń.
+- Repozytoryjny React Doctor 0.9.12 uruchomiono w stałym frontendzie dla
+  dziewięciu staged plików JS/TS, z rozpoznanym projektem Control Room.
+  Zgłosił siedem ostrzeżeń o eksportach funkcji z pliku komponentu stopki;
+  lista tych eksportów jest identyczna jak w HEAD. Są to istniejące
+  ostrzeżenia, nie nowa regresja ani zielony pełny scan. Konfiguracji reguł
+  i normalnego hooka Git nie zmieniano; bez instalowania `@latest` na hoście.
+- Iteracja `012eb2a58e6143c7b48650a28d93f3b6` zakończona `succeeded`,
+  konfiguracja nadal `0ed804fb5b3848cd1f9ecb321a8caa8ae0a9a828945ec5498a4a47608da733f3`.
+  Te same kontenery osiągnęły ponownie `healthy` i API Ready; `make` exit0
+  w `430960` ms. Zbudowany commit `01fe2cdf8e785c5c324810ebc643d95499755781`,
+  dirty snapshot `600d16846362533087aea670fca0d6e3b08bf20e33ec53b26f30baec1a6025ba`.
+  Nie uruchomiono jeszcze nowej symulacji.
+- Dispatcher `scripts/docker_dev.py` po udanym codegen wywołuje także
+  `generate_python_api_models.write_outputs`. Zmiana
+  `packages/fullmag-py/src/fullmag/client/_generated/models.py` jest zatem
+  wynikiem naszej kanonicznej generacji, nie nieznanym cudzym WIP.
+  Obejmuje ten sam `ScalarObservationSource`; check generatora i AST
+  potwierdzają spójność. Plik należy do tego fragmentu kontraktu.
+- Automatyczny reviewer odrzucił commit z tymczasowym `PATH`, ponieważ zmieniał
+  sposób uruchomienia hooka. Commit nie został wykonany. Użytkownik następnie
+  jawnie dopuścił jednorazowe uruchomienie istniejącego hostowego skanera
+  `pnpm dlx react-doctor@latest`; zwykły commit ma zachować hook i PATH.
+- Odtworzenie po nowym runie, pomiar CoFeB, 10 iteracji FEM, 10 kroków obu
+  wariantów FDM, odbiór przeglądarki i kwalifikowana retencja nadal oczekują
+  na wykonanie. Żaden z tych odbiorów nie wynika z samego builda lub health.
