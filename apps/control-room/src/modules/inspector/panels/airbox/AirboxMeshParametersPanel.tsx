@@ -10,7 +10,10 @@ import { visualizationTargetIdForSceneObject } from "@/kernel/selection/selectio
 import {
   sessionRequestScopeKey,
 } from "@/kernel/resources/sessionResourceIdentity";
-import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import {
+  SESSION_STATUS_RESOURCE_KEY,
+  useSessionResourceIdentity,
+} from "@/kernel/resources/useSessionStatus";
 import { useRuntimeCommandControlResourceData } from "@/kernel/resources/studyRuntimeResources";
 import {
   MESH_BUILD_CURRENT_RESOURCE_KEY,
@@ -410,6 +413,7 @@ export function AirboxMeshParametersPanel({
       identityKey,
       sessionScopeKey: operationSessionScopeKey,
     });
+    const submittedDraft = draft;
     try {
       const submission = await submitAirboxPolicyDraft(
         rebaseAirboxMeshPolicyDraft(draft, policy.data ?? null),
@@ -426,6 +430,21 @@ export function AirboxMeshParametersPanel({
         return true;
       }
       const next = submission.resource;
+      // Adopt the committed policy as the clean draft base. The server
+      // canonicalizes the config (e.g. it marks it authored), so comparing the
+      // submitted draft with the new base would stay dirty forever. Edits made
+      // while the request was in flight are kept.
+      setDraftState((current) =>
+        current.identityKey === identityKey &&
+        current.dirty &&
+        airboxMeshPolicyDraftDirty(current.draft, submittedDraft)
+          ? current
+          : initialInspectorDraftState({
+            baseDraft: draftFromUniverseMeshPolicyResource(next),
+            baseKey: `${operationSessionScopeKey}:${draftKeyForUniverseMeshPolicyResource(next)}`,
+            identityKey,
+          }),
+      );
       publishCommittedMeshPolicyResource?.(
         resources,
         MESH_UNIVERSE_POLICY_RESOURCE_KEY,
@@ -435,6 +454,11 @@ export function AirboxMeshParametersPanel({
       resources.invalidate(MESH_UNIVERSE_POLICY_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_CURRENT_RESOURCE_KEY, next.revision);
       resources.invalidate(MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY, next.revision);
+      // The policy is stored in the scene document and bumps the scene and
+      // mesh revisions without a realtime event. Refetch both, so open object
+      // drafts and the build dialog's mesh_revision precondition stay current.
+      resources.invalidate(SCENE_RESOURCE_KEY, `mesh-policy:universe:${next.revision}`);
+      resources.invalidate(SESSION_STATUS_RESOURCE_KEY, `mesh-policy:universe:${next.revision}`);
       let fdmReplanMessage: Feedback | null = null;
       if (isFdm && runtimeLane === "fdm") {
         try {

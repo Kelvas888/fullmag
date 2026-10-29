@@ -39,16 +39,19 @@ Waga: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza 
 | 11 | W | Readiness po buildzie: „Build a current shared-domain mesh” | Skutek pkt 10 | naprawione, zweryfikowane |
 | 12 | N | Build: „mesh_revision precondition failed: expected 3, got 4” | Status sesji nie odświeżał się po zmianie siatki | naprawione (status przy zdarzeniu Mesh), zweryfikowane |
 | 13 | N | Manifest z `object_id` równym nazwie | Segmenty kluczowane nazwą geometrii | naprawione w ścieżce ADR 0074 (`object_id` z dokumentu sceny) |
-| 14 | N | „Mesh editor capabilities 0/8 – fem is not advertised” | Zasób meshingu nie publikuje capabilities | otwarte |
-| 15 | N | „Configure now” w oknie New simulation nie otwiera Inspektora Universe | Potwierdzone (`aria-checked=true`, a Inspektor pokazuje „Nothing selected”); przyczyna nieustalona | otwarte |
+| 14 | N | „Mesh editor capabilities 0/8 – fem is not advertised” | Żaden producent nie publikował kluczy pasa (`fem`, `cpu`, `double` …) w zasobie capabilities meshingu | naprawione: API publikuje pas sesji (dyskretyzację zawsze, urządzenie i precyzję po rozwiązaniu); inne pasy pozostają informacyjne |
+| 15 | N | „Configure now” w oknie New simulation nie otwiera Inspektora Universe | Powłoka przełącza poddrzewa przy tworzeniu sesji, co przemontowuje dialog i gubi intencję zapisaną w jego stanie | naprawione: intencja zapisana przy ACK poza dialogiem, stosowana w konektorach sesji po potwierdzeniu tożsamości |
 | 16 | N | Readiness uznaje interakcje na podstawie `physics_stack`, a renderer skryptu używa `study.exchange_enabled`/`demag_enabled` | Dwa źródła prawdy | otwarte |
-| 17 | W | „Element growth rate” = 1,3 kończy build błędem `adjacent_size_growth_exceeded` | `_mesh_result_payload` traktuje `growth_rate` jako twardą bramkę po siatkowaniu (tolerancja 0) | otwarte – decyzja: bramka czy wskazówka |
+| 17 | W | „Element growth rate” = 1,3 kończy build błędem `adjacent_size_growth_exceeded` | `growth_rate` to wskazówka Gmsh, a `_mesh_result_payload` traktował ją jako twardą bramkę (tolerancja 0). Pomiar: max ρ ≈ 2,2–2,6 dla g = 1,3, 1,8 i 3,0, więc każda wartość < ~2,6 odrzucała build | naprawione: raport publikowany jako diagnostyka (`enforced: false`); twarda bramka tylko na żądanie kwalifikacji `enforce_growth_gate`; nota 0105 |
 | 18 | B | Build z sekcji Inspektora: „Choose FEM or FDM in Study settings” | Kontekst polecenia w Inspektorze nie miał statusu sesji | naprawione (Shared-Domain i Airbox), zweryfikowane |
 | 19 | N | Dialog buildu: „scene_revision precondition failed: expected 4, got 5” | Zasób sceny w dialogu podawał rewizję z cache | naprawione (nowsza z rewizji: zasób sceny albo status), zweryfikowane |
 | 20 | B | Druga edycja Airbox blokuje Compute: `scene_document_universe_conflict` | Trasa polityki universe aktualizowała `scene.universe` tylko przy pierwszym zapisie | naprawione, zweryfikowane |
 | 21 | B | Compute FEM po buildzie tylko z geometrii: „simulation preparation unavailable” | Frontend wymagał przygotowania, które dawniej powstawało przy buildzie | naprawione: przy braku przygotowania przygotowuje serwer; Compute zakończony |
-| 22 | N | Po udanym Apply Inspektory Universe i geometrii nadal zgłaszają niezapisane zmiany | Draft pozostaje „dirty” względem nowej bazy | otwarte |
-| 23 | N | Polecenie `close` w trybie Docker zostaje w kolejce (`queued`) | Brak konsumenta journala w trybie API-only | otwarte |
+| 22 | N | Po udanym Apply Inspektory Universe i geometrii nadal zgłaszają niezapisane zmiany | Airbox: draft nie był przebazowany na kanoniczną odpowiedź serwera (np. `authoredConfigPresent`). Geometria: publikacja zatwierdzonej sceny bywa pomijana bez odświeżenia zasobu | naprawione: Airbox przyjmuje odpowiedź jako czystą bazę (zachowując edycje w locie); panel obiektu zawsze unieważnia zasób sceny |
+| 23 | N | Polecenie `close` w trybie Docker zostaje w kolejce (`queued`) | Kolejkę opróżnia tylko host CLI, którego tryb API-only nie ma | naprawione: `close` jest jawnie odrzucany (`accepted_control_unsupported`), readiness podaje ten sam powód; UI nie wysyła `close` |
+| 24 | N | Dwie sfery z wstążki dostają tę samą nazwę „New sphere”, a build kończy się błędem „Region name 'New sphere' is used by both …” | Nowe obiekty nie dostają unikalnych nazw, a regiony są kluczowane nazwą | otwarte – obejście: zmiana nazwy w Inspektorze |
+| 25 | B | Po zapisie polityki siatki edycja obiektu kończy się 409 `scene revision mismatch` (aż do Revert), a build błędem `mesh_revision precondition failed` | Zapis polityki podbija rewizje sceny i siatki bez zdarzenia realtime; brudny draft obiektu nigdy nie był przebazowywany | naprawione: po zapisie polityki odświeżane są scena i status sesji; brudny draft przechodzi na nową rewizję, gdy sam obiekt się nie zmienił |
+| 26 | N | `curvature_factor` i `narrow_region_resolution` wpisane w JSON polityki Airbox znikają po zapisie | `ScriptBuilderUniverseState` nie ma tych pól i ich nie odrzuca | otwarte – formularz Airbox ich nie pokazuje |
 
 ## Commity
 
@@ -60,6 +63,8 @@ Waga: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza 
 - `cf8bfb283` – synchronizacja `universe` z `study.universe_mesh`.
 - `117efbdf4` – format polityki shared-domain i kontekst polecenia w Inspektorze.
 - `d7397891f` – aktualne rewizje buildu, rebase Airbox, Compute bez przygotowania.
+- `a9fdaad40` – `growth_rate` jako diagnostyka (pkt 17), nota 0105.
+- kolejny commit – punkty 14, 15, 22, 23 i 25.
 
 ## Weryfikacja
 
@@ -87,6 +92,17 @@ Waga: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza 
 
   Canvas WebGL jest widoczny, kontekst nie jest utracony, bufor rysowania ma 684×449,
   a dialog potwierdził renderowanie nowej rewizji siatki.
+- **Druga runda (pkt 14, 15, 17, 22, 23, 25), ta sama grupa po przebudowie backendu:**
+  - pytest `scripts/test_fem_quality_typed_dispatch.py`: 29 testów przechodzi; dwie
+    sfery z `growth_rate` 1,3, 1,8 i 3,0 budują się i publikują raport wzrostu.
+  - `tsc --noEmit` na całym projekcie (z testami) i ESLint na zmienionych plikach
+    przechodzą; vitest i testy Rust sprawdza CI.
+  - Przeglądarka: nowa symulacja FEM z „Configure now” otwiera Inspektor Universe.
+    Apply Airbox, utworzenie dwóch sfer i zmiana promienia kończą się stanem
+    „No unapplied changes”. Inspektor siatki pokazuje „3/8 available”. Po zapisie
+    polityki zmiana nazwy obiektu przechodzi bez 409, a build z `growth_rate` 1,3
+    kończy się stanem `published` (12 461 elementów, SICN p5 0,39, min 0,005).
+    `close` zwraca `accepted_control_unsupported`.
 - **Środowisko:** grupy pierwotnego worktree nie dało się uruchomić. Najpierw zabrakło
   pul adresów sieci Docker; za zgodą użytkownika usunięto 8 pustych sieci. Potem
   launcher zostawił znacznik aktywnej operacji bez usług. Do weryfikacji użyto

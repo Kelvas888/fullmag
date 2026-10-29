@@ -9,12 +9,16 @@ import {
   MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
   MESH_SEMANTICS_RESOURCE_KEY,
   MESH_SHARED_DOMAIN_POLICY_RESOURCE_KEY,
+  SCENE_RESOURCE_KEY,
   useMeshSemanticsResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { publishCommittedMeshPolicyResource } from "@/kernel/resources/meshPolicyResourceCache";
 import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
 import { useRuntimeCommandControlResourceData } from "@/kernel/resources/studyRuntimeResources";
-import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import {
+  SESSION_STATUS_RESOURCE_KEY,
+  useSessionResourceIdentity,
+} from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
 
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
@@ -196,6 +200,11 @@ export function SharedDomainMeshPolicySection() {
         MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
         next.revision,
       );
+      // The policy is stored in the scene document and bumps the scene and
+      // mesh revisions without a realtime event. Refetch both, so open object
+      // drafts and the build dialog's mesh_revision precondition stay current.
+      resources.invalidate(SCENE_RESOURCE_KEY, `mesh-policy:shared-domain:${next.revision}`);
+      resources.invalidate(SESSION_STATUS_RESOURCE_KEY, `mesh-policy:shared-domain:${next.revision}`);
       if (!silent) {
         setFeedback({
           kind: "success",

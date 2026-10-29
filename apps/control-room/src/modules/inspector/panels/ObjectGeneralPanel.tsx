@@ -70,6 +70,7 @@ import {
 } from "./objectGeneralPanelModel";
 import {
   objectEditMetadataEquals,
+  rebaseDirtyDraftOntoUnchangedObject,
   reconcileObjectEditAck,
   reconcileObjectIdentityAck,
 } from "./objectEditAckReconciliation";
@@ -182,9 +183,11 @@ function invalidateAuthoringResources(
       sessionScopeKey,
       resourceCacheScope,
     );
-  } else {
-    resources.invalidate(MODEL_SCENE_PATH, revision);
   }
+  // The publish above is skipped without error while a scene load is pending
+  // or the requested revision is opaque. The Inspector draft is clean only
+  // once the scene resource shows the committed revision, so always request it.
+  resources.invalidate(MODEL_SCENE_PATH, revision);
   resources.invalidate(MODEL_GEOMETRY_VALIDATION_PATH, revision);
   resources.invalidate(MODEL_READINESS_PATH, revision);
   resources.invalidate(MODEL_GEOMETRY_DIAGNOSTICS_PATH, revision);
@@ -286,7 +289,11 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
       Number.isFinite(canonicalGeometryDraft.baseRevision) &&
       currentDraft.baseRevision === canonicalGeometryDraft.baseRevision
     ) return;
-    kernel.objectEditSession.refreshCanonical(identity, canonicalDraftInSelectedUnits(canonicalGeometryDraft, currentDraft ?? canonicalGeometryDraft));
+    kernel.objectEditSession.refreshCanonical(
+      identity,
+      canonicalDraftInSelectedUnits(canonicalGeometryDraft, currentDraft ?? canonicalGeometryDraft),
+      rebaseDirtyDraftOntoUnchangedObject,
+    );
   }, [
     canonicalGeometryDraft,
     currentSessionScopeKey,

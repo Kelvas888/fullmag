@@ -271,12 +271,14 @@ async fn submit_structured_command_impl_with_context(
             .await;
         }
         if crate::live_accepted_execution::docker_api_only_runtime()
-            && matches!(command.kind.as_str(), "pause" | "skip")
+            && matches!(command.kind.as_str(), "pause" | "skip" | "close")
         {
-            let reason = if command.kind == "pause" {
-                "accepted_control_unsupported: Docker accepted workers expose durable Stop; Pause is unavailable until a worker pause command is published."
-            } else {
-                "accepted_control_unsupported: Docker accepted workers expose durable Stop; Skip is unavailable until a worker stage-skip command is published."
+            // Only a CLI host drains the control queue and the Docker
+            // API-only runtime has none, so these must not be queued.
+            let reason = match command.kind.as_str() {
+                "pause" => "accepted_control_unsupported: Docker accepted workers expose durable Stop; Pause is unavailable until a worker pause command is published.",
+                "skip" => "accepted_control_unsupported: Docker accepted workers expose durable Stop; Skip is unavailable until a worker stage-skip command is published.",
+                _ => super::runtime::DOCKER_CLOSE_UNSUPPORTED_REASON,
             };
             return reject_session_command_impl_with_context(
                 Arc::clone(&state),
