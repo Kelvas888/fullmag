@@ -404,3 +404,32 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   zmienia schematu. Starsze czytniki pomijają nowy typ. Review granicy CAS,
   rollbacku i retencji: PASS źródła. Parser/diff przechodzą; build, nowe
   końcowe skalary i pomiar poprawy czasu pozostają **NOT VERIFIED**.
+
+### Checkpoint: rzeczywisty drain i proof odtworzenia
+
+- Commit UI `9f70be04f8e60a55c5c321d26c2e2fde41798d4c` jest na remote.
+  Użytkownik dopuścił niezmieniony hostowy hook przy kolejnych commitach tego
+  zadania. Normalny hook zgłosił dwa bounded lookup ostrzeżenia w skrypcie QA;
+  nie zmieniano hooka, PATH ani reguł skanera.
+- Pierwsza próba stopu wygasła w odczycie namespace przed utworzeniem
+  operation. Inspekcja potwierdziła stary start, oba healthy, API 200 i brak
+  nowej iteration; nie potraktowano timeoutu jako zakończenia kontenera.
+  Ponowiony pełny preflight/drain `3e3997a9af064c53ab134b3a003277c8`
+  zakończył się `succeeded`; oba kontenery mają exit0 i `OOMKilled=false`.
+- Rzeczywisty receipt zawiera parę historycznych
+  `container_recovery` / `container_recovery_authorization`. Zamknięty zestaw
+  pól starego walidatora ich nie uwzględniał. Host i Rust dopuszczają teraz
+  wyłącznie pełną parę ze znanymi schematami/outcome, statusem `recovered`,
+  tym samym request ID i czterema zgodnymi digestami. Cały process pozostaje
+  objęty canonical+LF SHA; Ready/Drained owner, children i terminal-run fence
+  są sprawdzane niezależnie. Historyczne recovery nie jest nową autoryzacją
+  ani operacją do ponowienia. Review: PASS źródła, bez testów.
+- Producer na rzeczywistym preflighcie i store zakończył się kodem 0:
+  `verification/terminal-observation-six-points-6146e07161af45f8b7a4741ec0c774a8.json`,
+  SHA `3d100be0ad4bdcc0ee24f31bad55b32c5a711011a8997957c20c79d706b225e5`.
+  Ten proof dotyczy powyższego runu 10 iteracji i potwierdzonego drain;
+  nie zastępuje odbioru jego instalacji po nowym starcie.
+- Źródłowa optymalizacja materializacji zapisana jako `1bddc0bae`.
+  Kontrolowany restart/nowy build ma zachować backend 128 GiB / 16 CPU oraz
+  istniejący frontend 16 GiB / 4 CPU. Oba serwisy celowo pozostają zatrzymane
+  między drain a odtworzeniem. Pozostałe grupy i dane pozostają zachowane.
