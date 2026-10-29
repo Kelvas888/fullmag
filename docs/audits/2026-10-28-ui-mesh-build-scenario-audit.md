@@ -64,7 +64,12 @@ Waga: **B** – blokuje scenariusz, **W** – daje błędny wynik lub wprowadza 
 - `117efbdf4` – format polityki shared-domain i kontekst polecenia w Inspektorze.
 - `d7397891f` – aktualne rewizje buildu, rebase Airbox, Compute bez przygotowania.
 - `a9fdaad40` – `growth_rate` jako diagnostyka (pkt 17), nota 0105.
-- kolejny commit – punkty 14, 15, 22, 23 i 25.
+- `7e4542361` – punkty 14, 15, 22, 23 i 25.
+- kolejny commit – cofnięcie bezwarunkowej inwalidacji sceny w `ObjectGeneralPanel`.
+  Dodatkowe pobranie sceny po publikacji potwierdzonej sceny łamało w CI
+  `browser-fixture-smoke`: gest przesunięcia w trakcie oczekującego Apply zmieniał
+  podgląd. Bisekcja w CI potwierdziła przyczynę. Rebase szkicu z punktu 25 sam
+  usuwa konflikt rewizji.
 
 ## Weryfikacja
 
