@@ -164,3 +164,20 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   budżet 1 GiB na nowe rekordy prepared, obejmujący oba przebiegi odczytu,
   niezależnie od budżetu CAS. Publikacja autoryzacji i wykonanie recovery mają
   ponowić własne kontrole; sam wynik preview nie uruchamia kontenerów.
+- Publikacja świeżego dowodu i autoryzacji zakończyła się kodem 0 w operacji
+  `011e3832c36e4fe49c2beba630d38ffe`; zapis pozostaje w wolumenie control,
+  pod `container-recovery-authorization/attempts/<id>/operator-authorization.json`.
+  Sam zapis nie uruchomił ani nie usunął stałych usług aplikacji.
+- Remote `dcfc351c86a75e04b5df4e52a65325fbb4dfec07` zawierał 24 nowe commity,
+  a lokalny master pięć naszych. Merge zatrzymany przed commitem scalił się
+  bez konfliktów; żadna ścieżka incoming nie przecinała cudzych zmian ani
+  niezacommitowanej stopki. Kontrola składni 23 Rust / 14 Python zakończyła
+  się powodzeniem; poprawiono jedną pustą linię EOF z incoming fixture.
+  Review trzech automatycznie scalonych plików API potwierdziło zachowanie
+  kontraktów terminal restore, scalar scope i uptime. To dowody źródłowe.
+- Windows Computer Use zgłosił błąd `sandboxCwd is not a local file URI` dla
+  katalogu WSL. Odbiór renderu ma użyć istniejącej zarządzanej recepty
+  `docker_dev_browser_qa.py`. Dotychczasowa flaga Airbox vectors obejmuje
+  FDM; nie zaliczać jej jako dowodu FEM. Wymagany jest rzeczywisty wybór
+  Airbox H_demag, scoped odczyt i dodatnia liczba adoptowanych segmentów,
+  wraz z widocznym canvasem i stanem WebGL. Bez fixture i bez ponownego Solve.
