@@ -28,8 +28,8 @@ defined in `airboxMeshPolicyDraft.ts`; the UI is implemented by
 | Narrow-region resolution | `airbox_narrow_region_resolution` (alias `narrow_region_resolution`) | 1 |
 | Advanced JSON | complete universe policy | mixed |
 
-Curvature factor and narrow-region resolution refine only the air (note
-`docs/physics/0107-airbox-feature-refinement.md`) and require the maximum element size. They are
+Curvature factor and narrow-region resolution refine only the air (next to curved magnet
+surfaces and across narrow air gaps) and require the maximum element size. They are
 exported to Python as `study.universe.mesh(curvature_factor=..., narrow_region_resolution=...)`.
 Exact-layer, swept and mixed air routes reject them.
 
