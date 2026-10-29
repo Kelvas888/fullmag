@@ -1,4 +1,4 @@
-//! Candidate only: private first reattachment of a failed accepted observation.
+//! Candidate only: private first reattachment of a terminal accepted observation.
 //! Kept separate from held activation and accepted-successor ACK contracts.
 use super::*;
 
@@ -209,7 +209,11 @@ fn restore(
     let public_run = preflight.get("run").context("terminal preflight has no run")?;
     equal(public_run, "run_id", &proof.run_id)?;
     equal(public_run, "session_id", &proof.session_id)?;
-    equal(public_run, "status", "failed")?;
+    let expected_outcome = match string(public_run, "status")? {
+        "failed" => "failed",
+        "completed" => "completed",
+        _ => bail!("terminal observation public run status is unsupported"),
+    };
     let session_started_at = string(public_run, "started_at")?.parse::<u64>()?;
     if session_started_at == 0 {
         bail!("terminal observation has no positive historical session timestamp");
@@ -385,12 +389,12 @@ fn restore(
     raw(store.root(), &format!("{relative}/run_catalog.json"), &proof.catalog_sha256)?;
     let catalog = store.read_run_catalog(&proof.run_id)?.context("terminal observation catalog is absent")?;
     let terminal_outcome = terminal_catalog_outcome(&catalog)?;
-    if catalog.revision != proof.catalog_revision || terminal_outcome != "failed" {
-        bail!("terminal observation requires the exact durable Failed catalog");
+    if catalog.revision != proof.catalog_revision || terminal_outcome != expected_outcome {
+        bail!("terminal observation catalog differs from the hash-bound public run outcome");
     }
     raw(store.root(), &format!("{relative}/start_release.json"), &proof.start_release_sha256)?;
     if !store.accepted_run_start_permitted(&proof.run_id)? {
-        bail!("failed terminal observation has no canonical Start release");
+        bail!("terminal observation has no canonical Start release");
     }
     let mut planned_inputs = std::collections::BTreeMap::new();
     for step in accepted.lowered.steps.iter().filter(|step| step.enabled
@@ -432,7 +436,7 @@ fn restore(
         "api_instance_id": state.request_scope_instance_id,
         "run_id": proof.run_id, "session_id": proof.session_id,
         "session_epoch": proof.session_epoch, "scene_revision": proof.scene_revision,
-        "terminal_outcome": "failed", "proof_sha256": input.proof_sha256,
+        "terminal_outcome": terminal_outcome, "proof_sha256": input.proof_sha256,
         "launch_sha256": input.launch_sha256,
         "source_image_id": proof.image_id, "source_config_sha256": proof.config_sha256,
         "target_build_id": input.target_build_id,

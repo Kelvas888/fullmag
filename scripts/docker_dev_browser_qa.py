@@ -215,15 +215,8 @@ def _validate_frontend_volume(
         raise BuildControlError("Frontend inputs have an invalid dependency seed digest")
     if not isinstance(toolpins_digest, str) or SHA256_RE.fullmatch(toolpins_digest) is None:
         raise BuildControlError("Frontend inputs have an invalid tool pin digest")
-    cache_key = hashlib.sha256(
-        canonical(
-            {
-                "project": control.project,
-                "dependencies": dependency_digest,
-                "tools": toolpins_digest,
-            }
-        )
-    ).hexdigest()
+    from docker_development_inputs import metadata_cache_key
+    cache_key = metadata_cache_key(frontend_inputs, control.project)
     expected_name = "fullmag-dev-frontend-v1-" + cache_key[:24]
     if frontend_volume != expected_name:
         raise BuildControlError("Frontend state volume is not the deterministic selected-group volume")

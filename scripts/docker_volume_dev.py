@@ -717,8 +717,8 @@ def _backend_cache(control, operation, layout, selected, image, toolchain):
         source_root=selected, toolchain_image=toolchain, active_consumers=consumers,
         control_volume_name=control.volume, control_namespace=control.namespace,
         shared_packages=True)
-    snapshot = (getattr(control, "namespace_registry", None) or {}).get("retirement", {})
-    if snapshot.get("schema") == "fullmag.docker-isolated-session-snapshot.v1":
+    snapshot = _active_isolated_snapshot(control)
+    if snapshot is not None:
         from docker_isolated_control_prepare import prepare_snapshot_control
         prepare_snapshot_control(control, snapshot, operation=operation)
     overlay = cache.maintenance_overlay(profile)
@@ -862,23 +862,9 @@ def _group_ledger(control, operation, image, *, new_render=False):
     empty_generation = _empty_stopped_namespace_ledger_generation(control)
     generation = empty_generation
     if generation_record is not None:
-        if (not isinstance(generation_record, Mapping)
-                or generation_record.get("schema") != "fullmag.docker-group-ledger-generation.v1"
-                or generation_record.get("compose_project") != control.project
-                or not re.fullmatch(r"[0-9a-f]{32}", str(generation_record.get("generation", "")))):
-            raise BuildControlError("Fresh group ledger generation is malformed")
+        from docker_volume_fresh_runtime import pinned_group_archive
+        pinned_group_archive(control, generation_record)
         generation = generation_record["generation"]
-        terminal_path = "recreate-services/attempts/" + generation + "/runtime-control-archive-terminal.json"
-        if generation_record.get("archive_terminal_path") != terminal_path:
-            raise BuildControlError("Fresh ledger generation has another archive path")
-        terminal = control.read(terminal_path)
-        if (terminal.get("state") != "succeeded"
-                or terminal.get("operation_attempt") != generation
-                or terminal.get("compose_project") != control.project
-                or terminal.get("preserved_group_ledger_volume") != generation_record.get("preserved_volume")
-                or hashlib.sha256(canonical(terminal)).hexdigest()
-                   != generation_record.get("archive_terminal_sha256")):
-            raise BuildControlError("Fresh ledger generation has no exact completed runtime archive")
     generation = _select_group_ledger_generation(empty_generation, generation_record)
     key = group_ledger.volume_key(daemon["id_sha256"], control.project, generation)
     volume = _owned_volume(control, group_ledger.VOLUME_ROLE, key)
@@ -925,6 +911,14 @@ def _snapshot_certificate_placeholder(control, state, certificate_path, snapshot
             or control.read_bytes("isolated-snapshot/native-validation.json", optional=True) is not None
             or host.read_owned_regular(certificate_path, 1) != b""):
         raise BuildControlError("Existing snapshot certificate is not the pinned pre-admission placeholder")
+
+
+def _active_isolated_snapshot(control):
+    snapshot = (getattr(control, "namespace_registry", None) or {}).get("retirement", {})
+    if snapshot.get("schema") != "fullmag.docker-isolated-session-snapshot.v1":
+        return None
+    from docker_volume_fresh_runtime import snapshot_bootstrap_retired
+    return None if snapshot_bootstrap_retired(control, snapshot) else snapshot
 
 
 def _empty_stopped_namespace_ledger_generation(control):
@@ -1941,10 +1935,8 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
     else:
         control = provided_control
         toolchain, images = _validate_prepared_start_context(prepared)
-    snapshot = (control.namespace_registry or {}).get("retirement", {})
-    if snapshot.get("schema") != "fullmag.docker-isolated-session-snapshot.v1":
-        snapshot = None
-    elif (snapshot["source_root"] != str(selected) or args.script is not None
+    snapshot = _active_isolated_snapshot(control)
+    if snapshot is not None and (snapshot["source_root"] != str(selected) or args.script is not None
           or getattr(args, "fresh_state", False)):
         raise BuildControlError("Isolated snapshot start must preserve its source and cannot replay a script")
     from docker_volume_cancelled_activation_guard import assert_start_allowed
@@ -2332,7 +2324,10 @@ def start(args, *, reuse_state=None, control=None, operation=None, prepared=None
             backend["environment"].update(terminal_observation["environment"])
         backend["environment"].pop("FULLMAG_ISOLATED_SNAPSHOT_START", None)
         backend["environment"].pop("FULLMAG_ISOLATED_SNAPSHOT_START_SHA256", None)
-        if snapshot is not None:
+        # A validated terminal observation selects its exact current run. Keep
+        # the imported snapshot/archive intact, but do not hydrate that older
+        # workspace before the terminal observation requires a fresh API.
+        if snapshot is not None and terminal_observation is None:
             meta_raw = control.read_bytes("isolated-snapshot/start.json")
             meta_pin = snapshot["control_pins"].get(
                 control.namespace + "/isolated-snapshot/start.json"
@@ -7073,9 +7068,14 @@ def _retained_operation(
             config_sha256=args.config_sha256, selected=selected)
         _saved_authoring_validate_services(saved_authoring, actual)
     if restart_idle_service:
-        if (not actual["backend"]["State"]["Running"]
-                or actual["backend"]["State"].get("Health", {}).get("Status") != "healthy"):
+        diagnostic_terminal = None
+        if not actual["backend"]["State"]["Running"]:
             raise BuildControlError("Idle restart requires a healthy backend; an active build is never interrupted")
+        if actual["backend"]["State"].get("Health", {}).get("Status") != "healthy":
+            if not stop_after_drain or saved_authoring is not None:
+                raise BuildControlError("An unhealthy backend requires explicit diagnostic stop-only")
+            from docker_volume_terminal_observation import diagnostic_terminal_stop_probe
+            diagnostic_terminal = diagnostic_terminal_stop_probe(control, previous, actual["backend"])
         state = storage.validate_path(Path(previous["state_root"]), layout["runtime_root"], "retained Windows sessions")
         certificate_path = _certificate_path(state)
         certificate = _retained_certificate(state, document)
@@ -7116,17 +7116,17 @@ def _retained_operation(
                         or fresh["backend"]["State"].get("Running") is not True):
                     raise BuildControlError("Frontend is not quiesced or backend is no longer running")
                 _assert_private_restart_network(fresh, ids, control.project)
-                probe = """import json,urllib.request
+                probe = "EXPECTED_HEALTH = " + repr("degraded" if diagnostic_terminal else "ok") + "\n" + """import json,urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5) as response:
  document=json.load(response)
- if (response.status!=200 or document.get('status')!='ok'
+ if (response.status!=200 or document.get('status')!=EXPECTED_HEALTH
          or (document.get('active_session') is not False
              and document.get('active_session') is not True)):
   raise RuntimeError('Backend health is unknown; restart refused')
  print(json.dumps(document))
 """
                 health = json.loads(docker_text("exec", ids["backend"], "/usr/local/bin/python3", "-B", "-c", probe))
-                if health.get("status") != "ok":
+                if health.get("status") != ("degraded" if diagnostic_terminal else "ok"):
                     raise BuildControlError("Backend health is not ready; idle restart refused")
                 active_session = health.get("active_session")
                 authoring_probe = None
@@ -7139,6 +7139,20 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     control.write(operation["root"] + "/saved-authoring-checkpoint.json", saved_authoring)
                     control.write(operation["root"] + "/saved-authoring-preflight.json", authoring_probe)
                     operation["receipt"]["saved_authoring_restore_required"] = saved_authoring["archive"]
+                elif diagnostic_terminal is not None:
+                    from docker_volume_terminal_observation import diagnostic_terminal_stop_probe
+                    diagnostic_fresh = diagnostic_terminal_stop_probe(control, previous, fresh["backend"])
+                    # Uptime/version are not part of the stable stop pin.
+                    if diagnostic_fresh != diagnostic_terminal or any(
+                        health.get(key) != value for key, value in diagnostic_terminal["health"].items()
+                    ):
+                        raise BuildControlError("Diagnostic terminal stop proof changed under lease")
+                    control.write(operation["root"] + "/diagnostic-terminal-preflight.json", diagnostic_terminal)
+                    operation["receipt"]["diagnostic_terminal_stop_sha256"] = hashlib.sha256(canonical(diagnostic_terminal)).hexdigest()
+                    diagnostic_process = control.read_bytes("runtime-control/runtime-service/process-tree.json")
+                    if hashlib.sha256(diagnostic_process).hexdigest() != diagnostic_terminal["process_sha256"]:
+                        raise BuildControlError("Diagnostic process changed before stop archival")
+                    control.write_bytes(operation["root"] + "/diagnostic-terminal-process-before.json", diagnostic_process)
                 elif active_session is True:
                     if startup_enabled:
                         raise BuildControlError("Backend has an active session; idle restart refused")
@@ -7187,7 +7201,7 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     != actual["backend"].get("State", {}).get("StartedAt")
                     or stopped["State"].get("Running") is not False
                     or stopped["State"].get("OOMKilled") is not False
-                    or stopped["State"].get("ExitCode") != 0):
+                    or stopped["State"].get("ExitCode") != (1 if diagnostic_terminal else 0)):
                 raise BuildControlError("Backend termination is not confirmed graceful; restart withheld")
             from docker_volume_stop_unadmitted import _read_terminal_process_receipt
             drained_raw, drained = _read_terminal_process_receipt(stopped, control)
@@ -7219,6 +7233,9 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     backend_container=ids["backend"], frontend_container=ids["frontend"],
                     config_sha256=args.config_sha256,
                 )
+                if diagnostic_terminal is not None:
+                    operation["receipt"]["backend_exit_code"] = stopped["State"]["ExitCode"]
+                    operation["receipt"]["native_drain_authenticated"] = True
                 return
             docker_capture("start", ids["backend"], timeout=90)
             docker_capture("start", ids["frontend"], timeout=90)
@@ -7644,10 +7661,15 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                 _retained_certificate(state, document)
                 if terminal_observation is not None:
                     from docker_volume_terminal_observation import revalidate_context
-                    revalidate_context(
+                    preowner_successor = revalidate_context(
                         control, terminal_observation, source_root=str(selected),
                         attempt=args.attempt, config_sha256=args.config_sha256, actual=leased_actual,
                     )
+                    if preowner_successor is not None:
+                        context_key = ("terminal_diagnostic_successor"
+                            if preowner_successor.get("schema") == "fullmag.terminal-diagnostic-drain-context.v1"
+                            else "preowner_drained_successor")
+                        operation["receipt"][context_key] = dict(preowner_successor)
                     operation["receipt"]["terminal_observation"] = terminal_observation["metadata"]
                 actual = leased_actual
             if pre_admission_recreate_proof is not None:
@@ -7821,6 +7843,22 @@ with urllib.request.urlopen('http://127.0.0.1:8081/v2/platform/health',timeout=5
                     or observed["State"].get("StartedAt") != actual[service]["State"].get("StartedAt")
                 ):
                     raise BuildControlError("Service restarted during fresh session: " + service)
+            snapshot_record = (control.namespace_registry or {}).get("retirement", {})
+            if fresh_state and snapshot_record.get("schema") == "fullmag.docker-isolated-session-snapshot.v1":
+                from docker_volume_stop_unadmitted import _read_terminal_process_receipt
+                native_raw, _ = _read_terminal_process_receipt(actual["backend"], control)
+                native_path = operation["root"] + "/snapshot-native-drain.json"
+                control.write_bytes(native_path, native_raw)
+                operation["receipt"]["snapshot_bootstrap_retirement"] = {
+                    "schema": "fullmag.docker-snapshot-bootstrap-retirement.v1",
+                    "snapshot_sha256": hashlib.sha256(canonical(snapshot_record)).hexdigest(),
+                    "backend_container_id": ids["backend"],
+                    "image_id": actual["backend"]["Image"],
+                    "backend_started_at": actual["backend"]["State"]["StartedAt"],
+                    "native_drain_path": native_path,
+                    "native_drain_sha256": hashlib.sha256(native_raw).hexdigest(),
+                }
+                control.write(operation["root"] + "/receipt.json", operation["receipt"])
             _revalidate_helper_source_binding(helper_source_binding, selected)
             docker_capture("rm", *ids.values())
             if helper_ids:
