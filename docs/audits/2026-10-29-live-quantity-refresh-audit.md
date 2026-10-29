@@ -430,3 +430,19 @@ Nie zrobione w tym branchu, z powodem:
 - **P4** (mutex przejścia na każdym zdarzeniu WS): mutex chroni przed wysłaniem zdarzenia
   w trakcie przejścia sesji; zdjęcie go wymaga osobnej analizy.
 - F3, P1, R4, C3: bez zmian.
+
+### Dowody runtime (29.10.2026)
+
+Grupa weryfikacyjna `live-quantity-refresh-verify-20261029`, commit `69e5afbe9`, FDM GPU, pasek
+400×100×5 nm (1600 komórek), `fm.run(1 ns)`, w trakcie biegu `active_quantity_id = H_demag`:
+
+- `runs/<run>/live_demand.v1.json` = `["H_demag","m"]` (z odczytem `H_ex` przez endpoint
+  pojawiło się też `H_ex` i wypadło po 15 s);
+- nagłówki workera niosły `m` + `H_demag` albo samo `m`, nigdy pełnego katalogu;
+- do API trafiło 467 wierszy skalarów, z czego 277 nadal z zerowymi `E_*` i momentem. Źródło:
+  aktualizacja live wysyłana przed krokiem z `current_stats` poprzedniego kroku. Poprawka:
+  `072626847`; jej weryfikacja runtime: NOT VERIFIED (przebudowa odrzucona, dysk C: < 32 GiB);
+- na magazynie w folderze Windows projektor często odkłada projekcję („session read transaction
+  requires no active store writer”); pierwsze ~4400 kroków nie zostało zprojektowanych. Worker
+  zapisuje ładunek i nagłówek na każdym kroku (~10 kroków/s); kadencję czasową wnosi PR #270.
+
