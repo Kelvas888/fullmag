@@ -1033,6 +1033,11 @@ pub(crate) fn execute_cuda_fdm(
             current_time = stats.time;
             latest_stats = Some(stats.clone());
             current_stats = stats.clone();
+            if !step_stats_observed {
+                // The next loop iteration publishes these stats to the live
+                // consumer before it steps; they must not read as a measurement.
+                current_stats.kind = fullmag_quantities::StepDataKind::LegacyUnclassified;
+            }
             // The checkpoint exists only for frozen-spin plans; without one this
             // device-to-host copy of m on every live step had no consumer.
             if live.is_some() && frozen_spins_state.is_some() {
