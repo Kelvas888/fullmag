@@ -35,7 +35,7 @@ uruchamia solvera. UI używa wspólnych resource hooks i bieżącej tożsamości
   potwierdzono Docker Desktop 29.9.2, 40 CPU i około 196,6 GiB RAM.
   Oba dotychczasowe kontenery mastera są zatrzymane z exit255 po przerwie
   silnika; nie jest to zgoda na replay ich starego zadania.
-- [ ] **2. Odtworzenie siatki i pól bez obliczeń.** Root odpowiada za
+- [x] **2. Odtworzenie siatki i pól bez obliczeń.** Root odpowiada za
   `development_accepted_restore/terminal_observation.rs`,
   `live_accepted_projection.rs`, `live_scene_preparation.rs` i wymaganych
   konsumentów. Najpierw prześledzić odmowę publikacji terminalnej domeny.
@@ -433,3 +433,40 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   Kontrolowany restart/nowy build ma zachować backend 128 GiB / 16 CPU oraz
   istniejący frontend 16 GiB / 4 CPU. Oba serwisy celowo pozostają zatrzymane
   między drain a odtworzeniem. Pozostałe grupy i dane pozostają zachowane.
+
+
+### Checkpoint: rzeczywiste odtworzenie terminalnego CoFeB
+
+- Backend `34df0e44a2eb00f109940f6bcb3e1cb06820f834` zbudowano
+  w stałym kontenerze `fullmag-master-backend-1`: make 288 573 ms, 24 pliki
+  zweryfikowanego pakietu, snapshot
+  `cd8acc586bed087ab48f9acf27f5d11158fc77d2b6cfff3dfaf1b97ee78b0972`.
+  Zarządzane wznowienie `a2f0d98c797440e2a79a0d007ea89a67` zakończyło się
+  `succeeded`; API Ready i kontenery healthy, backend 128 GiB/16 CPU.
+- Naprawiono błąd kompilacji E0507 w ponawianej publikacji terminalnych
+  skalarów oraz ścisłe rozpoznawanie schematu receiptu V3. Nie zmieniono
+  schematu istniejącego quantity bundle V1. Pierwszy nieudany build pozostaje
+  zapisany; poprawka przeszła rzeczywisty kolejny build, bez testów jednostkowych.
+- Nowe API `d44d0702-b589-4797-b77e-ea84509f15a4` odtworzyło ten sam run
+  `run-live-38f03054f1ca457a14dca4a95cbf08006998b8b67bd334a9e6eac017b5f8a0d4`,
+  publiczny epoch, krok 10 i domenę 1 087 250 elementów/183 764 węzłów.
+  Hashe wartości m oraz Airbox H_demag/H_eff, indeksów węzłów i observation
+  frames są identyczne z odczytem sprzed drain. Katalog zadania zachował SHA
+  `7f176485debdb3e5251978643051965baa6197ccf9ebce1e425e2f8bb802c4bb`;
+  wszystkie zadania nadal succeeded. Nie zlecono nowego Solve ani Compute Fields.
+- Dowód porównania: `backend/six-points-runtime/terminal-restoration-comparison-d017211205db4bbf9ea1f5e0e3b87ddd.json`
+  w wolumenie control grupy. Odbiór przeglądarkowy po odtworzeniu:
+  `browser-qa/attempts/30cd774feb3540bbbe66b6392891a9e8`, succeeded.
+  Pierwsza próba po zimnym starcie frontendu zakończyła się na odczycie
+  loopback; zachowano receipt, odczyt /workspace potwierdził HTTP 200 przed
+  następną próbą. Krótka degradacja obserwacji native ustąpiła po 4 s bez
+  zatrzymania API.
+- Ten stary run nie zawiera nowego artefaktu terminalnego StepStats; po
+  odtworzeniu historia skalarów jest pusta, zamiast fałszywego prepared Step 0.
+  Odbiór trwałych końcowych skalarów wymaga nowego runu i pozostaje otwarty.
+- Scalenie `origin/master` z poprawką mapowania FDM multilayer w 2D zapisano
+  i wypchnięto jako `25e5d76e9766aa3ba924cd4a7528fe5713abcfb1`.
+  Kontrola parserów pięciu produkcyjnych plików Rust i JSON source-map przeszła;
+  testów nie uruchamiano. Wszystkie siedem obcych plików nadal ma hashe
+  manifestu początkowego. Wdrożenie tego scalenia, nowe przebiegi FDM/FEM,
+  pomiar materializacji i kwalifikowana retencja pozostają do wykonania.
