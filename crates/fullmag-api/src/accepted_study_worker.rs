@@ -914,6 +914,7 @@ struct WorkerExecutionCompletedReceiptV2 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerExecutionCompletedReceiptV3 {
+    #[serde(deserialize_with = "deserialize_completed_worker_receipt_v3_schema")]
     schema_version: String,
     identity: WorkerExecutionReceiptIdentity,
     status: RunStatus,
@@ -927,6 +928,19 @@ struct WorkerExecutionCompletedReceiptV3 {
     terminal_publication: Option<fullmag_runtime_control::PreparedTerminalPublicationV4>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_stats: Option<fullmag_runner::StepStats>,
+}
+
+fn deserialize_completed_worker_receipt_v3_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = String::deserialize(deserializer)?;
+    if version != "fullmag.accepted_worker_execution.v3" {
+        return Err(serde::de::Error::custom("expected completed worker receipt v3"));
+    }
+    Ok(version)
 }
 
 #[derive(Deserialize)]
