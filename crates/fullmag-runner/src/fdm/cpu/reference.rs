@@ -765,10 +765,8 @@ fn capture_full_active_cpu_fields(
     config_revision: u64,
 ) -> Result<Vec<crate::LivePreviewField>, RunError> {
     let quantities = field_materialization_quantity_ids();
-    let quantities = active_fdm_preview_quantities(
-        crate::dispatch::FdmEngine::CpuReference,
-        plan,
-        &quantities,
+    let quantities = crate::live_demand::retain_demanded_live_quantities(
+        active_fdm_preview_quantities(crate::dispatch::FdmEngine::CpuReference, plan, &quantities),
     );
     capture_cpu_fields_for_quantities(
         problem,

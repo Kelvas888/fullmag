@@ -49,8 +49,9 @@ const WORKER_EXECUTION_COMPLETED_RECEIPT: &str = "worker_execution_completed.v1.
 // overwritten observation sidecar in its private attempt directory; the API
 // projector reads that sidecar for a `Running` task and turns it into the
 // ordinary current-live resource revisions. The sidecar is not a durable
-// output: it is not CAS-pinned, never replaces the final accepted state, and is
-// removed when the solver returns. Transfer cost is bounded twice: the runner
+// output: it is not CAS-pinned and never replaces the final accepted state.
+// When the solver returns, the field payload is removed and only a scalar
+// header of the last step remains. Transfer cost is bounded twice: the runner
 // copies magnetization from the device only every
 // `ACCEPTED_LIVE_FIELD_EVERY_N` steps, and the worker writes at most one
 // scalar header per `ACCEPTED_LIVE_SCALAR_MIN_INTERVAL` and one magnetization
@@ -166,6 +167,9 @@ pub(crate) struct AcceptedLiveObservationWriter {
     terminal_spool: Option<crate::accepted_observation_spool::TerminalObservationSpool>,
     terminal_storage_budget: u64,
     terminal_field_budget: u64,
+    live_demand: crate::accepted_live_demand::AcceptedLiveDemandReader,
+    /// Last physical step stats, kept for the final scalar header.
+    last_stats: Option<fullmag_runner::StepStats>,
 }
 
 impl AcceptedLiveObservationWriter {
@@ -216,6 +220,11 @@ impl AcceptedLiveObservationWriter {
             terminal_spool: None,
             terminal_storage_budget: accepted_step.claim.lease.budget.storage_bytes / 4,
             terminal_field_budget: accepted_step.claim.lease.budget.memory_bytes / 16,
+            live_demand: crate::accepted_live_demand::AcceptedLiveDemandReader::new(
+                attempt_output_dir,
+                accepted_step.claim.run_id.as_str(),
+            ),
+            last_stats: None,
         }
     }
 
@@ -247,6 +256,8 @@ impl AcceptedLiveObservationWriter {
     /// Observe one runner update. Always returns without blocking the solver
     /// on a failed write.
     pub(crate) fn observe(&mut self, update: &fullmag_runner::StepUpdate) {
+        // The displayed quantities apply from the runner's next live capture.
+        self.live_demand.refresh();
         if update.terminal_field_snapshot {
             // Keep the original-context endpoint for recovery and later CAS
             // binding. It is validated against m_final, never used as state.
@@ -263,6 +274,9 @@ impl AcceptedLiveObservationWriter {
             return;
         }
         let stats = &update.stats;
+        if stats.is_physical_observation() {
+            self.last_stats = Some(stats.clone());
+        }
         self.recent_clock.push_back((stats.step, stats.time, stats.dt));
         while self.recent_clock.len() > ACCEPTED_LIVE_RECENT_CLOCK_SAMPLES {
             self.recent_clock.pop_front();
@@ -289,7 +303,15 @@ impl AcceptedLiveObservationWriter {
         let previous_magnetization = staged_magnetization
             .as_ref()
             .and_then(|reference| self.current_magnetization.replace(reference.clone()));
-        if let Err(error) = self.write_header(stats) {
+        // A lane may leave some steps' diagnostics unobserved (FDM CUDA with a
+        // requested stats policy). The header carries the latest physical
+        // stats then, so the projector does not miss them between two reads.
+        let header_stats = if stats.is_physical_observation() {
+            stats.clone()
+        } else {
+            self.last_stats.clone().unwrap_or_else(|| stats.clone())
+        };
+        if let Err(error) = self.write_header(&header_stats) {
             if let Some(staged) = staged_magnetization.as_ref() {
                 self.current_magnetization = previous_magnetization;
                 let _ = fs::remove_file(self.attempt_output_dir.join(&staged.file_name));
@@ -307,13 +329,28 @@ impl AcceptedLiveObservationWriter {
         }
     }
 
-    /// Remove the live sidecar after the solver returned. The durable output
-    /// manifest is the only source of the final accepted state.
-    pub(crate) fn finish(self) {
-        let _ = fs::remove_file(self.attempt_output_dir.join(ACCEPTED_LIVE_OBSERVATION_FILE));
-        if let Some(reference) = self.current_magnetization {
+    /// Remove the live field payload after the solver returned. The durable
+    /// output manifest is the only source of the final accepted state.
+    ///
+    /// A scalar-only header of the last step is kept: a run that ends between
+    /// two projector ticks would otherwise publish no scalar row at all, and
+    /// the projector recovers its final row only from this header.
+    pub(crate) fn finish(mut self) {
+        let payload = self.current_magnetization.take();
+        let final_stats = self.last_stats.take();
+        let kept = final_stats
+            .as_ref()
+            .is_some_and(|stats| stats.is_physical_observation())
+            && final_stats
+                .as_ref()
+                .is_some_and(|stats| self.write_header(stats).is_ok());
+        if !kept {
+            let _ = fs::remove_file(self.attempt_output_dir.join(ACCEPTED_LIVE_OBSERVATION_FILE));
+        }
+        if let Some(reference) = payload {
             let _ = fs::remove_file(self.attempt_output_dir.join(reference.file_name));
         }
+        self.live_demand.finish();
     }
 
     fn write_terminal_capture(&mut self, update: &fullmag_runner::StepUpdate) -> Result<()> {
