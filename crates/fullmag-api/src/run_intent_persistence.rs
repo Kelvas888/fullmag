@@ -465,6 +465,19 @@ fn prepare_borrowed_run_intent_commit<'a>(
     )
 }
 
+fn validate_accepted_document_sizes(definition: &[u8], study: &[u8], catalog: &[u8]) -> Result<()> {
+    for (label, bytes, maximum) in [
+        ("definition", definition, fullmag_runtime_control::MAX_ACCEPTED_MODEL_DOCUMENT_BYTES),
+        ("Study plan", study, fullmag_session::MAX_TERMINAL_CATALOG_METADATA_BYTES),
+        ("Study catalog", catalog, fullmag_runtime_control::MAX_ACCEPTED_MODEL_DOCUMENT_BYTES),
+    ] {
+        if bytes.len() as u64 > maximum {
+            bail!("accepted {label} requires {} bytes; its decode budget is {maximum} bytes", bytes.len());
+        }
+    }
+    Ok(())
+}
+
 fn prepare_run_intent_commit<'a>(
     intent: RunIntent,
     definition: &ProjectEnvelope,
@@ -519,6 +532,7 @@ fn prepare_run_intent_commit<'a>(
     }
     let catalog_value = serde_json::to_value(catalog)?;
     let catalog_bytes = fullmag_session::canonical_json_bytes(&catalog_value);
+    validate_accepted_document_sizes(&definition_bytes, &study_bytes, &catalog_bytes)?;
     let catalog_sha256 = fullmag_session::hex_sha256(&catalog_bytes);
     if intent.specification.study_catalog_sha256 != catalog_sha256 {
         bail!("run study catalog digest does not match immutable planner inputs");
@@ -828,6 +842,7 @@ pub(crate) fn commit_archived_batch_intent(
     let definition_bytes = opened.envelope.raw_definition.raw_bytes();
     let study_bytes = study.canonical_json_bytes()?;
     let catalog_bytes = fullmag_session::canonical_json_bytes(&catalog_value);
+    validate_accepted_document_sizes(definition_bytes, &study_bytes, &catalog_bytes)?;
     let (snapshot_schema, output_storage_snapshot) = if let Some(existing) = existing_intent {
         let schema = existing
             .specification
