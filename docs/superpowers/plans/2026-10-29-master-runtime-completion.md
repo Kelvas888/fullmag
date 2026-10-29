@@ -318,3 +318,89 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
 - Odtworzenie po nowym runie, pomiar CoFeB, 10 iteracji FEM, 10 kroków obu
   wariantów FDM, odbiór przeglądarki i kwalifikowana retencja nadal oczekują
   na wykonanie. Żaden z tych odbiorów nie wynika z samego builda lub health.
+
+### Checkpoint: rzeczywiste 10 iteracji CoFeB i bieżące braki
+
+- Zwykły commit `4b60cdbfa00a9c219dcb0baf90547b8944fef572` przeszedł hook po
+  jednorazowej zgodzie użytkownika i trafił na remote. Następnie lokalny master
+  zaktualizowano fast-forward do `9f6505a1ee428d84bbd5626dee0e522326dc37b9`;
+  incoming nie przecinał cudzych niezacommitowanych ścieżek. Zachowano także
+  równoległe zmiany obu submodułów i audyt materiałów/interakcji.
+- Iteracja `4e627e71268548b48614f94b1fc12fc7` zbudowała commit `4b60cdbfa00a`
+  w stałym backendzie: make exit0, 88 794 ms, snapshot
+  `74838fcf57a27e0ee24c4d53cc5c08a1bad5773d0717c55c444581d6da561871`.
+  Kontenery zachowały ID, backend 128 GiB / 16 CPU oraz API Ready.
+  Późniejszy fast-forward źródeł nie jest dowodem przebudowania backendu.
+- Aktywacja `42873af4f9934a07a5b149ae1d6cad4a` i jeden przyjęty Solve
+  `fm-faf0da66-6dce-49c9-a1e2-10e9ed7392e6` zakończyły run
+  `run-live-38f03054f1ca457a14dca4a95cbf08006998b8b67bd334a9e6eac017b5f8a0d4`
+  w stanie completed, dokładnie 10 iteracji, FEM / GPU / double / strict,
+  `fem_native_gpu`. Limit iteracji nie oznacza zbieżności naukowej.
+- Siatka: 1 087 250 komórek, 183 764 węzły, fingerprint topologii
+  `1a7d1afa1af58fdce2112b1484fd8ec366b78ab8843aa7a725440e711749a18e`.
+  Odczyt FMVP potwierdził skończone `m` oraz niezerowe `H_demag` i `H_eff`
+  na 157 393 węzłach Airboxa. FieldMeta wiąże je z końcowym krokiem 10.
+  Dowód binarny w control tej grupy:
+  `backend/six-points-runtime/cofeb-terminal-fields-841da5bf4ad143eeb65e85f40954f43f.json`.
+- Całe przygotowanie nie przyspieszyło: materializacja 429 105 ms i native
+  domain preparation 200 702 ms, razem 629 807 ms, wobec 586 414 ms poprzednio.
+  Python/Gmsh zakończył się po około 148 s; późniejsze powtórne walidacje,
+  lowering i kodowanie nadal pozostają znaczącą pracą. Nie zmniejszano siatki.
+- API nadal ma potwierdzony błąd końcowej historii skalarów: run i pola mają
+  krok 10, ale jedyny wiersz `scalar_history` pochodzi z prepared kroku 0.
+  Poprawiona stopka odrzuca ten wiersz i pokazuje brak średniej magnetyzacji.
+  Przyczyna źródłowa: pełne końcowe StepStats są w usuwanym sidecarze;
+  zaakceptowany stan CAS i energia nie zawierają kompletu statystyk.
+  Naprawa wymaga trwałego, przypiętego artefaktu, bez przelabelowania kroku 0.
+- Odbiór przeglądarkowy nadal **NOT VERIFIED**. Pierwsza próba zatrzymała się
+  na timeout zimnej strony; druga ujawniła blokadę diagnostycznego POST
+  `visualization/client-acks` w samym skrypcie QA. Handler ACK zapisuje jedynie
+  stan klienta, bez zlecania obliczeń. Guard dopuszcza teraz dokładnie ten
+  same-origin endpoint obok display PATCH, nadal blokując inne mutacje.
+  Kolejna próba nie miała błędów HTTP/JS, lecz oczekiwała na spójny Debug
+  Airboxa; dodano zapis dokładnego panelu i obrazu przy timeout. Nie obniżono
+  warunków gotowości ani wymagań dotyczących bufora/wektorów/WebGL.
+- Otwarte pozostają: trwałe końcowe skalary, pomiar optymalizacji na tej samej
+  topologii, kontrolowany restart z odtworzeniem bez Solve, odbiór renderu FEM,
+  nowe próby obu wariantów FDM oraz wykonana kwalifikowana retencja. Bez testów
+  jednostkowych i bez nowych worktree. Nie powtarzać zakończonego Solve.
+
+### Checkpoint: pozytywny odbiór renderu i gotowe poprawki źródeł
+
+- Odbiór `57e1efc6a57b430e9f7210c4c92a602f` zakończył się `succeeded`.
+  Przeglądarka zachowała sesję, run i epoch przez przejście Home; primary `m`
+  pozostało dostępne. Scoped FEM Airbox `H_demag` zwrócił HTTP 200, przyjęty
+  `target-buffer` i 1200 segmentów. Widoczny canvas miał niezagubiony kontekst
+  oraz dodatni drawing buffer. Obejrzano obraz po dopasowaniu Airboxa do kamery.
+  Dowód dotyczy backendu `4b60cdbfa00a` i bieżących źródeł frontendu z poprawką
+  HMR; nie kwalifikuje jeszcze nowej aplikacji backendowej ani fizyki.
+- Rzeczywisty odbiór ujawnił dwa błędy diagnostyki: porównanie zapisu SHA-256
+  zamiast skrótu oraz odczyt cache po publicznym URL zamiast kluczu konkretnej
+  sesji/epoch/request scope. Debug korzysta teraz z tego samego normalizera co
+  renderer i dokładnego klucza przeniesionego wraz z buforem. Nie korzysta
+  z globalnej bieżącej sesji, aby przypisać staremu buforowi nową tożsamość.
+- Skrypt odbioru wymaga pełnego kanonicznego render snapshotu `ready`.
+  Oddzielnie raportuje `unknown` panelu porównań, gdy jedynym ograniczeniem jest
+  `backend-meta-incomparable`: statystyki próbkowanego żądania nie są tożsame
+  ze statystykami całego pola. Nie przepisuje stanu panelu i nie deklaruje
+  kompletności takiego porównania. Inne problemy nadal blokują odbiór.
+- Typecheck i focused ESLint we frontendzie przeszły:
+  `backend/source-checks/a6056dff087447f5b69ac4d046c78e1f.json`.
+  Późniejsze zmiany skryptu QA przeszły Node syntax i Python AST.
+  Przypięty React Doctor wykazał dwa istniejące ostrzeżenia pętli w
+  `viewport3dRenderModel.ts`; diff zmienia w tym pliku tylko przeniesienie
+  `cacheResourceKey`. Scan nie jest raportowany jako całkowicie zielony.
+- Odczytowa natywna inspekcja rzeczywistego terminalnego runu potwierdziła
+  `mutations_applied=false`, `solve_replayed=false`, native config
+  `4bfee3acb8bcec75b46cd2f1a98b913acbeb032f7bc956ed8ddcf56a4e0e0f5e`
+  i terminal evidence `79e8b6722f7f30c2f6ea4468dc59d696f693ffdc2f0f6df071b83b9d3fc257c4`.
+  Receipt: `backend/six-points-runtime/terminal-inspection-7ba55f768e1649cbb7d38c368d0a29d3.json`.
+  To wejście do kontrolowanego odtworzenia, jeszcze nie dowód restartu.
+- Przygotowano dwa fragmenty Rust do wspólnego buildu: sealed immutable
+  materialization usuwa powtórny lowering/serializację przed commit, zachowując
+  walidację pierwszego wejścia i wszystkie kontrole publikacji. Trwałe końcowe
+  StepStats mają osobny auxiliary artifact `accepted_terminal_scalar_stats`,
+  ścisłe CAS/claim/clock i istniejący katalog/piny; quantity bundle v1 nie
+  zmienia schematu. Starsze czytniki pomijają nowy typ. Review granicy CAS,
+  rollbacku i retencji: PASS źródła. Parser/diff przechodzą; build, nowe
+  końcowe skalary i pomiar poprawy czasu pozostają **NOT VERIFIED**.
