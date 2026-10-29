@@ -692,6 +692,8 @@ fn v0_3_study_universe_air_feature_controls_migrate_to_canonical_airbox() {
         "size": [400e-9, 240e-9, 240e-9],
         "center": [0.0, 0.0, 0.0],
         "airbox_hmax": 40e-9,
+        // The default geometric law needs a near-air size.
+        "airbox_hmin": 3e-9,
         "airbox_curvature_factor": 0.3,
         "airbox_narrow_region_resolution": 0.5
     });
