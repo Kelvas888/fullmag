@@ -181,3 +181,28 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   FDM; nie zaliczać jej jako dowodu FEM. Wymagany jest rzeczywisty wybór
   Airbox H_demag, scoped odczyt i dodatnia liczba adoptowanych segmentów,
   wraz z widocznym canvasem i stanem WebGL. Bez fixture i bez ponownego Solve.
+- Merge zapisano jako `6969c58dca1e671e2477c95327b9e6f6e67af7bd`.
+  Zwykły hook uruchomił statyczny React Doctor: 9 ostrzeżeń w incoming
+  (sekwencyjne pętle smoke, małe lookupy i klucz indeksowy); bez testów.
+  Nie zmieniano konfiguracji ani nie wyciszano reguł.
+- Pomocniczy host manager publikacji `011e...` pominął terminalny stan
+  receipt, przez co jego helper pozostał na `READY/LOGGED` i trzymał lease.
+  To błąd wywołania przez root, nie błąd solvera. Odczytowe uwierzytelnienie
+  potwierdziło dokładny helper `d588e9ffeeec...`, przypięte SHA receipt/auth/proof,
+  pusty log i wyłącznie zakończoną publikację metadanych. Finalizacja zachowała
+  poprzedni receipt w journalu, wykonała CAS i zapisała terminalny stan;
+  oryginalny helper sam zwolnił marker i zakończył się kodem 0. Terminal SHA:
+  `c6ace1c6005e04455fbe2b59135e416fd10a84813b8446d89d994342ecf40bd1`.
+  Bez zmiany aplikacji, ownera, sesji lub danych. Pomocniczy skrypt ma już
+  jawne `state=succeeded`; nie powtarzać publikacji starej autoryzacji.
+- Ponowione `docker-dev-toolchain` po zwolnieniu lease zakończyło się
+  powodzeniem: attempt `312ac575ca8c4fdd9820b4091b3d43e4`, cache hit,
+  obraz `sha256:efe1c5b5ef051387c4e6b32f960effd382a6e3cbc7de1627c15508be0ac96ebf`.
+- Probe dostał opt-in `--expect-fem-airbox-vectors` tylko z
+  `--canvas-only --expect-live-field m`. Wymaga live scoped H_demag,
+  przyjętego bufora, dodatnich segmentów i niezmienionego runu. Review
+  usunęło niekanoniczne aliasy statusu, uzupełniło health w wyniku, wybór
+  Radix opiera na etykiecie rzeczywistego katalogu i dodało sprawdzenie Cmd
+  helpera względem Compose. Stare opcje FDM/receipty zachowują kontrakt.
+  AST Python, `node --check` i diff-check przechodzą; sam probe nie był
+  jeszcze uruchomiony i nie stanowi dowodu działania FEM.
