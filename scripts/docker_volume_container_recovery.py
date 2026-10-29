@@ -1151,10 +1151,94 @@ def hash_cas_object(path, expected, remaining_budget):
 def regular(path, label, maximum=8*1024*1024):
     path=pathlib.Path(path)
     if not path.is_absolute() or '..' in path.parts or path.is_symlink() or not path.is_file(): raise RuntimeError(label+' is not a regular file')
-    data=path.read_bytes()
-    if len(data)>maximum: raise RuntimeError(label+' exceeds the size bound')
-    return data
+    fd=os.open(path,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0))
+    try:
+        before=os.fstat(fd); identity=cas_identity(before)
+        if not stat.S_ISREG(before.st_mode) or before.st_size>maximum or identity!=cas_identity(os.lstat(path)):
+            raise RuntimeError(label+' exceeds its size bound or changed before read')
+        with os.fdopen(fd,'rb',closefd=False) as reader:
+            data=reader.read(maximum+1)
+        if (len(data)>maximum or len(data)!=before.st_size
+                or identity!=cas_identity(os.fstat(fd)) or identity!=cas_identity(os.lstat(path))):
+            raise RuntimeError(label+' exceeds its size bound or changed while reading')
+        return data
+    finally: os.close(fd)
 def canonical(value): return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+def terminal_prepared_refs(run_root,run_id,tasks,read_budget):
+    root=run_root/'task_prepared_observations'
+    if not os.path.lexists(root): return set()
+    if root.is_symlink() or not root.is_dir(): raise RuntimeError('terminal prepared observation namespace is invalid')
+    def sha(value):
+        return isinstance(value,str) and len(value)==64 and all(c in '0123456789abcdef' for c in value)
+    def unique(pairs):
+        value={}
+        for key,item in pairs:
+            if key in value: raise RuntimeError('terminal preparation record contains a duplicate JSON key')
+            value[key]=item
+        return value
+    def prepared_raw(path):
+        raw=regular(path,'terminal preparation record',min(16*1024*1024,read_budget[0]))
+        read_budget[0]-=len(raw)
+        return raw
+    def record(path):
+        raw=prepared_raw(path)
+        value=json.loads(raw,object_pairs_hook=unique)
+        if not isinstance(value,dict): raise RuntimeError('terminal preparation record is not an object')
+        return raw,value
+    refs=set(); evidence={}
+    observation_fields={'schema_version','run_id','task_id','step_id','preparation_id','plan_fingerprint','magnetization_values_sha256','evaluation_lane','requested_lane','outcome','created_at'}
+    receipt_fields={'schema_version','run_id','task_id','step_id','input_fingerprint','preparation_id','plan_fingerprint','payload_sha256','payload','created_at'}
+    for path in root.iterdir():
+        raw,item=record(path)
+        task_id=path.name.removesuffix('.json')
+        step=item.get('step_id'); fingerprint=item.get('plan_fingerprint')
+        if (set(item)!=observation_fields or item.get('schema_version')!='task_prepared_observation.v1'
+                or path.name!=task_id+'.json' or task_id not in tasks
+                or item.get('run_id')!=run_id or item.get('task_id')!=task_id
+                or not isinstance(step,str) or not step.strip() or len(step.encode())>256
+                or any(ord(c)<32 or 127<=ord(c)<=159 or c in '/\\' for c in step)
+                or task_id!='task-'+hashlib.sha256((run_id+'\0'+step).encode()).hexdigest()
+                or item.get('preparation_id')!='prep-'+task_id
+                or not isinstance(fingerprint,str) or not fingerprint.startswith('sha256:') or not sha(fingerprint[7:])
+                or not sha(item.get('magnetization_values_sha256'))
+                or any(item.get(key) not in {'fdm_cpu','fdm_gpu','fem_cpu','fem_gpu'} for key in ('evaluation_lane','requested_lane'))
+                or not isinstance(item.get('created_at'),str) or not item['created_at']):
+            raise RuntimeError('terminal prepared observation identity/shape is invalid')
+        receipt_path=run_root/'task_preparation_receipts'/(task_id+'.json')
+        receipt_raw,receipt=record(receipt_path)
+        payload=receipt.get('payload')
+        if (set(receipt)!=receipt_fields or receipt.get('schema_version')!='task_preparation_receipt.v1'
+                or any(receipt.get(key)!=item[key] for key in ('run_id','task_id','step_id','preparation_id','plan_fingerprint'))
+                or not sha(receipt.get('input_fingerprint'))
+                or receipt['input_fingerprint']!=tasks[task_id].get('input_fingerprint')
+                or not sha(receipt.get('payload_sha256')) or not isinstance(payload,dict)
+                or payload.get('schema_version') not in {'preparation_receipt.v1','closed_loop_preparation_receipt.v1'}
+                or any(payload.get(key)!=item[key] for key in ('preparation_id','plan_fingerprint'))
+                or not isinstance(receipt.get('created_at'),str) or not receipt['created_at']):
+            raise RuntimeError('terminal prepared observation differs from its task preparation receipt')
+        # Native typed admission additionally validates canonical payload/RunSpec
+        # digests. Python must not substitute its float JSON encoding for Rust's.
+        outcome=item.get('outcome')
+        if not isinstance(outcome,dict): raise RuntimeError('terminal prepared observation outcome is invalid')
+        if outcome.get('state')=='published':
+            object_refs=outcome.get('object_refs'); bundle=outcome.get('bundle_object_ref')
+            if (set(outcome)!={'state','bundle_object_ref','object_refs'} or not isinstance(object_refs,list)
+                    or not 1<=len(object_refs)<=4096 or any(not sha(ref) for ref in object_refs)
+                    or len(set(object_refs))!=len(object_refs) or not sha(bundle) or bundle not in object_refs):
+                raise RuntimeError('terminal prepared observation CAS references are invalid')
+            refs.update(object_refs)
+        elif outcome.get('state')=='unavailable':
+            reason=outcome.get('reason')
+            if set(outcome)!={'state','reason'} or not isinstance(reason,str) or not reason.strip() or len(reason.encode())>2048:
+                raise RuntimeError('terminal prepared observation unavailable reason is invalid')
+        else: raise RuntimeError('terminal prepared observation outcome is unsupported')
+        evidence[path]=hashlib.sha256(raw).hexdigest()
+        evidence[receipt_path]=hashlib.sha256(receipt_raw).hexdigest()
+    for path,digest in evidence.items():
+        if hashlib.sha256(prepared_raw(path)).hexdigest()!=digest:
+            raise RuntimeError('terminal preparation observation/receipt changed before final CAS')
+    return refs
 ledger=pathlib.Path('/host-ledger/ledger')
 fd=os.open(ledger/'WRITER.lock', os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
 try:
@@ -1344,6 +1428,9 @@ if observation.get('terminal_mode') or v4:
             checkpoint=json.loads(regular(path,'scheduler checkpoint'))
             if any(run_id not in expected for run_id in checkpoint.get('run_ids',[])) or (checkpoint.get('next_run_id') is not None and checkpoint['next_run_id'] not in expected): raise RuntimeError('scheduler references unknown work')
     referenced=set()
+    # Shared by all terminal runs, including each final metadata reread.
+    # Separate from the CAS object-byte allowance checked below.
+    prepared_record_read_budget=[1024*1024*1024]
     terminal_subset=terminal_expected if v4 else expected
     for run_id,pin in terminal_subset.items():
         intent=json.loads(regular(runs/run_id/'run_intent.json','run intent'))
@@ -1362,6 +1449,7 @@ if observation.get('terminal_mode') or v4:
         if pin['artifact_catalog_sha256'] is None and any(t.get('artifact_ids') for t in tasks): raise RuntimeError('terminal run outputs have no artifact catalog')
         task_by_id={t.get('task_id'):t for t in tasks if isinstance(t.get('task_id'),str)}
         if len(task_by_id)!=len(tasks): raise RuntimeError('terminal task identity inventory is invalid')
+        referenced.update(terminal_prepared_refs(runs/run_id,run_id,task_by_id,prepared_record_read_budget))
         historical_claims={}
         for claim in history_by_run.get(run_id,{}).get('attempts',[]):
             task=task_by_id.get(claim['task_id'])
@@ -1681,7 +1769,9 @@ if observation.get('terminal_mode') or v4:
         ref=path.name.removesuffix('.json')
         if path.suffix!='.json' or set(pin)!={'schema','object_ref'} or pin['schema']!='fullmag.cas-pin.v1' or pin['object_ref']!=ref or ref not in referenced: raise RuntimeError('retained input CAS pin is not referenced by the retained intents')
     total=0
-    cas_budget=1024*1024*1024 if v4 else 128*1024*1024
+    # Prepared terminal observations share v4's bounded aggregate I/O allowance;
+    # cancelled/default paths and the 128 MiB per-object bound stay unchanged.
+    cas_budget=1024*1024*1024 if observation.get('terminal_mode') or v4 else 128*1024*1024
     for ref in sorted(referenced):
         total+=hash_cas_object(store/'objects/sha256'/ref,ref,cas_budget-total)
 

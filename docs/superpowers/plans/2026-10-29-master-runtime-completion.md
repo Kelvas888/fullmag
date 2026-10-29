@@ -150,3 +150,17 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   terminalnej ścieżce hosta i runtime. Suma 71 obiektów CAS wynosi 231 755 414 B,
   więc dotychczasowy łączny budżet odczytu 128 MiB jest niewystarczający;
   walidacja musi pozostać strumieniowa, ograniczona i sprawdzać wszystkie hashe.
+- Naprawa źródłowa terminalnych obserwacji obejmuje hosta i typowany walidator
+  Rust. Odczyt rzeczywistych danych potwierdził 42 referencje przygotowanych
+  obserwacji, 76 referencjonowanych obiektów CAS i 71 pinów bez niepowiązanych
+  pinów. Sprawdzono SHA-256 wszystkich 271 255 118 B referencjonowanych danych
+  (piny są podzbiorem); największy pojedynczy obiekt ma 82 261 717 B.
+  Budżet terminalny wynosi 1 GiB sumy odczytu, jednostkowy nadal 128 MiB.
+  Domyślna ścieżka cancelled nie zmienia budżetu. To odczytowy fragment
+  preflightu, bez kompilacji lub dowodu uruchomienia nowego runtime.
+- Pełny odczytowy preflight zakończył się `ready` dla obu zachowanych runów.
+  Review usunęło powtórne odczyty typed intent/catalog dla każdej obserwacji;
+  Rust korzysta z wcześniej zweryfikowanych danych. Host ma dodatkowy wspólny
+  budżet 1 GiB na nowe rekordy prepared, obejmujący oba przebiegi odczytu,
+  niezależnie od budżetu CAS. Publikacja autoryzacji i wykonanie recovery mają
+  ponowić własne kontrole; sam wynik preview nie uruchamia kontenerów.
