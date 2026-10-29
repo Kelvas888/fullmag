@@ -313,6 +313,10 @@ operators, although the identity above would also hold there.
 | $N_n$ | FDM cell count along the normal | $1$ |
 | $h_n$ | FDM cell edge along the normal | $\mathrm{m}$ |
 | $h_\perp$ | Navigation step of a continuous FEM section: median normal extent of the cut target elements | $\mathrm{m}$ |
+| $\mathbf h$ | Shared native cell spacing of all FDM multilayer grids | $\mathrm{m}$ |
+| $\mathbf o_l$ | Edge origin of native multilayer grid l | $\mathrm{m}$ |
+| $\mathbf s_l$ | Integral cell shift of native grid l in the composite lattice | $1$ |
+| $\mathcal C$ | Composite cells covered by a native multilayer cell | $1$ |
 | $\pi$ | Circle constant | $1$ |
 
 `[q]` denotes the canonical SI unit of the selected source quantity. Unit

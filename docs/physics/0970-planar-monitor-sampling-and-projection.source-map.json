@@ -493,13 +493,13 @@
       "id": "h_vec",
       "latex": "\\mathbf h",
       "meaning": "Shared native cell spacing of all FDM multilayer grids",
-      "si_unit": "m"
+      "si_unit": "\\mathrm{m}"
     },
     {
       "id": "o_l",
       "latex": "\\mathbf o_l",
       "meaning": "Edge origin of native multilayer grid l",
-      "si_unit": "m"
+      "si_unit": "\\mathrm{m}"
     },
     {
       "id": "s_l",
