@@ -9,12 +9,14 @@ import math
 import operator
 from pathlib import Path
 import struct
+from time import monotonic_ns
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 from weakref import WeakSet
 import numpy as np
 from numpy.typing import NDArray
 
+from fullmag._progress import emit_progress
 from fullmag._validation import parse_bool, parse_finite_float, parse_integer
 from fullmag.model.discretization import _MESH_SIZE_PRESET_ALIASES
 
@@ -3827,6 +3829,7 @@ class MeshData:
         )
 
     def to_ir(self, mesh_name: str) -> dict[str, object]:
+        certification_started_ns = monotonic_ns()
         # Native mixed certification proves positive orientation, so avoid a
         # second Python pass over every cell merely to discover that no
         # reorientation is needed.  Uncertified/source-only meshes retain the
@@ -3835,6 +3838,11 @@ class MeshData:
         mesh = self if native_mixed_valid else self.oriented_copy()
         if not native_mixed_valid:
             mesh.validate_strict(require_positive_orientation=True)
+        emit_progress(
+            "MeshData.to_ir phase=certificate_fingerprint_validation "
+            f"elapsed_ms={(monotonic_ns() - certification_started_ns) / 1_000_000:.3f}"
+        )
+        conversion_started_ns = monotonic_ns()
         ir: dict[str, object] = {
             "mesh_name": mesh_name,
             "nodes": mesh.nodes.tolist(),
@@ -3893,6 +3901,10 @@ class MeshData:
         mesh_statistics = mesh.statistics_ir(mesh_name)
         if mesh_statistics is not None:
             ir["mesh_statistics"] = mesh_statistics
+        emit_progress(
+            "MeshData.to_ir phase=ir_conversion_statistics "
+            f"elapsed_ms={(monotonic_ns() - conversion_started_ns) / 1_000_000:.3f}"
+        )
         return ir
 
 
