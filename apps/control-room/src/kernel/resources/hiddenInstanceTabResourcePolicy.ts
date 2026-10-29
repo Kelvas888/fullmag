@@ -43,3 +43,48 @@ export function createHiddenInstanceTabResourcePauseController({
     releasePause = null;
   };
 }
+
+const SESSION_DATA_PLANE_SEGMENT = "/v2/sessions/current/data/";
+
+/** Field, topology, table and scalar reads: the heavy live data plane. */
+export function isSessionDataPlaneResourceKey(resourceKey: ResourceKey): boolean {
+  return resourceKey.includes(SESSION_DATA_PLANE_SEGMENT);
+}
+
+interface DocumentVisibilitySource {
+  readonly hidden: boolean;
+  addEventListener(type: "visibilitychange", listener: () => void): void;
+  removeEventListener(type: "visibilitychange", listener: () => void): void;
+}
+
+/**
+ * While the browser tab itself is hidden, defers live data-plane loads. A
+ * running solve keeps invalidating field vectors and table rows every tick;
+ * nobody sees them, so only the latest request per resource is kept and it
+ * loads when the tab is shown again. Control-plane resources (status, health,
+ * commands) are not paused.
+ */
+export function createHiddenDocumentResourcePauseController({
+  runtimeStore = sharedResourceRuntimeStore,
+  visibility,
+}: {
+  runtimeStore?: ResourcePauseRuntimeStore;
+  visibility: DocumentVisibilitySource;
+}): () => void {
+  let releasePause: (() => void) | null = null;
+  const sync = (): void => {
+    if (visibility.hidden) {
+      releasePause ??= runtimeStore.beginPauseMatching(isSessionDataPlaneResourceKey);
+    } else if (releasePause) {
+      releasePause();
+      releasePause = null;
+    }
+  };
+  visibility.addEventListener("visibilitychange", sync);
+  sync();
+  return () => {
+    visibility.removeEventListener("visibilitychange", sync);
+    releasePause?.();
+    releasePause = null;
+  };
+}
