@@ -2019,11 +2019,23 @@ def _read_foreign_docker_consumers(excluded):
 
 def _prove_foreign_windows_bind(control, backend, item, source, compose):
     state_root = _retained_compose_state_root(backend, compose, project=control.project)
+    from docker_windows_bind_isolation import (
+        WindowsBindObservationDrift, prove_windows_bind_disjoint,
+        validate_windows_bind_disjoint_proof)
     try:
-        from docker_windows_bind_isolation import (
-            prove_windows_bind_disjoint, validate_windows_bind_disjoint_proof)
-        proof = prove_windows_bind_disjoint(control, backend, item, source, state_root)
-        validate_windows_bind_disjoint_proof(proof, source=source, container_id=item.get("Id"))
+        for observation in range(3):
+            try:
+                proof = prove_windows_bind_disjoint(control, backend, item, source, state_root)
+                validate_windows_bind_disjoint_proof(proof, source=source, container_id=item.get("Id"))
+                return
+            except WindowsBindObservationDrift as drift:
+                if not drift.ordinary_inventory_only or observation == 2:
+                    raise
+                # Discard this attempt entirely. A new proof must independently
+                # re-observe all metadata and satisfy exact before/after equality.
+    except WindowsBindObservationDrift as unstable:
+        _fail("foreign Windows bind proof remained unstable: container="
+              + str(item.get("Id")) + "; " + str(unstable))
     except Exception as present_error:
         # A removed historical source needs positive, typed absence evidence;
         # stopped state or lexical path differences alone never qualify.

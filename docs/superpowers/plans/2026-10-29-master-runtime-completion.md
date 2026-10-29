@@ -226,3 +226,27 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   konsumentów Linux/WSL: wszystkie fizyczne dowody `disjoint`. Nie zatrzymano
   obcych grup, nie opublikowano dodatkowej autoryzacji i nie uruchomiono solvera.
   Pełny ponowny start, nowa kompilacja i odbiór UI/physics pozostają otwarte.
+- Poprawkę lifecycle zapisano jako `9edd3ec7b8af5bc6758d2cf6f01fa9b3e1bedaf2`.
+  Kolejne żądania startu były przerywane przez zewnętrzną automatyczną kontrolę
+  uprawnień (`model at capacity` / deadline), przed utworzeniem procesu;
+  nie obchodzono kontroli. Ostatecznie powstała jedna próba `83097`.
+- Próba `83097` zakończyła się kodem 2 przed startem aplikacji: konsument
+  Windows `b26b89c335475feeb08715fda3184146ae8b172bba598ed3de8324393dac9943`
+  zmienił jedynie `native.candidate.descendants.entries/files/sha256`.
+  Oba zachowane katalogi runów nadal mają pierwotne SHA i wszystkie taski
+  `Succeeded`; w store pozostają dwa runy. Nie uruchomiono solvera.
+- Nowy typ driftu powstaje dopiero po pełnej walidacji obu obserwacji względem
+  kontekstu. Caller może maksymalnie trzy razy wykonać cały dowód tylko dla
+  różnic `entries/directories/files/sha256`; każda zaakceptowana para nadal
+  musi być identyczna. Typed drift innych tożsamości, linków, backing images,
+  montowań lub wyczerpany limit kończy operację bez absent-source fallback.
+  Pozostałe błędy nie są ponawiane; zachowują dotychczasową ścieżkę typed absence.
+  Rzeczywisty brak historycznego źródła nadal wymaga pozytywnego typed absence.
+  Review: PASS; ekstrakcję istniejącego walidatora sprawdzono AST jako identyczną
+  poza wiązaniem argumentu. Schemat dowodu się nie zmienił, odrzucone próby nie
+  są archiwizowane jako dowody izolacji.
+- Odczytowe pełne dowody trzech bindów wskazanego konsumenta Windows po
+  poprawce: `disjoint` dla script-output, source i source-git. To subset
+  preflightu, bez autoryzacji, startu lub zatrzymania obcej grupy. AST trzech
+  Pythonów i diff-check przechodzą; istniejąca negatywna fixture uwzględnia
+  wcześniejsze odrzucenie niepoprawnego snapshotu. Testów nie uruchamiano.

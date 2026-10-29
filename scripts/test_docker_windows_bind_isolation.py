@@ -396,7 +396,8 @@ class WindowsIsolationTests(unittest.TestCase):
                 candidate["after"]["contained_links"][0]["hops"][0]["target"] = "different.so"
             else:
                 candidate["after"]["contained_links"][0]["final"]["inode"] += 1
-            with self.subTest(field=field), self.assertRaisesRegex(BuildControlError, "identities drifted"):
+            expected_error = "Relative link does not end" if field == "target" else "identities drifted"
+            with self.subTest(field=field), self.assertRaisesRegex(BuildControlError, expected_error):
                 self.check_proof(candidate)
 
     def test_directory_descendant_inventory_has_fixed_entry_and_time_bounds(self):

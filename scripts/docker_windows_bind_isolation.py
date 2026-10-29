@@ -35,6 +35,21 @@ PROOF_FIELDS = {"schema", "decision", "container_id", "source_sha256",
                 "context", "before", "after", "provider_sha256"}
 OBSERVATION_FIELDS = {"engine", "backend", "foreign", "linux", "mapping", "native", "contained_links"}
 
+
+class WindowsBindObservationDrift(BuildControlError):
+    """Two individually valid observations differ; no proof was accepted."""
+
+    def __init__(self, differences):
+        self.differences = tuple(differences)
+        ordinary_inventory = {
+            "observation.native.candidate.descendants.entries",
+            "observation.native.candidate.descendants.directories",
+            "observation.native.candidate.descendants.files",
+            "observation.native.candidate.descendants.sha256",
+        }
+        self.ordinary_inventory_only = bool(self.differences) and set(self.differences) <= ordinary_inventory
+        super().__init__("Windows isolation identities drifted: " + ", ".join(self.differences))
+
 # No Add-Type, compilation, temporary files or candidate contents are used.
 # Microsoft: hard links cannot refer to files on different volumes.
 # https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions
@@ -1035,12 +1050,16 @@ def validate_windows_bind_disjoint_proof(proof, *, source, container_id):
                     for key in ("project", "control_volume", "ledger_volume", "source_root", "reference_root"))
             and isinstance(context["control_namespace"], str),
             "Windows isolation registered group binding is incomplete")
+    for observed in (proof["before"], proof["after"]):
+        _validate_windows_bind_observation(observed, context, source=source, container_id=container_id)
     if proof["before"] != proof["after"]:
-        raise BuildControlError("Windows isolation identities drifted: "
-                                + ", ".join(_observation_differences(proof["before"], proof["after"])))
-    require(isinstance(proof["before"], dict) and set(proof["before"]) == OBSERVATION_FIELDS,
+        raise WindowsBindObservationDrift(_observation_differences(proof["before"], proof["after"]))
+    return proof
+
+
+def _validate_windows_bind_observation(observed, context, *, source, container_id):
+    require(isinstance(observed, dict) and set(observed) == OBSERVATION_FIELDS,
             "Windows isolation observation is incomplete")
-    observed = proof["before"]
     _validate_engine(observed["engine"])
     require(observed["foreign"].get("id") == container_id
             and observed["linux"].get("reference_root") == context.get("reference_root")
@@ -1084,7 +1103,6 @@ def validate_windows_bind_disjoint_proof(proof, *, source, container_id):
             and (path == target or target in path.parents),
             "Windows proof mount does not contain its translated candidate")
     _validate_link_evidence(observed["contained_links"], mapping, observed["native"])
-    return proof
 
 
 def prove_windows_bind_disjoint(control, backend, container, source, reference_root):
