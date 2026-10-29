@@ -601,6 +601,8 @@ pub fn scene_document_to_script_builder_overrides(
             "airbox_hmin": universe.airbox_hmin,
             "airbox_growth_rate": universe.airbox_growth_rate,
             "airbox_grading": universe.airbox_grading,
+            "airbox_curvature_factor": universe.airbox_curvature_factor,
+            "airbox_narrow_region_resolution": universe.airbox_narrow_region_resolution,
         })).unwrap_or(Value::Null),
         "stages": builder.stages.iter().map(|stage| {
             let mut stage_override = serde_json::json!({
@@ -2686,6 +2688,8 @@ mod tests {
                 airbox_hmin: Some(12e-9),
                 airbox_growth_rate: Some(1.35),
                 airbox_grading: Some("linear".to_string()),
+                airbox_curvature_factor: None,
+                airbox_narrow_region_resolution: None,
             }),
             domain_frame: None,
             stages: vec![ScriptBuilderStageState {

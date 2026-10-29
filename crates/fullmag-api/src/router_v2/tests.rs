@@ -12847,6 +12847,8 @@ async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
             airbox_hmin: Some(2.0e-9),
             airbox_growth_rate: Some(1.4),
             airbox_grading: Some("linear".to_string()),
+            airbox_curvature_factor: Some(0.3),
+            airbox_narrow_region_resolution: Some(0.5),
         };
         scene.study.universe_mesh = Some(universe_mesh.clone());
         scene.universe = Some(universe_mesh);
@@ -12994,6 +12996,21 @@ async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
             .and_then(|value| value.get("airbox_grading"))
             .and_then(serde_json::Value::as_str),
         Some("linear")
+    );
+    let universe_patch = mesh_options
+        .get("scene_problem_patch")
+        .and_then(|value| value.get("universe"));
+    assert_eq!(
+        universe_patch
+            .and_then(|value| value.get("airbox_curvature_factor"))
+            .and_then(serde_json::Value::as_f64),
+        Some(0.3)
+    );
+    assert_eq!(
+        universe_patch
+            .and_then(|value| value.get("airbox_narrow_region_resolution"))
+            .and_then(serde_json::Value::as_f64),
+        Some(0.5)
     );
     drop(queue);
 
@@ -17044,7 +17061,9 @@ async fn mesh_universe_config_put_commits_scene_projection() {
                             "airbox_hmax": 8.0e-9,
                             "airbox_hmin": 2.0e-9,
                             "airbox_growth_rate": 1.4,
-                            "airbox_grading": "linear"
+                            "airbox_grading": "linear",
+                            "curvature_factor": 0.3,
+                            "airbox_narrow_region_resolution": 0.5
                         }
                     })
                     .to_string(),
@@ -17056,6 +17075,10 @@ async fn mesh_universe_config_put_commits_scene_projection() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
+    // Audit 26: the air feature controls survive the policy write.
+    assert_eq!(json["config"]["airbox_curvature_factor"], 0.3);
+    assert_eq!(json["config"]["airbox_narrow_region_resolution"], 0.5);
+    assert!(json["config"].get("curvature_factor").is_none());
     assert_eq!(json["config"]["mode"], "box");
     assert_eq!(json["config"]["size"][0], 4.0);
     assert_eq!(json["config"]["airbox_hmax"], 8.0e-9);
@@ -17080,6 +17103,8 @@ async fn mesh_universe_config_put_commits_scene_projection() {
     assert_eq!(universe.airbox_hmin, Some(2.0e-9));
     assert_eq!(universe.airbox_growth_rate, Some(1.4));
     assert_eq!(universe.airbox_grading.as_deref(), Some("linear"));
+    assert_eq!(universe.airbox_curvature_factor, Some(0.3));
+    assert_eq!(universe.airbox_narrow_region_resolution, Some(0.5));
     assert_eq!(committed.universe.as_ref(), Some(universe));
 }
 
