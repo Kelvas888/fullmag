@@ -1896,6 +1896,58 @@ def _posix_paths_overlap(left, right):
     return left == right or left in right.parents or right in left.parents
 
 
+def _read_foreign_docker_consumers(excluded):
+    # Short-lived helpers can disappear between ps and bulk inspect. Restart
+    # the entire read only when the inventory actually changed; never accept
+    # a partial inspect or reinterpret an unchanged permission/daemon failure.
+    for observation in range(3):
+        listed = docker_capture("ps", "-aq", "--no-trunc", timeout=60).stdout.decode().split()
+        if len(listed) != len(set(listed)):
+            _fail("Docker consumer inventory contains duplicate IDs")
+        foreign = sorted(set(listed) - excluded)
+        if not foreign:
+            return []
+        if len(foreign) > 512:
+            _fail("Docker consumer inventory exceeds the observation budget")
+        for identifier in foreign:
+            _require_container(identifier, "foreign Docker consumer ID")
+        try:
+            raw = docker_capture("inspect", *foreign, timeout=90).stdout
+        except BuildControlError:
+            after = docker_capture("ps", "-aq", "--no-trunc", timeout=60).stdout.decode().split()
+            if observation == 2 or set(after) == set(listed):
+                raise
+            continue
+        records = json.loads(raw)
+        if (not isinstance(records, list) or len(records) != len(foreign)
+                or any(not isinstance(item, Mapping) for item in records)
+                or {item.get("Id") for item in records} != set(foreign)):
+            _fail("foreign Docker consumer inventory changed during observation")
+        return records
+    _fail("Docker consumer inventory did not stabilize")
+
+
+def _prove_foreign_windows_bind(control, backend, item, source, compose):
+    state_root = _retained_compose_state_root(backend, compose, project=control.project)
+    try:
+        from docker_windows_bind_isolation import (
+            prove_windows_bind_disjoint, validate_windows_bind_disjoint_proof)
+        proof = prove_windows_bind_disjoint(control, backend, item, source, state_root)
+        validate_windows_bind_disjoint_proof(proof, source=source, container_id=item.get("Id"))
+    except Exception as present_error:
+        # A removed historical source needs positive, typed absence evidence;
+        # stopped state or lexical path differences alone never qualify.
+        try:
+            from docker_windows_absent_bind_isolation import (
+                prove_absent_stopped_windows_bind, validate_absent_stopped_windows_bind_proof)
+            proof = prove_absent_stopped_windows_bind(control, backend, item, source, state_root)
+            validate_absent_stopped_windows_bind_proof(proof, source=source, container_id=item.get("Id"))
+        except Exception as absent_error:
+            _fail("foreign Windows bind has unresolved storage identity: container="
+                  + str(item.get("Id")) + "; present proof: " + str(present_error)
+                  + "; absent-stopped proof: " + str(absent_error))
+
+
 def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=None, *,
                                          prove_foreign_disjoint=None):
     """Fence every Docker consumer, including stopped containers able to restart."""
@@ -1911,9 +1963,6 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                     protected.add(("bind", mount.get("source")))
     if not protected:
         _fail("abrupt recovery has no protected runtime mount inventory")
-    listed = docker_capture("ps", "-aq", "--no-trunc", timeout=60).stdout.decode().split()
-    if len(listed) != len(set(listed)):
-        _fail("Docker consumer inventory contains duplicate IDs")
     own = {backend["Id"], frontend["Id"]}
     operation = getattr(control, "_active_operation", None)
     if operation is not None:
@@ -1925,18 +1974,7 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
             _fail("active recovery operation has no authenticated control helper")
         helper_id = authenticate(operation)
         own.add(_require_container(helper_id, "authenticated operation helper ID"))
-    foreign = sorted(set(listed) - own)
-    if not foreign:
-        return
-    if len(foreign) > 512:
-        _fail("Docker consumer inventory exceeds the observation budget")
-    for identifier in foreign:
-        _require_container(identifier, "foreign Docker consumer ID")
-    records = json.loads(docker_capture("inspect", *foreign, timeout=90).stdout)
-    if (not isinstance(records, list) or len(records) != len(foreign)
-            or any(not isinstance(item, Mapping) for item in records)
-            or {item.get("Id") for item in records} != set(foreign)):
-        _fail("foreign Docker consumer inventory changed during observation")
+    records = _read_foreign_docker_consumers(own)
     for item in records:
         alias_mapping = None
         alias_mapping_decided = False
@@ -1958,14 +1996,7 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                                  or PureWindowsPath(path) in windows_source.parents)
                             for kind, path in protected):
                         _fail("a foreign Docker container references the recovery store/control/ledger")
-                    try:
-                        from docker_windows_bind_isolation import (
-                            prove_windows_bind_disjoint, validate_windows_bind_disjoint_proof)
-                        state_root = _retained_compose_state_root(backend, compose, project=control.project)
-                        proof = prove_windows_bind_disjoint(control, backend, item, source, state_root)
-                        validate_windows_bind_disjoint_proof(proof, source=source, container_id=item.get("Id"))
-                    except Exception as error:
-                        _fail("foreign Windows bind has unresolved storage identity: " + str(error))
+                    _prove_foreign_windows_bind(control, backend, item, source, compose)
                     continue
                 if (not isinstance(source, str) or not source.startswith("/") or source.startswith("//")
                         or ".." in PurePosixPath(source).parts
@@ -1998,9 +2029,11 @@ def _assert_no_foreign_storage_consumers(control, backend, frontend, compose=Non
                     and any(alias == prefix.rstrip("/") or alias.startswith(prefix)
                             for prefix in _DESKTOP_HOST_PREFIXES)
                     and not alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
-                # Docker Desktop host-drive paths belong to the daemon's
-                # Windows namespace; they are not local POSIX source proof.
-                _fail("foreign Windows Docker Desktop bind has unresolved storage identity")
+                # Daemon drive aliases require the same independent native
+                # Windows/DrvFs proof as literal drive paths. Their textual
+                # difference from WSL storage is never isolation evidence.
+                _prove_foreign_windows_bind(control, backend, item, alias, compose)
+                continue
             if (isinstance(alias, str)
                     and alias.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")):
                 # Alias hashes are not identities. A missing/denied registered

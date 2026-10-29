@@ -810,8 +810,10 @@ def _foreign_container_pin(container, alias):
     if not any(item.get("Type") == "bind" and item.get("Source") == alias for item in mounts):
         raise BuildControlError("foreign bind alias is absent from the exact container Mounts")
     host_config = container.get("HostConfig")
-    if (not isinstance(host_config, Mapping)
-            or "Mounts" not in host_config or "Binds" not in host_config):
+    # Engine's HostConfig.Mounts is tagged omitempty. Binds-based containers
+    # therefore legitimately omit it; keep the explicit Binds inventory and
+    # all resolved mounts, lifecycle pins and physical disjointness proof.
+    if not isinstance(host_config, Mapping) or "Binds" not in host_config:
         raise BuildControlError("foreign bind consumer HostConfig is missing")
     host_mounts = host_config.get("Mounts")
     binds = host_config.get("Binds")
