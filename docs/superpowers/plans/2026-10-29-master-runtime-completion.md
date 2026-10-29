@@ -206,3 +206,23 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   helpera względem Compose. Stare opcje FDM/receipty zachowują kontrakt.
   AST Python, `node --check` i diff-check przechodzą; sam probe nie był
   jeszcze uruchomiony i nie stanowi dowodu działania FEM.
+- Kanoniczna próba recovery (obserwowana jako sesja `60890`) zakończyła się
+  kodem 2 przed operacją development i przed zmianą stałych kontenerów:
+  `foreign consumer identity or state changed during overlap proof`.
+  Oryginalny komunikat nie podawał ID ani zmienionych pól. Kod przekazywał
+  stan z początkowego inventory do dowodu po długim skanie Windows; równoległe
+  grupy WSL normalnie startowały/kończyły pracę (m.in. starty 14:46 UTC).
+  Dwie kolejne świeże obserwacje 22 konsumentów nie wykazały zmiany kolejności
+  mountów; nie zmieniano ich canonicalizacji na podstawie hipotezy.
+- Poprawka dopuszcza maksymalnie trzy fizyczne dowody dla jednego aliasu:
+  tylko zmiana samego lifecycle wymaga nowego pełnego kernel proof i nowego
+  porównania przed/po. ID, obraz i wszystkie metadane montowań pozostają
+  ścisłe; ich zmiana, błędny inspect, brak obiektu lub negatywny kernel proof
+  kończą operację. Publikacja wyłącznie po zgodnych bieżących pinach.
+  Nowe błędy zawierają ID i nazwy zmienionych pól. Review: PASS źródła.
+  Istniejąca fixture reprezentuje ciągłą niestabilność wszystkich trzech prób;
+  testów nie uruchamiano. AST dwóch Pythonów i diff-check przechodzą.
+- Rzeczywisty odczytowy subset po poprawce sprawdził pierwszy alias 22
+  konsumentów Linux/WSL: wszystkie fizyczne dowody `disjoint`. Nie zatrzymano
+  obcych grup, nie opublikowano dodatkowej autoryzacji i nie uruchomiono solvera.
+  Pełny ponowny start, nowa kompilacja i odbiór UI/physics pozostają otwarte.
