@@ -208,6 +208,30 @@ lease `iteration` i przed zatrzymaniem którejkolwiek usługi; błąd tej kontro
 zostawia grupę działającą i nie tworzy próby. Grupa bez kwarantanny namespace
 ma `BuildControl.namespace == ""` i używa subpath `runtime-control`.
 
+#### Zapis pustej sesji UI przed restartem
+
+Zwykłą, aktywną sesję `ui_authoring` w stanie `awaiting_command`, bez bieżącego
+runu i bez obiektów sceny, można zachować w archiwum projektu przed
+`restart-idle`. Dla tego przypadku checkpoint używa osobnego schematu
+`fullmag.saved-empty-authoring-restart.v1`: oba piny źródła (`source_entry` i
+`source_sha256`) muszą jawnie mieć wartość `null`. Archiwum zachowuje dokładne
+hashowane rewizje projektu i sceny; scena musi wskazywać `source_of_truth: ui`,
+a `objects` musi być pominięte albo puste. Nie dodaje się zastępczego skryptu
+Python ani metadanych skryptu, historii źródeł, historii projektu lub runów.
+
+Ta ścieżka nadal wymaga zwykłego ścisłego probe stanu przed i po zatrzymaniu
+frontendu, identycznych pinów kontenerów, źródeł, właściciela i archiwum oraz
+uwierzytelnionego natywnego drainu. Nie przyjmuje checkpointów rozszerzonych o
+anulowane lub historyczne preclaim ani katalogi zachowanych runów. Istniejący
+schemat `fullmag.saved-authoring-restart.v1` pozostaje przeznaczony dla
+archiwów z przypiętym skryptem źródłowym i nadal wymaga obu pinów źródła.
+
+Do bezpiecznego zatrzymania tej grupy użyj `just docker-dev-stop-saved-authoring`
+z przypiętym checkpointem. Recepta przechodzi przez probe i native drain,
+następnie pozostawia frontend oraz backend zatrzymane. Nie odtwarza sesji ani
+nie uruchamia skryptu; archiwum pozostaje zachowane do osobnego, jawnego otwarcia
+projektu.
+
 #### Początkowy start odrzucony z powodu wyczerpanej puli sieci
 
 Błąd Dockera `all predefined address pools have been fully subnetted` może
