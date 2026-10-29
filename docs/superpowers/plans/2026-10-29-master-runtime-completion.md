@@ -470,3 +470,13 @@ niepełny. Raport końcowy oddziela źródła, build, runtime, render i fizykę.
   testów nie uruchamiano. Wszystkie siedem obcych plików nadal ma hashe
   manifestu początkowego. Wdrożenie tego scalenia, nowe przebiegi FDM/FEM,
   pomiar materializacji i kwalifikowana retencja pozostają do wykonania.
+
+- Kolejny potwierdzony drain: `8695f842b5d141be99c72caddfa326c3`, oba
+  kontenery exit0. Jawny fresh-state zatrzymał się przed usunięciem usług:
+  `4544fbee491444dfad9947f2c21a94a1`, failed-confirmed. Preflight wybierał pusty
+  recovery context dla archiwizacji, ale kontrola pod lease ponownie wybierała
+  retained recovery i odrzucała historyczny capability. Wybór pod lease jest
+  teraz zgodny z preflightem. Nie zmieniono walidatora retained recovery;
+  zachowano kontrolę dokładnych zatrzymanych inkarnacji i atomowe archiwum
+  starego runtime/ledgera/danych. Python AST/diff przechodzi; ponowne wykonanie
+  tej zarządzanej ścieżki i nowy build nadal oczekują na odbiór.
