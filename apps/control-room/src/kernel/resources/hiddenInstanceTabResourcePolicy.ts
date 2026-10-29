@@ -1,3 +1,4 @@
+import { DATA_FIELDS_PATH } from "@/kernel/api/apiPaths";
 import { instanceTabVisibility } from "@/kernel/layout/instanceTabVisibility";
 import { sharedResourceRuntimeStore } from "@/kernel/resources/ResourceRuntimeStore";
 import type { ResourceKey } from "@/kernel/resources/resourceTypes";
@@ -44,7 +45,8 @@ export function createHiddenInstanceTabResourcePauseController({
   };
 }
 
-const SESSION_DATA_PLANE_SEGMENT = "/v2/sessions/current/data/";
+// `/v2/sessions/current/data/`, derived from the typed path table.
+const SESSION_DATA_PLANE_SEGMENT = DATA_FIELDS_PATH.slice(0, DATA_FIELDS_PATH.lastIndexOf("/") + 1);
 
 /** Field, topology, table and scalar reads: the heavy live data plane. */
 export function isSessionDataPlaneResourceKey(resourceKey: ResourceKey): boolean {
