@@ -41988,11 +41988,12 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
     assert_eq!(response.headers()["x-fullmag-node-index-count"], "2");
     let bytes = body_bytes(response).await;
     assert_eq!(&bytes[..4], b"FMVP");
-    assert_eq!(decode_fmvp_node_indices(&bytes), vec![1, 2]);
+    // floor(i * 4 / 2): the same uniform sample the Control Room renderer draws.
+    assert_eq!(decode_fmvp_node_indices(&bytes), vec![0, 2]);
     let values = decode_fmvp_payload_f64(&bytes);
     assert_eq!(
         values,
-        vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         "sampled FDM m must preserve the live solver-grid vectors"
     );
 }
@@ -43584,7 +43585,7 @@ async fn v2_field_vector_applies_max_samples_to_part_scope() {
 }
 
 #[tokio::test]
-async fn v2_field_vector_applies_max_samples_to_unscoped_center_window() {
+async fn v2_field_vector_applies_uniform_max_samples_to_unscoped_values() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
         snapshot.latest_fields = serde_json::from_value(serde_json::json!({
@@ -43634,7 +43635,8 @@ async fn v2_field_vector_applies_max_samples_to_unscoped_center_window() {
         .chunks_exact(8)
         .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
         .collect();
-    assert_eq!(values, vec![1.0, 1.1, 1.2, 2.0, 2.1, 2.2, 3.0, 3.1, 3.2]);
+    // floor(i * 5 / 3) = 0, 1, 3: spread over the whole field, not a centre window.
+    assert_eq!(values, vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 3.0, 3.1, 3.2]);
 }
 
 #[tokio::test]
