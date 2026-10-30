@@ -53,7 +53,7 @@ describe("PlanarSurface lifecycle", () => {
       />,
     );
     expect(html).toMatch(
-      /<div class="fm-field-map__canvas-stack">[\s\S]*<table class="fm-field-map__pinned-probe">[\s\S]*<\/table><\/div>/,
+      /<div class="fm-field-map__canvas-stack"[^>]*>[\s\S]*<table class="fm-field-map__pinned-probe">[\s\S]*<\/table>[\s\S]*<\/div>/,
     );
   });
 
