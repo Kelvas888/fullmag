@@ -563,16 +563,13 @@ describe("FieldMapModule planar state ownership", () => {
     const maxIndex = html.indexOf("2 kA/m");
     expect(minIndex).toBeLessThan(rampIndex);
     expect(rampIndex).toBeLessThan(maxIndex);
-    expect(html).toContain("<th scope=\"row\">x</th><td>13 m</td>");
-    expect(html).toContain("<th scope=\"row\">y</th><td>25 m</td>");
-    expect(html).not.toContain("<th scope=\"row\">u</th>");
-    expect(html).not.toContain("<th scope=\"row\">v</th>");
     expect(html).toContain(
       '<div class="fm-field-map__canvas-stack"><output data-planar-render-layers=',
     );
-    expect(html).toMatch(
-      /<div class="fm-field-map__canvas-stack">[\s\S]*<table [^>]*class="fm-field-map__pinned-probe">[\s\S]*<\/table><\/div>/,
-    );
+    // Since PR 350 the probe reading is retained per pinned point; with no
+    // point pinned (static render) no stale reading is shown. Axis rows are
+    // covered by PlanarPinnedProbe, placement by PlanarSurface.
+    expect(html).not.toContain('class="fm-field-map__pinned-probe"');
   });
 
   it("resolves Airbox and object wireframes without changing the field query or sample identity", () => {
