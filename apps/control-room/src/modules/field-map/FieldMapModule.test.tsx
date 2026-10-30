@@ -150,14 +150,16 @@ vi.mock("@/kernel/resources/planarFieldResources", () => ({
     }
     return resource;
   },
-  usePlanarMaskResource: () => ({ data: null, error: null, status: "idle" }),
-  usePlanarMeshOverlayResource: () => ({ data: null, error: null, status: "idle" }),
+  // Auxiliary layers settle with the sample: since PR 350 a frame is
+  // published only after every requested layer finished loading.
+  usePlanarMaskResource: () => ({ data: null, error: null, status: mocks.renderReady ? "ready" : "idle" }),
+  usePlanarMeshOverlayResource: () => ({ data: null, error: null, status: mocks.renderReady ? "ready" : "idle" }),
   usePlanarProbeResource: () => ({ data: mocks.probeData, error: null, status: mocks.probeData ? "ready" : "idle" }),
   usePlanarProfileResource: () => ({ data: null, error: null, status: "idle" }),
   usePlanarScalarResource: () => mocks.renderReady && !mocks.scalarPending
     ? { data: mocks.scalarData, error: null, status: "ready" }
     : { data: null, error: null, status: "idle" },
-  usePlanarVectorResource: () => ({ data: null, error: null, status: "idle" }),
+  usePlanarVectorResource: () => ({ data: null, error: null, status: mocks.renderReady ? "ready" : "idle" }),
 }));
 
 vi.mock("@/kernel/resources/planarMonitorResources", () => ({
