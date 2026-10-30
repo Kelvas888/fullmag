@@ -452,9 +452,8 @@ def _is_fullmag_result_directory(path: Path) -> bool:
             return None
 
     attributes = read_json(".zattrs")
-    if isinstance(attributes, dict) and (
-        "output_store_schema" in attributes
-        or str(attributes.get("schema_version", "")).startswith("fullmag.")
+    if isinstance(attributes, dict) and str(attributes.get("schema_version", "")).startswith(
+        "fullmag."
     ):
         return True
     receipt = read_json("output-storage.json")

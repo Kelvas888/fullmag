@@ -406,11 +406,10 @@ fn is_fullmag_result_directory(path: &Path) -> bool {
         serde_json::from_slice(&fs::read(path.join(name)).ok()?).ok()
     };
     let zattrs_marked = read_json(".zattrs").is_some_and(|attributes| {
-        attributes.get("output_store_schema").is_some()
-            || attributes
-                .get("schema_version")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|schema| schema.starts_with("fullmag."))
+        attributes
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|schema| schema.starts_with("fullmag."))
     });
     let receipt_marked = read_json("output-storage.json").is_some_and(|receipt| {
         receipt.get("schema").and_then(serde_json::Value::as_str)
