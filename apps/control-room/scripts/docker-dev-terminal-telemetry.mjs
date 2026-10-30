@@ -2,6 +2,8 @@ const STATUS_PATH = "/v2/sessions/current/status";
 const CURRENT_RUN_PATH = "/v2/sessions/current/simulation/runs/current";
 const SCALARS_PATH = "/v2/sessions/current/data/scalars?columns=step,e_total&limit=1&tail=true";
 const API_INSTANCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const FOOTER_STEP_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const FOOTER_ENERGY_FORMAT = new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 });
 
 const requireText = (value, label) => {
   if (typeof value !== "string" || value.trim() === "") {
@@ -159,11 +161,11 @@ const readTerminalApiSnapshot = async (page, expectedSession, expectedApiInstanc
 };
 
 const formatFooterStep = (step) =>
-  new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(step);
+  FOOTER_STEP_FORMAT.format(step);
 
 const formatFooterEnergy = (energy) => {
   if (Math.abs(energy) >= 1e-2 && Math.abs(energy) < 1e4) {
-    return new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 }).format(energy);
+    return FOOTER_ENERGY_FORMAT.format(energy);
   }
   return energy.toExponential(6);
 };
