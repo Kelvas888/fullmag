@@ -23,6 +23,8 @@ import {
   resolveMultisliceRange,
   type MultisliceExtent,
 } from "../model/planarMultislice";
+import { useRetainedPlanarFrame } from "../hooks/useRetainedPlanarFrame";
+import { describePlanarError, isSupersededPlanarError } from "../model/planarErrorCopy";
 
 export interface PlanarMultisliceGridProps {
   quantityId: string;
@@ -134,9 +136,11 @@ function PlanarMultislicePanel({
   const height = resolution?.[1] ?? 0;
   const [uMin, uMax, vMin, vMax] = (meta.data?.frame.bounds_uv_m ?? []) as (number | undefined)[];
 
+  // While a live refresh resamples the panel, keep its last extent so the
+  // shared range and legend do not fall back to "pending" on every revision.
   useEffect(() => {
-    const extent = values ? resolvePlanarDisplayRange(values, maskValues ?? undefined, { mode: "auto" }) : null;
-    onExtent(index, extent);
+    if (!values) return;
+    onExtent(index, resolvePlanarDisplayRange(values, maskValues ?? undefined, { mode: "auto" }));
   }, [index, maskValues, onExtent, values]);
   useEffect(() => () => onExtent(index, null), [index, onExtent]);
 
@@ -187,12 +191,16 @@ function PlanarMultislicePanel({
     });
   }, [colorByDirection, colormap, height, maskValues, rangeMax, rangeMin, rasterOpacity, uMax, uMin, vMax, vMin, values, width, worldVectors]);
 
-  const coordinate = meta.data?.section?.resolved_coordinate_m;
-  const error = meta.status === "error"
-    ? meta.error?.message
+  const coordinate = useRetainedPlanarFrame(
+    String(fraction),
+    meta.data?.section?.resolved_coordinate_m ?? null,
+  ) ?? undefined;
+  const failure = meta.status === "error"
+    ? meta.error
     : canonical && !canonical.ok
-      ? String(canonical.error instanceof Error ? canonical.error.message : canonical.error)
-      : scalar.status === "error" ? scalar.error?.message : null;
+      ? canonical.error
+      : scalar.status === "error" ? scalar.error : null;
+  const error = failure && !isSupersededPlanarError(failure) ? describePlanarError(failure) : null;
   const state = error ? "error" : values && sharedRange ? "ready" : "loading";
   return (
     <figure
@@ -220,7 +228,9 @@ function PlanarMultislicePanel({
       <figcaption className="fm-field-map__multislice-caption">
         {meta.data?.section?.normal_axis ?? "n"} ={" "}
         {coordinate === undefined ? "…" : `${(coordinate * 1e9).toFixed(2)} nm`}
-        {error ? <span className="fm-field-map__multislice-error"> — {error}</span> : null}
+        {error ? (
+          <span className="fm-field-map__multislice-error" title={error.technical}> — {error.message}</span>
+        ) : null}
       </figcaption>
     </figure>
   );
