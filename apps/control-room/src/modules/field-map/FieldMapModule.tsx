@@ -546,8 +546,13 @@ function useFieldMapModuleController() {
       worldVectors: sample.worldVectors,
     });
   }, [canonicalPlanar?.resolution.vector_budget, effectiveWireframeStyle, presentationPlanar, sample]);
+  // The pinned probe resamples with every revision; keep its last reading.
+  const probeData = useRetainedPlanarFrame(
+    activePinned ? `${planarViewIdentityKey}|${activePinned.join(",")}` : null,
+    probe.data ?? null,
+  );
   const pinnedAxisState = useMemo(() => {
-    if (!renderModel || !probe.data) return null;
+    if (!renderModel || !probeData) return null;
     const axisFrame = {
       normal: renderModel.frame.normal,
       origin: renderModel.frame.origin,
@@ -564,11 +569,11 @@ function useFieldMapModuleController() {
       ),
       coordinates: resolvePlanarProbeCoordinates(
         axisFrame,
-        probe.data.u_m,
-        probe.data.v_m,
+        probeData.u_m,
+        probeData.v_m,
       ),
     };
-  }, [probe.data, renderModel]);
+  }, [probeData, renderModel]);
   // F6 B1: a line profile is a derived resource of the current sample. The
   // segment belongs to one view identity, so a new source, plane or quantity
   // drops it, while a layer step re-evaluates it on the new sample.
@@ -745,7 +750,7 @@ function useFieldMapModuleController() {
     pinnedAxisState,
     plan,
     presentationPlanar,
-    probe,
+    probeData,
     profile,
     profileLengthUnit,
     retainedProfile,
@@ -781,7 +786,7 @@ export default function FieldMapModule() {
     pinnedAxisState,
     plan,
     presentationPlanar,
-    probe,
+    probeData,
     profile,
     profileLengthUnit,
     retainedProfile,
@@ -948,11 +953,11 @@ export default function FieldMapModule() {
           onProfileSegment={onProfileSegment}
           onRenderEvidence={onRenderEvidence}
           profileSegment={activeProfileSegment}
-          probeOverlay={presentationPlanar.layers.probes && probe.data ? (
+          probeOverlay={presentationPlanar.layers.probes && probeData ? (
             <PlanarPinnedProbe
               axisState={pinnedAxisState}
               legendUnit={renderModel.display.legendUnit}
-              probe={probe.data}
+              probe={probeData}
               probeScale={renderModel.display.probeScale}
             />
           ) : null}

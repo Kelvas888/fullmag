@@ -131,10 +131,17 @@ function PlanarMultislicePanel({
     [clientComponent, scalar.data, worldVectors],
   );
   const maskValues = useMemo(() => (mask.data ? new Uint8Array(mask.data) : null), [mask.data]);
+  // Colour a panel only once its mask and vectors match the scalar, so a live
+  // refresh never draws an unmasked or direction-less intermediate frame.
+  const layersSettled =
+    ["ready", "stale", "error"].includes(mask.status) &&
+    (!requestVectors || ["ready", "stale", "error"].includes(vectors.status));
   const resolution = meta.data?.resolution;
   const width = resolution?.[0] ?? 0;
   const height = resolution?.[1] ?? 0;
-  const [uMin, uMax, vMin, vMax] = (meta.data?.frame.bounds_uv_m ?? []) as (number | undefined)[];
+  // Keep the panel's bounds while its metadata reloads so the aspect does not jump.
+  const bounds = useRetainedPlanarFrame(String(fraction), meta.data?.frame.bounds_uv_m ?? null);
+  const [uMin, uMax, vMin, vMax] = (bounds ?? []) as (number | undefined)[];
 
   // While a live refresh resamples the panel, keep its last extent so the
   // shared range and legend do not fall back to "pending" on every revision.
@@ -174,7 +181,7 @@ function PlanarMultislicePanel({
   const rangeMax = sharedRange?.max;
   useEffect(() => {
     const colorizer = colorizerRef.current;
-    if (!colorizer || !values || width < 1 || height < 1) return;
+    if (!colorizer || !values || !layersSettled || width < 1 || height < 1) return;
     if (rangeMin === undefined || rangeMax === undefined) return;
     if (uMin === undefined || uMax === undefined || vMin === undefined || vMax === undefined) return;
     sizeRef.current = { height, width };
@@ -189,7 +196,7 @@ function PlanarMultislicePanel({
       opacity: rasterOpacity,
       width,
     });
-  }, [colorByDirection, colormap, height, maskValues, rangeMax, rangeMin, rasterOpacity, uMax, uMin, vMax, vMin, values, width, worldVectors]);
+  }, [colorByDirection, colormap, height, layersSettled, maskValues, rangeMax, rangeMin, rasterOpacity, uMax, uMin, vMax, vMin, values, width, worldVectors]);
 
   const coordinate = useRetainedPlanarFrame(
     String(fraction),
