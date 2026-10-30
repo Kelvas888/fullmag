@@ -682,6 +682,10 @@ Pozostają ograniczenia poza odbiorem tych sześciu punktów:
   profilowania; skrócenie do Ready nie oznacza skrócenia całego runu o 20,8%.
 - Krótkie próby GPU dowodzą uruchomienia, mapowania, materializacji i renderu.
   Nie kwalifikują zbieżności, parytetu FEM/FDM, realizacji CPU ani produkcji.
+- Pobrane później commity remote opisują odrębny, nadal zablokowany przypadek
+  `fem_relax_gpu_smoke.py`: natywny worker FEM GPU kończy się SIGSEGV przed
+  pierwszym krokiem. Udany CoFeB nie zamyka tego błędu;
+  [status osobnego odbioru 2D](../../status/2d-slice-capabilities.md).
 - Normalny, zatwierdzony hook React Doctor pozostawia dwie wcześniejsze
   uwagi do lookupów w istniejącym głównym harnessie. Nie zmieniano hooka,
   PATH ani progów kontroli; nie przedstawiamy skanera jako bezuwagowego.
@@ -689,3 +693,11 @@ Pozostają ograniczenia poza odbiorem tych sześciu punktów:
   Późniejsze zmiany odbioru dotyczą harnessu i dokumentacji; nie wymagają
   kolejnej kompilacji solvera. Backend i frontend pozostają włączone
   na 3198 z ukończonym CoFeB. Nie uruchamiano testów jednostkowych.
+
+Przed końcową synchronizacją pobrano
+`fec56017703cef40a7321646f3367858dea0d6fb` z origin/master: sześć nowych
+commitów zmieniających wyłącznie testy i dokumentację widoku 2D. Połączono
+je bez konfliktów z własnymi commitami odbioru; nie uruchamiano tych testów
+ani kolejnego buildu. Zmiany nie modyfikują działającego solvera ani jego
+wyników. Równoległe zmiany instrukcji, poradników i submodułów zachowano
+poza commitami tego zadania.
